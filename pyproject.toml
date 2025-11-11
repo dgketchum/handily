@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling>=1.21.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "handily"
+version = "0.1.0"
+description = "Height Above Nearest Drainage (REM/HAND) stratification and Leaflet visualization"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10,<3.11"
+authors = [
+  { name = "dgketchum" }
+]
+keywords = ["hydrology", "GIS", "DEM", "HAND", "REM", "geospatial", "NHD", "3DEP", "raster"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+  "numpy<2.0",               # RichDEM compatibility
+  "pybind11>=2.10",          # helps build richdem from source when wheels unavailable
+  "geopandas>=0.13",
+  "rasterio>=1.3",
+  "rioxarray>=0.14",
+  "xarray>=2023.1",
+  "scipy>=1.10",
+  "rasterstats>=0.19",
+  "pynhd>=0.15",
+  "richdem>=0.3.4",
+  "shapely>=2.0",
+  "fiona>=1.9",
+  "affine>=2.4",
+  "setuptools>=65",          # runtime for pkg_resources used by richdem
+  "pystac>=1.8",
+  "requests>=2.31",
+  "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "black",
+  "isort",
+  "mypy",
+]
+
+[project.urls]
+Homepage = "https://example.com/handily"
+
+[project.scripts]
+handily = "handily.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/handily"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src",
+  "README.md",
+  "LICENSE",
+  "scripts",
+]
