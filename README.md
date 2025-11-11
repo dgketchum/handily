@@ -19,12 +19,10 @@ Notes:
 
 ### Option B: uv (fast installer)
 
-
 - Install uv (see https://docs.astral.sh/uv/ for platform installers), then:
   - Ensure Python 3.10 is available: `uv python install 3.10`
   - Create and activate a venv: `uv venv --python 3.10 .venv && source .venv/bin/activate`
   - Install the package: `uv pip install -U pip setuptools wheel && uv pip install .`
-
 
 Tool-style install (no venv activation):
 - `uv tool install .`  # installs a `handily` command in uv’s tool shim
