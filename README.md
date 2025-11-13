@@ -49,8 +49,6 @@ Build a local STAC catalog for USGS 3DEP OPR 1 m DEM tiles directly from the TNM
 
 - Build for Montana (MT) only into `stac/3dep_1m`:
   - `handily stac build --out-dir stac/3dep_1m --states MT`
-- Extend later with Idaho (ID):
-  - `handily stac extend --out-dir stac/3dep_1m --states ID`
 
 The builder crawls project → subproject → metadata, parses FGDC XMLs (for bbox and links), and creates one STAC Item per tile with links to the GeoTIFF and XML.
 

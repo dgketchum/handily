@@ -2,19 +2,25 @@ import os
 import re
 import json
 import logging
+from tqdm import tqdm
 from typing import Iterable, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 import requests
+import geopandas as gpd
 import numpy as np
 import rasterio
 import xarray as xr
 import rioxarray as rxr
 from rasterio.merge import merge as rio_merge
 from shapely.geometry import box as shapely_box
+from shapely.strtree import STRtree
 import shapely
 import pystac
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
+
 try:
     from tqdm import tqdm
 except Exception:  # pragma: no cover - optional at runtime
@@ -24,7 +30,9 @@ except Exception:  # pragma: no cover - optional at runtime
 LOGGER = logging.getLogger("handily.stac_3dep")
 
 S3_BASE = "https://prd-tnm.s3.amazonaws.com"
-S3_PREFIX_PROJECTS = "StagedProducts/Elevation/OPR/Projects/"
+# 3DEP 1 m Project tiles live under this prefix, e.g.:
+# https://prd-tnm.s3.amazonaws.com/index.html?prefix=StagedProducts/Elevation/1m/Projects/MT_Statewide_Phase4_B22/metadata/
+S3_PREFIX_PROJECTS = "StagedProducts/Elevation/1m/Projects/"
 PROJECTS_INDEX = f"{S3_BASE}/?delimiter=/&prefix={quote(S3_PREFIX_PROJECTS)}"
 PROJECTS_ROOT = f"{S3_BASE}/{S3_PREFIX_PROJECTS}"
 
@@ -34,6 +42,18 @@ def _http_get(url: str, timeout: float = 30.0) -> str:
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.text
+
+
+def _http_get_with_retry(url: str, timeout: float = 30.0, retries: int = 3, backoff: float = 0.5) -> str:
+    attempt = 0
+    while True:
+        try:
+            return _http_get(url, timeout=timeout)
+        except Exception:
+            attempt += 1
+            if attempt > int(retries):
+                raise
+            time.sleep(float(backoff) * (2 ** (attempt - 1)))
 
 
 def _parse_s3_common_prefixes(xml_text: str) -> List[str]:
@@ -76,7 +96,7 @@ def _parse_s3_contents(xml_text: str) -> List[str]:
 def _list_projects(states: Optional[Iterable[str]] = None) -> List[str]:
     xml = _http_get(PROJECTS_INDEX)
     entries = _parse_s3_common_prefixes(xml)
-    # entries are full prefixes like 'StagedProducts/Elevation/OPR/Projects/MT_.../'
+    # entries are full prefixes like 'StagedProducts/Elevation/1m/Projects/MT_.../'
     norm = []
     for e in entries:
         if not e.endswith("/"):
@@ -91,31 +111,47 @@ def _list_projects(states: Optional[Iterable[str]] = None) -> List[str]:
     return sorted({d for d in norm})
 
 
-def _list_subprojects(project_dir: str) -> List[str]:
-    # project_dir like 'MT_Statewide_Phase4_B22/' → list CommonPrefixes one level down
-    pref = S3_PREFIX_PROJECTS + project_dir
-    url = f"{S3_BASE}/?delimiter=/&prefix={quote(pref)}"
-    xml = _http_get(url)
-    prefixes = _parse_s3_common_prefixes(xml)
-    # Return only the subdir names (last segment) with trailing slash
-    out = []
-    for p in prefixes:
-        if p.endswith("/") and p.startswith(pref):
-            seg = p[len(pref) :]
-            if seg:
-                out.append(seg)
-    return sorted({d for d in out})
+def _list_metadata_xmls(project_dir: str) -> List[str]:
+    """List tile metadata XML filenames under <project>/metadata/.
 
-
-def _list_metadata_xmls(project_dir: str, sub_dir: str) -> List[str]:
-    # List objects under .../<project>/<sub_dir>/metadata/
-    pref = S3_PREFIX_PROJECTS + project_dir + sub_dir + "metadata/"
+    Example project_dir: 'MT_Statewide_Phase4_B22/'
+    """
+    pref = S3_PREFIX_PROJECTS + project_dir + "metadata/"
     url = f"{S3_BASE}/?prefix={quote(pref)}"
     xml = _http_get(url)
     keys = _parse_s3_contents(xml)
     # Return filenames for xmls
     names = [os.path.basename(k) for k in keys if k.lower().endswith(".xml")]
     return sorted({n for n in names})
+
+
+def _fetch_item_meta(proj: str, name: str):
+    """Fetch and parse a single tile XML for a given project."""
+    xml_url = f"{S3_BASE}/{S3_PREFIX_PROJECTS}{proj}metadata/{name}"
+    try:
+        xml_text = _http_get_with_retry(xml_url, timeout=30.0, retries=3, backoff=0.5)
+        meta = _parse_fgdc_xml(xml_text)
+    except Exception:
+        return None
+    bbox = meta.get("bbox")
+    tif_href = meta.get("tif_href")
+    if not bbox or None in bbox or not tif_href:
+        return None
+    item_id = os.path.splitext(os.path.basename(name))[0]
+    iso_pub = _to_iso_date(meta.get("pubdate"))
+    iso_beg = _to_iso_date(meta.get("begdate"))
+    iso_end = _to_iso_date(meta.get("enddate"))
+    dt = iso_end or iso_pub or iso_beg
+    return {
+        "item_id": item_id,
+        "bbox": list(bbox),
+        "tif_href": tif_href,
+        "xml_url": xml_url,
+        "jpg_href": meta.get("jpg_href"),
+        "iso_beg": iso_beg,
+        "iso_end": iso_end,
+        "dt": dt,
+    }
 
 
 def _parse_fgdc_xml(xml_text: str) -> dict:
@@ -141,6 +177,9 @@ def _parse_fgdc_xml(xml_text: str) -> dict:
     onlinks = _findall("networkr") or _findall("onlink")
     tif_href = next((u for u in onlinks if u.lower().endswith(".tif")), None)
     jpg_href = next((u for u in onlinks if u.lower().endswith(".jpg")), None)
+    if not jpg_href:
+        # Some records provide thumbnail in <browsen> under <browse>
+        jpg_href = _find("browsen")
 
     # Rows/cols if present
     rowcount = _find("rowcount")
@@ -189,200 +228,246 @@ def _bbox_to_geojson_polygon(bbox: Tuple[float, float, float, float]) -> dict:
     }
 
 
-def build_3dep_stac(out_dir: str, states: Optional[Iterable[str]] = None, collection_id: str = "usgs-3dep-1m-opr") -> str:
+def build_3dep_stac(out_dir: str,
+                    states: Optional[Iterable[str]] = None,
+                    collection_id: str = "usgs-3dep-1m-opr",
+                    project_head: Optional[str] = None,
+                    search_string: Optional[str] = None,
+                    num_workers: int = 12,
+                    items_shapefile: Optional[str] = None) -> str:
     """
-    Build a single STAC Collection of 3DEP OPR 1m DEM tiles for the given states.
+    Build a STAC Collection of 3DEP 1 m DEM tiles.
 
-    - Scans the TNM S3 static index for projects.
-    - Filters projects by state abbreviation prefix (e.g., "MT_").
-    - Traverses subprojects, then the 'metadata' folder to read per-tile FGDC XML.
-    - Creates one STAC Item per XML, linking to the GeoTIFF and XML assets.
-    - Saves a self-contained STAC catalog under out_dir.
+    Modes:
+    - State scan (default): pass states to scan all matching projects.
+    - Project scoped: pass project_head and optionally search_string to restrict to a subproject.
 
     Returns the path to the root catalog.json.
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    catalog = pystac.Catalog(id=f"{collection_id}-catalog", description="USGS 3DEP OPR 1 m DEM tiles")
+    catalog = pystac.Catalog(id=f"{collection_id}-catalog", description="USGS 3DEP 1 m DEM tiles")
     collection = pystac.Collection(
         id=collection_id,
-        description="USGS 3DEP Original Product Resolution (OPR) 1 m DEM tiles (LiDAR-derived)",
+        description="USGS 3DEP 1 m DEM tiles (LiDAR-derived)",
         extent=pystac.Extent(
             pystac.SpatialExtent([[-180.0, -90.0, 180.0, 90.0]]),
             pystac.TemporalExtent([(None, None)]),
         ),
         license="public-domain",
-        title="USGS 3DEP OPR 1 m DEM",
-        keywords=["USGS", "3DEP", "LiDAR", "DEM", "OPR", "1m"],
+        title="USGS 3DEP 1 m DEM",
+        keywords=["USGS", "3DEP", "LiDAR", "DEM", "1m"],
         providers=[
-            pystac.Provider(name="U.S. Geological Survey", roles=[pystac.ProviderRole.PRODUCER, pystac.ProviderRole.LICENSOR]),
+            pystac.Provider(name="U.S. Geological Survey",
+                            roles=[pystac.ProviderRole.PRODUCER, pystac.ProviderRole.LICENSOR]),
         ],
     )
     catalog.add_child(collection)
 
-    projects = _list_projects(states)
-    LOGGER.info("Found %d projects matching states=%s", len(projects), list(states) if states else None)
+    if project_head:
+        projects = [project_head.rstrip("/") + "/"]
+    else:
+        projects = _list_projects(states)
+    LOGGER.info("Projects to build: %d (states=%s, project_head=%s, subfilter=%s)",
+                len(projects), list(states) if states else None, project_head, search_string)
     total_items = 0
     for proj in tqdm(projects, desc="Projects", unit="proj"):
-        subdirs = _list_subprojects(proj)
-        for sub in subdirs:
-            try:
-                xml_names = _list_metadata_xmls(proj, sub)
-            except requests.HTTPError:
-                continue
-            for name in xml_names:
-                xml_url = f"{S3_BASE}/{S3_PREFIX_PROJECTS}{proj}{sub}metadata/{name}"
+        # List XMLs directly under <project>/metadata/
+        try:
+            xml_names = _list_metadata_xmls(proj)
+        except Exception:
+            xml_names = []
+        if search_string:
+            xml_names = [n for n in xml_names if search_string in n]
+        if not xml_names:
+            continue
+
+        bar = tqdm(total=len(xml_names), desc=f"{proj}metadata/", position=1, unit="xml", leave=False)
+        workers = max(1, int(num_workers))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_fetch_item_meta, proj, name) for name in xml_names]
+            for fut in as_completed(futures):
                 try:
-                    xml_text = _http_get(xml_url)
-                    meta = _parse_fgdc_xml(xml_text)
-                except Exception:
+                    d = fut.result()
+                finally:
+                    try:
+                        bar.update(1)
+                    except Exception:
+                        pass
+                if not d:
                     continue
-                bbox = meta.get("bbox")
-                tif_href = meta.get("tif_href")
-                if not bbox or None in bbox or not tif_href:
-                    continue
-
-                item_id = os.path.splitext(os.path.basename(name))[0]
-                geom = _bbox_to_geojson_polygon(bbox)  # type: ignore[arg-type]
-                iso_pub = _to_iso_date(meta.get("pubdate"))
-                iso_beg = _to_iso_date(meta.get("begdate"))
-                iso_end = _to_iso_date(meta.get("enddate"))
-                dt = iso_end or iso_pub or iso_beg
-
+                geom = _bbox_to_geojson_polygon(d["bbox"])  # type: ignore[arg-type]
                 item = pystac.Item(
-                    id=item_id,
+                    id=d["item_id"],
                     geometry=geom,
-                    bbox=list(bbox),  # type: ignore[arg-type]
-                    datetime=pystac.utils.str_to_datetime(dt) if dt else None,
+                    bbox=d["bbox"],  # type: ignore[arg-type]
+                    datetime=pystac.utils.str_to_datetime(d["dt"]) if d["dt"] else None,
                     properties={},
                 )
-                if iso_beg or iso_end:
-                    if iso_beg:
-                        item.properties["start_datetime"] = pystac.utils.str_to_datetime(iso_beg).isoformat()
-                    if iso_end:
-                        item.properties["end_datetime"] = pystac.utils.str_to_datetime(iso_end).isoformat()
+                if d.get("iso_beg"):
+                    item.properties["start_datetime"] = pystac.utils.str_to_datetime(d["iso_beg"]).isoformat()
+                if d.get("iso_end"):
+                    item.properties["end_datetime"] = pystac.utils.str_to_datetime(d["iso_end"]).isoformat()
                 item.properties["gsd"] = 1.0
-
-                # Assets
                 item.add_asset(
                     "data",
-                    pystac.Asset(href=tif_href, media_type="image/tiff", roles=["data"], title="DEM 1m (GeoTIFF)"),
+                    pystac.Asset(href=d["tif_href"], media_type="image/tiff", roles=["data"], title="DEM 1m (GeoTIFF)"),
                 )
                 item.add_asset(
                     "metadata",
-                    pystac.Asset(href=xml_url, media_type="application/xml", roles=["metadata"], title="FGDC metadata"),
+                    pystac.Asset(href=d["xml_url"], media_type="application/xml", roles=["metadata"], title="FGDC metadata"),
                 )
-                if meta.get("jpg_href"):
+                if d.get("jpg_href"):
                     item.add_asset(
                         "thumbnail",
-                        pystac.Asset(href=meta["jpg_href"], media_type="image/jpeg", roles=["thumbnail"], title="Thumbnail"),
+                        pystac.Asset(href=d["jpg_href"], media_type="image/jpeg", roles=["thumbnail"], title="Thumbnail"),
                     )
-
                 collection.add_item(item)
                 total_items += 1
+
+        try:
+            bar.close()
+        except Exception:
+            pass
 
     catalog.normalize_hrefs(out_dir)
     catalog.make_all_asset_hrefs_absolute()
     catalog.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
     LOGGER.info("Wrote STAC: %s (items=%d)", os.path.join(out_dir, "catalog.json"), total_items)
+    # Persist spatial index for fast AOI queries
+    try:
+        _write_bbox_index(out_dir, collection_id)
+    except Exception:
+        pass
+    if items_shapefile:
+        shp_path = os.path.expanduser(items_shapefile)
+        shp_dir = os.path.dirname(shp_path)
+        if shp_dir and not os.path.exists(shp_dir):
+            os.makedirs(shp_dir)
+        root = os.path.join(out_dir, "catalog.json")
+        cat = pystac.read_file(root)
+        coll = next((c for c in cat.get_children() if isinstance(c, pystac.Collection) and c.id == collection_id), None)
+        if coll is None:
+            raise ValueError(f"Collection {collection_id} not found in catalog.")
+        ids, geoms = [], []
+        for it in coll.get_items():
+            if it.bbox:
+                ids.append(it.id)
+                geoms.append(shapely_box(*it.bbox))
+        gdf = gpd.GeoDataFrame({"id": ids}, geometry=geoms, crs="EPSG:4326")
+        gdf.to_file(shp_path)
+        print(f'wrote stac shapefiles to {shp_path}')
     return os.path.join(out_dir, "catalog.json")
 
 
-def extend_3dep_stac(out_dir: str, states: Iterable[str], collection_id: str = "usgs-3dep-1m-opr") -> str:
-    """
-    Extend an existing STAC catalog by adding Items for additional state abbreviations.
-
-    Loads the catalog at out_dir/catalog.json, finds the collection, and adds new Items
-    for projects whose names start with the provided state abbreviations.
-    """
-    root = os.path.join(out_dir, "catalog.json")
-    cat = pystac.read_file(root)
-    coll = next((c for c in cat.get_children() if isinstance(c, pystac.Collection) and c.id == collection_id), None)
-    if coll is None:
-        raise ValueError(f"Collection {collection_id} not found in catalog.")
-
-    existing_ids = set(i.id for i in coll.get_items())
-    new_count = 0
-    projects = _list_projects(states)
-    for proj in projects:
-        subdirs = _list_subprojects(proj)
-        for sub in subdirs:
-            try:
-                xml_names = _list_metadata_xmls(proj, sub)
-            except requests.HTTPError:
-                continue
-            for name in xml_names:
-                item_id = os.path.splitext(os.path.basename(name))[0]
-                if item_id in existing_ids:
-                    continue
-                xml_url = PROJECTS_ROOT + proj + sub + "metadata/" + name
-                try:
-                    xml_text = _http_get(xml_url)
-                    meta = _parse_fgdc_xml(xml_text)
-                except Exception:
-                    continue
-                bbox = meta.get("bbox")
-                tif_href = meta.get("tif_href")
-                if not bbox or None in bbox or not tif_href:
-                    continue
-                geom = _bbox_to_geojson_polygon(bbox)  # type: ignore[arg-type]
-                iso_pub = _to_iso_date(meta.get("pubdate"))
-                iso_beg = _to_iso_date(meta.get("begdate"))
-                iso_end = _to_iso_date(meta.get("enddate"))
-                dt = iso_end or iso_pub or iso_beg
-                item = pystac.Item(
-                    id=item_id,
-                    geometry=geom,
-                    bbox=list(bbox),  # type: ignore[arg-type]
-                    datetime=pystac.utils.str_to_datetime(dt) if dt else None,
-                    properties={},
-                )
-                if iso_beg or iso_end:
-                    if iso_beg:
-                        item.properties["start_datetime"] = pystac.utils.str_to_datetime(iso_beg).isoformat()
-                    if iso_end:
-                        item.properties["end_datetime"] = pystac.utils.str_to_datetime(iso_end).isoformat()
-                item.properties["gsd"] = 1.0
-                item.add_asset(
-                    "data",
-                    pystac.Asset(href=tif_href, media_type="image/tiff", roles=["data"], title="DEM 1m (GeoTIFF)"),
-                )
-                item.add_asset(
-                    "metadata",
-                    pystac.Asset(href=xml_url, media_type="application/xml", roles=["metadata"], title="FGDC metadata"),
-                )
-                if meta.get("jpg_href"):
-                    item.add_asset(
-                        "thumbnail",
-                        pystac.Asset(href=meta["jpg_href"], media_type="image/jpeg", roles=["thumbnail"], title="Thumbnail"),
-                    )
-                coll.add_item(item)
-                existing_ids.add(item_id)
-                new_count += 1
-
-    cat.normalize_hrefs(out_dir)
-    cat.make_all_asset_hrefs_absolute()
-    cat.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
-    LOGGER.info("Extended STAC with %d new items", new_count)
-    return root
-
-
-def tiles_for_aoi(stac_dir: str, aoi_bbox_4326: Tuple[float, float, float, float], collection_id: str = "usgs-3dep-1m-opr") -> list[pystac.Item]:
+def tiles_for_aoi(stac_dir: str, aoi_bbox_4326: Tuple[float, float, float, float],
+                  collection_id: str = "usgs-3dep-1m-opr") -> list[pystac.Item]:
     """
     Return a list of STAC Items whose bbox intersects the given AOI bbox (EPSG:4326).
+
+    Uses a Shapely STRtree spatial index for fast intersection queries over item bboxes.
     """
     root = os.path.join(stac_dir, "catalog.json")
     cat = pystac.read_file(root)
     coll = next((c for c in cat.get_children() if isinstance(c, pystac.Collection) and c.id == collection_id), None)
     if coll is None:
         raise ValueError(f"Collection {collection_id} not found in catalog.")
+
     aoi_poly = shapely_box(*aoi_bbox_4326)
-    hits = []
+    loaded = _load_bbox_index(stac_dir, collection_id)
+    if loaded is None:
+        items_all = list(coll.get_items())
+        geoms = []
+        ids = []
+        for it in items_all:
+            ib = it.bbox
+            if ib:
+                geoms.append(shapely_box(*ib))
+                ids.append(it.id)
+        try:
+            _write_bbox_index(stac_dir, collection_id)
+        except Exception:
+            pass
+    else:
+        geoms, ids = loaded
+
+    if not geoms:
+        return []
+
+    tree = STRtree(geoms)
+    matches = tree.query(aoi_poly, predicate="intersects")
+    # Shapely 2.x may return either integer indices (np.ndarray) or geometry objects.
+    wkb_to_idx = {g.wkb: i for i, g in enumerate(geoms)}
+    idxs = []
+    try:
+        # numpy array of indices path
+        import numpy as _np  # local import to avoid top-level constraints
+        if hasattr(matches, "dtype") and _np.issubdtype(matches.dtype, _np.integer):
+            idxs = [int(i) for i in matches.tolist()]
+        else:
+            for m in matches:
+                if isinstance(m, (int,)):
+                    idxs.append(int(m))
+                else:
+                    i = wkb_to_idx.get(m.wkb)
+                    if i is not None:
+                        idxs.append(i)
+    except Exception:
+        for m in matches:
+            try:
+                i = wkb_to_idx.get(m.wkb)
+            except Exception:
+                i = None
+            if i is not None:
+                idxs.append(i)
+
+    seen = set()
+    out = []
+    for i in idxs:
+        if i in seen:
+            continue
+        seen.add(i)
+        it = cat.get_item(ids[i], recursive=True)
+        if it is not None:
+            out.append(it)
+    return out
+
+
+def _index_path(stac_dir: str, collection_id: str) -> str:
+    return os.path.join(stac_dir, f"{collection_id}_bbox_index.json")
+
+
+def _write_bbox_index(stac_dir: str, collection_id: str) -> str:
+    root = os.path.join(stac_dir, "catalog.json")
+    cat = pystac.read_file(root)
+    coll = next((c for c in cat.get_children() if isinstance(c, pystac.Collection) and c.id == collection_id), None)
+    if coll is None:
+        raise ValueError(f"Collection {collection_id} not found in catalog.")
+    ids = []
+    bboxes = []
     for it in coll.get_items():
-        ib = it.bbox
-        if ib and shapely_box(*ib).intersects(aoi_poly):
-            hits.append(it)
-    return hits
+        if it.bbox:
+            ids.append(it.id)
+            bboxes.append(list(it.bbox))
+    data = {"collection_id": collection_id, "ids": ids, "bboxes": bboxes}
+    path = _index_path(stac_dir, collection_id)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    return path
+
+
+def _load_bbox_index(stac_dir: str, collection_id: str):
+    path = _index_path(stac_dir, collection_id)
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    ids = data.get("ids") or []
+    bboxes = data.get("bboxes") or []
+    if not ids or not bboxes or len(ids) != len(bboxes):
+        return None
+    geoms = [shapely_box(*bbox) for bbox in bboxes]
+    return geoms, ids
 
 
 def mosaic_from_stac(stac_dir: str,
@@ -404,7 +489,7 @@ def mosaic_from_stac(stac_dir: str,
         raise ValueError("No STAC tiles intersect AOI.")
 
     tifs_local: list[str] = []
-    for it in items:
+    for it in tqdm(items, total=len(items), desc='Mosaic from STAC'):
         asset = it.assets.get("data")
         if asset is None:
             continue
@@ -436,7 +521,8 @@ def mosaic_from_stac(stac_dir: str,
     dem = xr.DataArray(mosaic[0].astype("float32"), dims=("y", "x"), name="elevation")
     dem = dem.rio.write_crs(crs, inplace=False)
     dem = dem.rio.write_transform(mosaic_tr)
-    if int(target_crs_epsg) != int(pystac.utils.maybe_int(crs.to_epsg()) or target_crs_epsg):
+    epsg = crs.to_epsg()
+    if (epsg is None) or (int(epsg) != int(target_crs_epsg)):
         dem = dem.rio.reproject(f"EPSG:{int(target_crs_epsg)}")
 
     dem = dem.rio.clip(aoi_gdf.to_crs(dem.rio.crs).geometry, aoi_gdf.to_crs(dem.rio.crs).crs)
@@ -456,25 +542,3 @@ def mosaic_from_stac(stac_dir: str,
     except Exception:
         pass
     return dem
-
-
-if __name__ == "__main__":
-    # Temporary debug: direct function calls without CLI
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-    states = ["MT"]
-    print(f"Listing projects for states={states}")
-    projects = _list_projects(states)
-    print(f"Found {len(projects)} projects:")
-    for d in projects:
-        print(f"  - {d}")
-    if projects:
-        proj = projects[0]
-        print(f"Probing subprojects of {proj}")
-        subs = _list_subprojects(proj)
-        print(f"  Subprojects: {len(subs)}")
-        if subs:
-            xmls = _list_metadata_xmls(proj, subs[0])
-    out_dir = os.path.expanduser("~/data/IrrigationGIS/handily/stac/3dep_1m_debug")
-    print(f"Building STAC into: {out_dir}")
-    build_3dep_stac(out_dir, states=states)
-    print("Done.")

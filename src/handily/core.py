@@ -1,34 +1,19 @@
-import os
-import sys
-import logging
 import glob
-
-import numpy as np
-import geopandas as gpd
-import pandas as pd
-
-import xarray as xr
-import rioxarray as rxr
-from shapely.geometry import box as shapely_box
-
-# Data acquisition (py3dep removed; using STAC only)
+import logging
+import os
 
 import fiona
-from scipy import ndimage as ndi
-import richdem as rd
-from pyproj import CRS as _CRS
-
-# Pynhd imports (local version: NHD and WaterData are available; no WBD class)
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import rioxarray as rxr
+import xarray as xr
 from pynhd import NHD
-
-# Rasterization and transforms
+from pyproj import CRS as _CRS
 from rasterio import features
-from rasterio.io import MemoryFile
-from rasterio.merge import merge as rio_merge
-from affine import Affine
-
-# Zonal statistics
 from rasterstats import zonal_stats
+from scipy import ndimage as ndi
+from rioxarray.merge import merge_arrays
 
 LOGGER = logging.getLogger("handily.core")
 
@@ -234,22 +219,6 @@ def _filter_flowlines_nhd(fl, natural_perennial=False, exclude_artificial=False)
     return df.reset_index(drop=True)
 
 
-def get_dem_for_aoi(
-    aoi_gdf,
-    target_crs_epsg=5070,
-    cache_path=None,
-    overwrite=False,
-    tile_max_px=4096,
-):
-    """
-    Deprecated: py3dep-based DEM retrieval has been removed.
-    Use get_dem_for_aoi_via_stac(...) and pass --stac-dir via the CLI.
-    """
-    raise RuntimeError(
-        "py3dep DEM retrieval has been removed. Build a 3DEP STAC catalog and use --stac-dir."
-    )
-
-
 def rasterize_lines_to_grid(lines_gdf, template_da, burn_value=1):
     """
     Rasterize line features to match a template DataArray grid.
@@ -294,225 +263,159 @@ def rasterize_lines_to_grid(lines_gdf, template_da, burn_value=1):
     stream_da = stream_da.rio.write_crs(template_da.rio.crs, inplace=False)
     return stream_da
 
-
-def fill_sinks(dem_da):
+def build_streams_mask_from_nhd_ndwi(flowlines_gdf, dem_da, ndwi_da=None, ndwi_threshold=None):
     """
-    Hydro-condition the DEM by filling depressions using richdem.
+    Build a streams/water mask on the DEM grid by combining NHD flowlines with an NDWI raster.
 
-    This version uses the local RichDEM Python API directly with no fallbacks
-    or exception handling so errors surface clearly.
+    - Rasterize flowlines to the DEM grid.
+    - If NDWI is provided, reproject to DEM grid, threshold at ndwi_threshold, and union with flowlines mask.
     """
-    LOGGER.info("Filling depressions (hydro-conditioning DEM via richdem)")
+    if dem_da.rio.crs is None:
+        raise ValueError("DEM must have a valid CRS.")
+    if flowlines_gdf.crs is None or str(flowlines_gdf.crs) != str(dem_da.rio.crs):
+        flowlines_gdf = flowlines_gdf.to_crs(dem_da.rio.crs)
 
-    # Materialize DEM to NumPy and cast to float32 (RichDEM supported type)
-    data = dem_da.data
-    dem_np = data.compute() if hasattr(data, "compute") else np.asarray(data)
-    dem_np = dem_np.astype("float32", copy=False)
+    fl_mask = rasterize_lines_to_grid(flowlines_gdf, dem_da, burn_value=1)
+    streams_mask = fl_mask
 
-    # Build rdarray with an explicit no_data, and supply geotransform
-    nd = dem_da.rio.nodata
-    if nd is None or not np.isfinite(nd):
-        nd = -9999.0
-    # Replace NaNs with nd for RichDEM
-    dem_in = np.where(np.isfinite(dem_np), dem_np, nd).astype("float32", copy=False)
+    if ndwi_da is not None and ndwi_threshold is not None:
+        ndwi_match = ndwi_da
+        if str(ndwi_da.rio.crs) != str(dem_da.rio.crs) or ndwi_da.shape != dem_da.shape:
+            ndwi_match = ndwi_da.rio.reproject_match(dem_da)
+        water = (ndwi_match > float(ndwi_threshold)).astype("uint8")
+        water = water.rio.write_crs(dem_da.rio.crs, inplace=False)
+        combo = xr.DataArray(
+            np.maximum(np.asarray(streams_mask.data, dtype="uint8"), np.asarray(water.data, dtype="uint8")),
+            dims=dem_da.dims,
+            coords=dem_da.coords,
+            name="streams",
+        )
+        combo = combo.rio.write_crs(dem_da.rio.crs, inplace=False)
+        streams_mask = combo
 
-    # Construct geotransform from rasterio Affine
-    gt = dem_da.rio.transform()
-    geotransform = [gt.c, gt.a, gt.b, gt.f, gt.d, gt.e]
+    return streams_mask
 
-    dem_rd = rd.rdarray(dem_in, no_data=float(nd), geotransform=geotransform)
-
-    # Fill depressions with epsilon gradient to avoid flats
-    filled_rd = rd.FillDepressions(dem_rd, epsilon=True, in_place=False, topology="D8")
-
-    filled_np = np.asarray(filled_rd, dtype="float32")
-    # Restore nodata to NaN for downstream processing
-    filled_np = np.where(filled_np == float(nd), np.nan, filled_np)
-
-    filled_da = xr.DataArray(
-        filled_np,
-        dims=dem_da.dims,
-        coords=dem_da.coords,
-        name="DEM_filled",
-        attrs={"description": "Hydro-conditioned DEM (depressions filled via richdem)"},
-    )
-    filled_da = filled_da.rio.write_crs(dem_da.rio.crs, inplace=False)
-    return filled_da
-
-
-def compute_rem_from_streams(dem_da, streams_da):
+def compute_rem_quick(dem_da, streams_da):
     """
-    Compute Relative Elevation Model (REM, akin to HAND) relative to nearest stream.
-
-    Approach:
-    - Hydro-condition the DEM (fill depressions) to avoid artificial sinks.
-    - Rasterize streams on the same grid; identify stream cells.
-    - For each cell, find the nearest stream cell in Euclidean pixel space and
-      subtract that stream cell's elevation from the cell's elevation.
-
-    This produces a "detrended DEM" where values are height above the nearest
-    stream centerline, which is a practical proxy for HAND when flowpath-based
-    HAND is not available.
-
-    Notes:
-    - This method uses an Euclidean nearest-neighbor lookup. It is not identical
-      to a flowpath HAND, but in floodplain/valley bottoms it tracks relative
-      relief robustly for stratification tasks.
-    - For large rasters, we convert to in-memory NumPy arrays for the nearest
-      neighbor operation. This is typically manageable at HUC-10 scales at 10 m.
+    Compute a quick Relative Elevation Model using Euclidean nearest-stream height without sink filling.
     """
-    LOGGER.info("Computing REM relative to nearest stream")
-
-    # Ensure matching grid/CRS
     if dem_da.rio.crs is None or streams_da.rio.crs is None:
         raise ValueError("Both DEM and streams rasters must have a valid CRS.")
     if str(dem_da.rio.crs) != str(streams_da.rio.crs) or dem_da.shape != streams_da.shape:
         raise ValueError("DEM and streams must share grid shape and CRS.")
 
-    # Hydro-conditioning
-    dem_filled = fill_sinks(dem_da)
-
-    # Materialize as NumPy arrays for nearest-neighbor distance transform
-    dem_np = np.asarray(dem_filled.data)
+    dem_np = np.asarray(dem_da.data)
     streams_np = np.asarray(streams_da.data).astype(bool)
-
     if streams_np.sum() == 0:
-        raise ValueError("Stream mask has no active cells after rasterization.")
+        raise ValueError("Stream mask has no active cells after combination.")
 
-    # Compute indices of nearest stream cell for each pixel
-    # distance_transform_edt on ~stream cells returns indices to the nearest True
-    # pixels in streams_np when using return_indices with ~streams_np as input.
-    indices = ndi.distance_transform_edt(
+    row_ind, col_ind = ndi.distance_transform_edt(
         ~streams_np, return_distances=False, return_indices=True
     )
-    row_ind, col_ind = indices
     base_elev = dem_np[row_ind, col_ind]
-
     rem_np = dem_np - base_elev
-    # Height Above Nearest Drainage should be non-negative
     rem_np = np.where(rem_np < 0, 0, rem_np)
 
     rem_da = xr.DataArray(
         rem_np,
-        dims=dem_filled.dims,
-        coords=dem_filled.coords,
+        dims=dem_da.dims,
+        coords=dem_da.coords,
         name="REM",
-        attrs={"description": "Relative Elevation Model (height above nearest stream)"},
+        attrs={"description": "Quick REM (euclidean nearest stream; no sink filling)"},
     )
-    rem_da = rem_da.rio.write_crs(dem_filled.rio.crs, inplace=False)
+    rem_da = rem_da.rio.write_crs(dem_da.rio.crs, inplace=False)
     return rem_da
 
+def aoi_from_bounds(bounds_wsen):
+    w, s, e, n = bounds_wsen
+    aoi = gpd.GeoDataFrame([{}], geometry=[gpd.GeoSeries.from_bounds(w, s, e, n).iloc[0]], crs="EPSG:4326")
+    return aoi
 
-def compute_rem_centerline(dem_da, flowlines_gdf, spacing_m=250.0, buffer_exclude_m=50.0, smooth_sigma_m=150.0):
-    """
-    Approximate the report's detrending approach using densified centerline points and kernel smoothing.
+def tiles_for_bounds(bounds_wsen, mgrs_shp_path):
+    w, s, e, n = bounds_wsen
+    aoi_ll = gpd.GeoDataFrame([{}], geometry=[gpd.GeoSeries.from_bounds(w, s, e, n).iloc[0]], crs="EPSG:4326")
+    mgrs = gpd.read_file(os.path.expanduser(mgrs_shp_path))
+    mgrs_aea = mgrs.to_crs("EPSG:5070")
+    aoi_aea = aoi_ll.to_crs("EPSG:5070")
+    hits = mgrs_aea[mgrs_aea.intersects(aoi_aea.unary_union)].copy()
+    if hits.empty:
+        raise ValueError("No MGRS tiles intersect bounds.")
+    name_col = "MGRS_TILE"
+    tiles = list(hits[name_col].astype(str).unique())
+    return tiles, hits
 
-    Steps:
-    - Fill sinks in DEM (hydro-conditioning).
-    - Densify flowlines to points at `spacing_m`.
-    - Burn point locations to a raster grid and assign DEM elevations at those cells.
-    - Expand to full grid by nearest-point assignment via distance transform.
-    - Apply Gaussian smoothing (sigma in meters -> pixels) to the water-surface raster.
-    - Within `buffer_exclude_m` of streams, keep the unsmoothed base surface to avoid over-smoothing at channels.
-    - Compute REM = filled DEM - smoothed water surface, clamped to [0, inf).
-    """
-    if dem_da.rio.crs is None or flowlines_gdf.crs is None:
-        raise ValueError("DEM and flowlines must have a valid CRS.")
-    if str(flowlines_gdf.crs) != str(dem_da.rio.crs):
-        flowlines_gdf = flowlines_gdf.to_crs(dem_da.rio.crs)
+def ndwi_files_for_tiles(ndwi_dir, tiles):
+    ndwi_dir = os.path.expanduser(ndwi_dir)
+    present = {}
+    missing = []
+    for t in tiles:
+        matches = sorted(glob.glob(os.path.join(ndwi_dir, f"*{t}*.tif")))
+        if matches:
+            present[t] = matches
+        else:
+            missing.append(t)
+    return present, missing
 
-    dem_filled = fill_sinks(dem_da)
+def open_ndwi_mosaic(present_map, bounds_wsen):
+    rasters = []
+    for paths in present_map.values():
+        first = rxr.open_rasterio(paths[0])
+        if "band" in first.dims:
+            first = first.squeeze("band", drop=True)
+        rasters.append(first)
+    if len(rasters) == 1:
+        ndwi = rasters[0]
+    else:
+        ndwi = merge_arrays(rasters)
+    aoi_ll = gpd.GeoDataFrame([{}], geometry=[gpd.GeoSeries.from_bounds(*bounds_wsen).iloc[0]], crs="EPSG:4326")
+    shapes = [aoi_ll.to_crs(ndwi.rio.crs).geometry.unary_union.__geo_interface__]
+    ndwi_clip = ndwi.rio.clip(shapes, all_touched=True)
+    return ndwi_clip
 
-    # Grid/transform
-    transform = dem_filled.rio.transform()
-    shape = dem_filled.shape
-    try:
-        resx, resy = dem_filled.rio.resolution()
-    except Exception:
-        # Fallback to coordinate diffs
-        resx = float(abs(dem_filled.x[1] - dem_filled.x[0]))  # likely error: assumes regularly spaced coords
-        resy = float(abs(dem_filled.y[1] - dem_filled.y[0]))
-    cell_m = max(abs(resx), abs(resy))
+def run_bounds_rem(bounds_wsen,
+                        fields_path,
+                        ndwi_dir,
+                        stac_dir,
+                        flowlines_local_dir,
+                        out_dir,
+                        ndwi_threshold=0.15,
+                        mgrs_shp_path="~/data/IrrigationGIS/boundaries/mgrs/mgrs_aea.shp"):
+    ensure_dir(out_dir)
+    aoi = aoi_from_bounds(bounds_wsen)
+    flowlines = get_flowlines_within_aoi(aoi, local_flowlines_dir=flowlines_local_dir)
+    tiles, tiles_gdf = tiles_for_bounds(bounds_wsen, mgrs_shp_path)
+    present_map, missing = ndwi_files_for_tiles(ndwi_dir, tiles)
+    if missing:
+        raise ValueError(f"Missing NDWI tiles: {missing}")
+    ndwi_clip = open_ndwi_mosaic(present_map, bounds_wsen)
 
-    # Densify lines to points
-    pts = []
-    for geom in flowlines_gdf.geometry:
-        if geom is None or geom.is_empty:
-            continue
-        length = float(geom.length)
-        if length <= 0:
-            continue
-        # Sample along line at [0, spacing, 2*spacing, ...]
-        dists = np.arange(0.0, max(length, 0.0), float(spacing_m))
-        for d in dists:
-            try:
-                p = geom.interpolate(d)
-                if p is not None and not p.is_empty:
-                    pts.append(p)
-            except Exception:
-                continue
-        # Include endpoint to ensure coverage
-        try:
-            p_end = geom.interpolate(length)
-            if p_end is not None and not p_end.is_empty:
-                pts.append(p_end)
-        except Exception:
-            pass
-
-    if len(pts) == 0:
-        raise ValueError("No densified points generated from flowlines.")
-
-    # Rasterize densified points as a mask
-    point_shapes = [(p, 1) for p in pts]
-    point_mask = features.rasterize(
-        shapes=point_shapes,
-        out_shape=shape,
-        transform=transform,
-        fill=0,
-        all_touched=True,
-        dtype="uint8",
-    ).astype(bool)
-
-    # DEM to NumPy
-    dem_np = np.asarray(dem_filled.data)
-
-    # Assign DEM elevation to densified point cells; others NaN
-    points_elev = np.full(shape, np.nan, dtype="float32")
-    if point_mask.sum() == 0:
-        raise ValueError("Rasterized densified point mask is empty.")
-    points_elev[point_mask] = dem_np[point_mask]
-
-    # Nearest-point expansion via distance transform
-    row_ind, col_ind = ndi.distance_transform_edt(
-        ~point_mask, return_distances=False, return_indices=True
+    dem_cache = os.path.join(out_dir, "dem_bounds_1m.tif")
+    dem = get_dem_for_aoi_via_stac(
+        aoi_gdf=aoi,
+        stac_dir=os.path.expanduser(stac_dir),
+        target_crs_epsg=5070,
+        cache_path=dem_cache,
+        overwrite=False,
+        stac_download_cache_dir=os.path.join(out_dir, 'stac_cache'),
+        stac_collection_id="usgs-3dep-1m-opr",
     )
-    base_surface = points_elev[row_ind, col_ind]
-
-    # Streams raster and distance map for buffer logic
-    streams_da = rasterize_lines_to_grid(flowlines_gdf, dem_filled, burn_value=1)
-    streams_mask = np.asarray(streams_da.data).astype(bool)
-    dist_m = ndi.distance_transform_edt(~streams_mask) * float(cell_m)
-
-    # Gaussian smoothing (meters -> pixels)
-    sigma_px = max(1.0, float(smooth_sigma_m) / float(cell_m))
-    water_smooth = ndi.gaussian_filter(base_surface.astype("float32"), sigma=sigma_px, mode="nearest")
-
-    # Keep unsmoothed near channels
-    water_surface = np.where(dist_m < float(buffer_exclude_m), base_surface, water_smooth)
-
-    rem_np = dem_np - water_surface
-    rem_np = np.where(rem_np < 0, 0, rem_np)
-
-    rem_da = xr.DataArray(
-        rem_np,
-        dims=dem_filled.dims,
-        coords=dem_filled.coords,
-        name="REM",
-        attrs={"description": "Relative Elevation Model (kernel-smoothed base surface from centerlines)"},
-    )
-    rem_da = rem_da.rio.write_crs(dem_filled.rio.crs, inplace=False)
-    return rem_da
-
+    dem_crs = dem.rio.crs
+    flowlines_dem = flowlines.to_crs(dem_crs)
+    streams = build_streams_mask_from_nhd_ndwi(flowlines_dem, dem, ndwi_da=ndwi_clip, ndwi_threshold=float(ndwi_threshold))
+    rem = compute_rem_quick(dem, streams)
+    fields = load_and_clip_fields(fields_path, aoi, dem_crs)
+    fields_stats = compute_field_rem_stats(fields, rem, stats=("mean",))
+    return {
+        "aoi": aoi,
+        "flowlines": flowlines,
+        "ndwi": ndwi_clip,
+        "streams": streams,
+        "rem": rem,
+        "mgrs_tiles": tiles_gdf,
+        "fields": fields,
+        "fields_stats": fields_stats,
+        "summary": {"total_fields": len(fields_stats), "ndwi_threshold": float(ndwi_threshold)},
+    }
 
 def load_and_clip_fields(fields_path, aoi_gdf, target_crs):
     """
@@ -637,13 +540,13 @@ def stratify_fields_by_rem(fields_with_stats_gdf, threshold_m=2.0):
 
 
 def get_dem_for_aoi_via_stac(
-    aoi_gdf,
-    stac_dir: str,
-    target_crs_epsg: int = 5070,
-    cache_path: str | None = None,
-    overwrite: bool = False,
-    stac_download_cache_dir: str | None = None,
-    stac_collection_id: str = "usgs-3dep-1m-opr",
+        aoi_gdf,
+        stac_dir: str,
+        target_crs_epsg: int = 5070,
+        cache_path: str | None = None,
+        overwrite: bool = False,
+        stac_download_cache_dir: str | None = None,
+        stac_collection_id: str = "usgs-3dep-1m-opr",
 ):
     """
     Build a DEM mosaic from a local 3DEP STAC for the AOI.
@@ -715,136 +618,4 @@ def get_dem_for_aoi_via_stac(
     return dem
 
 
-def run_hand_stratification(huc10, fields_path, out_dir,
-                            save_rem=True,
-                            save_intermediates=False,
-                            overwrite_dem=False,
-                            wbd_local_dir=None,
-                            flowlines_local_dir=None,
-                            stac_dir=None,
-                            stac_collection_id="usgs-3dep-1m-opr",
-                            stac_download_cache_dir=None):
-    """
-    Orchestrate REM/HAND computation and field stratification over a HUC-10.
-
-    Workflow:
-    1) Fetch HUC-10 boundary.
-    2) Fetch NHDPlus flowlines within boundary.
-    3) Mosaic 3DEP LiDAR DEM tiles from a local STAC (EPSG:5070 output).
-    4) Reproject AOI and flowlines to DEM CRS; rasterize flowlines to DEM grid.
-    5) Hydro-condition DEM and compute REM (elevation above nearest stream).
-    6) Load statewide irrigation dataset, clip to AOI, reproject to DEM CRS.
-    7) Zonal stats of REM over fields; stratify by threshold (< 2 m => partitioned).
-    8) Save outputs to out_dir.
-
-    Returns a dictionary of key artifacts.
-    """
-    ensure_dir(out_dir)
-
-    # 1) AOI boundary (WBD) from local state shapefile
-    wbd_dir = wbd_local_dir if wbd_local_dir else os.environ.get("HANDILY_WBD_DIR")
-    if not wbd_dir:
-        raise ValueError(
-            "wbd_local_dir is required (or set HANDILY_WBD_DIR) to load WBDHU10 locally."
-        )
-    aoi = get_huc10_boundary(huc10, wbd_local_dir=wbd_dir)
-
-    # 2) Flowlines (local if provided)
-    flowlines = get_flowlines_within_aoi(aoi, local_flowlines_dir=flowlines_local_dir)
-
-    # 3) DEM
-    dem_cache = os.path.join(out_dir, f"dem_huc10_{huc10}_1m.tif")
-    if not stac_dir:
-        raise ValueError(
-            "stac_dir is required. Build one with 'handily stac build --out-dir stac/3dep_1m --states <STATE>' and pass --stac-dir stac/3dep_1m."
-        )
-    if not os.path.isdir(os.path.expanduser(stac_dir)):
-        raise ValueError(f"STAC directory does not exist: {stac_dir}")
-    dem = get_dem_for_aoi_via_stac(
-        aoi,
-        stac_dir=os.path.expanduser(stac_dir),
-        target_crs_epsg=5070,
-        cache_path=dem_cache,
-        overwrite=overwrite_dem,
-        stac_download_cache_dir=stac_download_cache_dir,
-        stac_collection_id=stac_collection_id,
-    )
-    dem_crs = dem.rio.crs
-
-    # 4) Reproject AOI + flowlines to DEM CRS and rasterize streams
-    aoi_dem = aoi.to_crs(dem_crs)
-    flowlines_dem = flowlines.to_crs(dem_crs)
-    streams_da = rasterize_lines_to_grid(flowlines_dem, dem, burn_value=1)
-
-    # 5) Compute REM (centerline/kernel detrend per Klamath approach)
-    rem = compute_rem_centerline(dem, flowlines_dem)
-
-    # Save REM for inspection if requested
-    rem_path = None
-    if save_rem:
-        rem_path = os.path.join(out_dir, f"rem_huc10_{huc10}.tif")
-        LOGGER.info("Saving REM raster: %s", rem_path)
-        rem.rio.to_raster(rem_path)
-
-    # Optional intermediates for QA
-    aoi_path = None
-    flowlines_path = None
-    streams_path = None
-    if save_intermediates:
-        try:
-            aoi_path = os.path.join(out_dir, f"aoi_huc10_{huc10}.gpkg")
-            aoi_dem.to_file(aoi_path, driver="GPKG")
-        except Exception:
-            aoi_path = None
-        try:
-            flowlines_path = os.path.join(out_dir, f"flowlines_huc10_{huc10}.gpkg")
-            flowlines_dem.to_file(flowlines_path, driver="GPKG")
-        except Exception:
-            flowlines_path = None
-        try:
-            streams_path = os.path.join(out_dir, f"streams_huc10_{huc10}.tif")
-            streams_da.rio.to_raster(streams_path)
-        except Exception:
-            streams_path = None
-
-    # 6) Fields (clip + reproject)
-    fields = load_and_clip_fields(fields_path, aoi, dem_crs)
-
-    # 7) Zonal stats and stratification
-    fields_stats = compute_field_rem_stats(fields, rem, stats=("mean",))
-    fields_strat = stratify_fields_by_rem(fields_stats, threshold_m=2.0)
-
-    # 8) Save outputs
-    fields_out_gpkg = os.path.join(out_dir, f"fields_stratified_huc10_{huc10}.gpkg")
-    LOGGER.info("Saving stratified fields: %s", fields_out_gpkg)
-    fields_strat.to_file(fields_out_gpkg, driver="GPKG")
-
-    # Shapefile optional (field name limits apply); keep concise names
-    try:
-        fields_out_shp = os.path.join(out_dir, f"fields_stratified_huc10_{huc10}.shp")
-        fields_strat.to_file(fields_out_shp)
-    except Exception:
-        fields_out_shp = None
-
-    # Quick summary
-    total = len(fields_strat)
-    part = int(fields_strat[fields_strat["partitioned"]].shape[0])
-    LOGGER.info("Partitioned fields (< %.2fm): %s / %s", 2.0, part, total)
-
-    return {
-        "aoi": aoi,
-        "flowlines": flowlines,
-        "dem": dem,
-        "streams": streams_da,
-        "rem": rem,
-        "fields": fields,
-        "fields_stats": fields_stats,
-        "fields_strat": fields_strat,
-        "rem_path": rem_path,
-        "aoi_path": aoi_path,
-        "flowlines_path": flowlines_path,
-        "streams_path": streams_path,
-        "fields_out_gpkg": fields_out_gpkg,
-        "fields_out_shp": fields_out_shp,
-        "summary": {"total_fields": total, "partitioned": part, "threshold_m": 2.0},
-    }
+# Legacy HUC10/RichDEM path removed; use run_bounds_rem

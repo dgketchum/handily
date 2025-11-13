@@ -15,22 +15,16 @@ def main(argv=None):
     parser.add_argument("-v", action="count", default=0, help="Increase verbosity")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    # run subcommand (Klamath-aligned stratification)
-    p_run = sub.add_parser("run", help="Run REM/HAND stratification and write a Leaflet debug map")
-    p_run.add_argument("--huc10", required=True, help="Target HUC-10 ID (e.g., 1002000207)")
-    p_run.add_argument("--fields", required=True, help="Path to irrigation fields dataset (SHP/GPKG/etc.)")
-    p_run.add_argument("--out-dir", required=True, help="Output directory for results")
-    # DEM cache control
-    p_run.add_argument("--overwrite-dem", action="store_true", help="Overwrite cached DEM if it exists")
-    # STAC (required): use local 3DEP STAC for LiDAR tiles
-    p_run.add_argument("--stac-dir", required=True, help="Path to local 3DEP STAC catalog (required)")
-    p_run.add_argument("--stac-collection-id", default=os.environ.get("HANDILY_STAC_COLLECTION", "usgs-3dep-1m-opr"), help="STAC Collection ID (default: usgs-3dep-1m-opr)")
-    p_run.add_argument("--stac-download-cache-dir", default=os.environ.get("HANDILY_STAC_CACHE_DIR"), help="Directory to cache downloaded STAC GeoTIFF tiles")
-    # Outputs
-    p_run.add_argument("--no-save-rem", dest="save_rem", action="store_false", default=True, help="Do not write the REM GeoTIFF")
-    p_run.add_argument("--save-intermediates", action="store_true", default=False, help="Also write AOI/flowlines/streams intermediate files")
-    p_run.add_argument("--wbd-local-dir", default=os.environ.get("HANDILY_WBD_DIR"), help="Path to local WBD state shapefile folder or WBDHU10.shp (required)")
-    p_run.add_argument("--flowlines-local-dir", default=os.environ.get("HANDILY_NHD_DIR"), help="Path to local NHD state shapefile folder (defaults to --wbd-local-dir)")
+    # bounds subcommand (bounds + NHD + NDWI quick REM)
+    p_bounds = sub.add_parser("bounds", help="Build REM within bounds using NHD flowlines + NAIP NDWI")
+    p_bounds.add_argument("--bounds", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"), help="Bounds in EPSG:4326: W S E N")
+    p_bounds.add_argument("--fields", required=True, help="Path to irrigation fields dataset (SHP/GPKG/etc.)")
+    p_bounds.add_argument("--ndwi-dir", required=True, help="Directory containing local NDWI tiles (by MGRS tile ID)")
+    p_bounds.add_argument("--flowlines-local-dir", required=True, help="Path to local NHD state shapefile folder")
+    p_bounds.add_argument("--stac-dir", required=True, help="Path to local 3DEP STAC catalog (required)")
+    p_bounds.add_argument("--mgrs-shp", default=os.path.expanduser("~/data/IrrigationGIS/boundaries/mgrs/mgrs_aea.shp"), help="Path to MGRS AEA shapefile with MGRS_TILE column")
+    p_bounds.add_argument("--ndwi-threshold", type=float, default=0.15, help="NDWI threshold for water masking (default 0.15)")
+    p_bounds.add_argument("--out-dir", required=True, help="Output directory for results")
 
     # stac subcommand with nested build/extend
     p_stac = sub.add_parser("stac", help="3DEP 1 m STAC tools")
@@ -49,44 +43,44 @@ def main(argv=None):
     args = parser.parse_args(argv)
     configure_logging(args.v)
 
-    if args.cmd == "run":
-        from handily.core import run_hand_stratification, ensure_dir, LOGGER as CORE_LOGGER
+    if args.cmd == "bounds":
+        from handily.core import run_bounds_rem, ensure_dir, LOGGER as CORE_LOGGER
         from handily.viz import write_interactive_map
 
         ensure_dir(args.out_dir)
         CORE_LOGGER.info("Output directory: %s", args.out_dir)
-        CORE_LOGGER.info("Starting REM/HAND stratification for HUC-10 %s", args.huc10)
-        results = run_hand_stratification(
-            huc10=str(args.huc10),
+        CORE_LOGGER.info("Building REM within bounds: %s", args.bounds)
+        results = run_bounds_rem(
+            bounds_wsen=tuple(args.bounds),
             fields_path=os.path.expanduser(args.fields),
+            ndwi_dir=os.path.expanduser(args.ndwi_dir),
+            stac_dir=os.path.expanduser(args.stac_dir),
+            flowlines_local_dir=os.path.expanduser(args.flowlines_local_dir),
             out_dir=args.out_dir,
-            save_rem=bool(args.save_rem),
-            save_intermediates=bool(args.save_intermediates),
-            overwrite_dem=bool(args.overwrite_dem),
-            wbd_local_dir=args.wbd_local_dir,
-            flowlines_local_dir=(args.flowlines_local_dir or args.wbd_local_dir),
-            stac_dir=args.stac_dir,
-            stac_collection_id=args.stac_collection_id,
-            stac_download_cache_dir=args.stac_download_cache_dir,
+            ndwi_threshold=float(args.ndwi_threshold),
+            mgrs_shp_path=os.path.expanduser(args.mgrs_shp),
         )
         out_html = os.path.join(args.out_dir, "debug_map.html")
         write_interactive_map(results, out_html, initial_threshold=2.0)
-        summary = results.get("summary", {})
-        total_fields = summary.get("total_fields")
-        partitioned = summary.get("partitioned")
-        threshold_m = summary.get("threshold_m")
-        print("--- Stratification Summary ---")
-        print(f"HUC-10: {args.huc10}")
-        print(f"Fields total: {total_fields}")
-        print(f"Partitioned (< {threshold_m} m): {partitioned}")
-        print("Outputs:")
-        if results.get("rem_path"):
-            print(f"  REM: {results['rem_path']}")
-        if results.get("fields_out_gpkg"):
-            print(f"  Stratified fields (GPKG): {results['fields_out_gpkg']}")
-        if results.get("fields_out_shp"):
-            print(f"  Stratified fields (SHP): {results['fields_out_shp']}")
-        print(f"  Map: {out_html}")
+        # Persist QA rasters
+        rem_path = os.path.join(args.out_dir, "rem_bounds.tif")
+        streams_path = os.path.join(args.out_dir, "streams_bounds.tif")
+        results["rem"].rio.to_raster(rem_path)
+        results["streams"].rio.to_raster(streams_path)
+        # Persist QA vectors
+        fields_gpkg = os.path.join(args.out_dir, "fields_bounds.gpkg")
+        mgrs_gpkg = os.path.join(args.out_dir, "mgrs_tiles_bounds.gpkg")
+        results["fields"].to_file(fields_gpkg, driver="GPKG")
+        results["mgrs_tiles"].to_file(mgrs_gpkg, driver="GPKG")
+
+        print("--- Bounds REM Summary ---")
+        print(f"Fields total: {results['summary'].get('total_fields')}")
+        print(f"NDWI threshold: {results['summary'].get('ndwi_threshold')}")
+        print(f"Map: {out_html}")
+        print(f"REM GeoTIFF: {rem_path}")
+        print(f"Streams mask GeoTIFF: {streams_path}")
+        print(f"Fields GPKG: {fields_gpkg}")
+        print(f"MGRS tiles GPKG: {mgrs_gpkg}")
         return 0
 
     if args.cmd == "stac":

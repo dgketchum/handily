@@ -210,3 +210,4 @@ __marimo__/
 .idea
 /.idea/.gitignore
 /klamath.txt
+.DS_Store
