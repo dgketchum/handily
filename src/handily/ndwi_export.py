@@ -69,20 +69,23 @@ def export_ndwi_for_bounds(bounds_wsen,
     return tasks
 
 
-def export_ndwi_for_polygons(aoi_gdf,
+def export_ndwi_for_polygons(aoi_shapefile,
                              bucket='wudr',
-                             prefix='naip_ndwi_aoi',
+                             prefix=None,
                              start_date='2014-01-01',
                              end_date='2024-12-31',
                              skip_if_present_dir=None):
+    shp_path = os.path.expanduser(aoi_shapefile)
+    aoi_gdf = gpd.read_file(shp_path)
     tasks = []
     for i, row in aoi_gdf.iterrows():
         geom = row.geometry
         region = _ee_geom(geom)
         ndwi = _naip_ndwi_image(region, start_date, end_date)
-        fname = f"{prefix}_{i:04d}"
+        idx = int(row['aoi_id']) if 'aoi_id' in aoi_gdf.columns else int(i)
+        fname = f"{prefix}/naip_ndwi_aoi_{idx:04d}"
         if skip_if_present_dir:
-            present = glob.glob(os.path.join(os.path.expanduser(skip_if_present_dir), f"{fname}*.tif"))
+            present = glob.glob(os.path.join(skip_if_present_dir, f"{os.path.basename(fname)}*.tif"))
             if present:
                 continue
         task = ee.batch.Export.image.toCloudStorage(
@@ -90,16 +93,16 @@ def export_ndwi_for_polygons(aoi_gdf,
             region=region, scale=1, maxPixels=1e13)
         task.start()
         tasks.append(task)
+        print(fname)
     return tasks
 
 
 if __name__ == '__main__':
     ee.Initialize()
     shp_path = '/home/dgketchum/data/IrrigationGIS/handily/outputs/testing/ndwi_aois.shp'
-    aoi = gpd.read_file(shp_path)
     ndwi_dir = os.path.expanduser('~/data/IrrigationGIS/surface_water/NDWI/')
     tasks = export_ndwi_for_polygons(
-        aoi_gdf=aoi,
+        aoi_shapefile=shp_path,
         bucket='wudr',
         prefix='naip_ndwi_aoi',
         start_date='2014-01-01',

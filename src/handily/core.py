@@ -13,6 +13,7 @@ from pyproj import CRS as _CRS
 from rasterio import features
 from rasterstats import zonal_stats
 from scipy import ndimage as ndi
+from shapely.geometry import box
 from rioxarray.merge import merge_arrays
 
 LOGGER = logging.getLogger("handily.core")
@@ -328,12 +329,14 @@ def compute_rem_quick(dem_da, streams_da):
 
 def aoi_from_bounds(bounds_wsen):
     w, s, e, n = bounds_wsen
-    aoi = gpd.GeoDataFrame([{}], geometry=[gpd.GeoSeries.from_bounds(w, s, e, n).iloc[0]], crs="EPSG:4326")
+    geom = box(w, s, e, n)
+    aoi = gpd.GeoDataFrame([{}], geometry=[geom], crs="EPSG:4326")
     return aoi
 
 def tiles_for_bounds(bounds_wsen, mgrs_shp_path):
     w, s, e, n = bounds_wsen
-    aoi_ll = gpd.GeoDataFrame([{}], geometry=[gpd.GeoSeries.from_bounds(w, s, e, n).iloc[0]], crs="EPSG:4326")
+    geom = box(w, s, e, n)
+    aoi_ll = gpd.GeoDataFrame([{}], geometry=[geom], crs="EPSG:4326")
     mgrs = gpd.read_file(os.path.expanduser(mgrs_shp_path))
     mgrs_aea = mgrs.to_crs("EPSG:5070")
     aoi_aea = aoi_ll.to_crs("EPSG:5070")
@@ -367,7 +370,8 @@ def open_ndwi_mosaic(present_map, bounds_wsen):
         ndwi = rasters[0]
     else:
         ndwi = merge_arrays(rasters)
-    aoi_ll = gpd.GeoDataFrame([{}], geometry=[gpd.GeoSeries.from_bounds(*bounds_wsen).iloc[0]], crs="EPSG:4326")
+    geom = box(*bounds_wsen)
+    aoi_ll = gpd.GeoDataFrame([{}], geometry=[geom], crs="EPSG:4326")
     shapes = [aoi_ll.to_crs(ndwi.rio.crs).geometry.unary_union.__geo_interface__]
     ndwi_clip = ndwi.rio.clip(shapes, all_touched=True)
     return ndwi_clip
@@ -411,6 +415,7 @@ def run_bounds_rem(bounds_wsen,
         "ndwi": ndwi_clip,
         "streams": streams,
         "rem": rem,
+        "dem": dem,
         "mgrs_tiles": tiles_gdf,
         "fields": fields,
         "fields_stats": fields_stats,

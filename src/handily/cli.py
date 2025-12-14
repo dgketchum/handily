@@ -26,6 +26,14 @@ def main(argv=None):
     p_bounds.add_argument("--ndwi-threshold", type=float, default=0.15, help="NDWI threshold for water masking (default 0.15)")
     p_bounds.add_argument("--out-dir", required=True, help="Output directory for results")
 
+    p_aoi = sub.add_parser("aoi", help="Build buffered-field AOI tiles and write a shapefile")
+    p_aoi.add_argument("--fields", required=True, help="Path to statewide irrigation dataset")
+    p_aoi.add_argument("--out-shp", required=True, help="Output AOI shapefile path")
+    p_aoi.add_argument("--max-km2", type=float, default=625.0, help="Maximum AOI tile area in square kilometers")
+    p_aoi.add_argument("--buffer-m", type=float, default=1000.0, help="Centroid buffer radius in meters")
+    p_aoi.add_argument("--bounds", nargs=4, type=float, metavar=("W", "S", "E", "N"), help="Optional bounds in EPSG:4326 (W S E N)")
+    p_aoi.add_argument("--simplify-m", type=float, default=None, help="Optional simplify tolerance in meters")
+
     # stac subcommand with nested build/extend
     p_stac = sub.add_parser("stac", help="3DEP 1 m STAC tools")
     stac_sub = p_stac.add_subparsers(dest="stac_cmd", required=True)
@@ -81,6 +89,22 @@ def main(argv=None):
         print(f"Streams mask GeoTIFF: {streams_path}")
         print(f"Fields GPKG: {fields_gpkg}")
         print(f"MGRS tiles GPKG: {mgrs_gpkg}")
+        return 0
+
+    if args.cmd == "aoi":
+        from handily.aoi_split import build_centroid_buffer_aois, write_aois_shapefile
+
+        bounds = tuple(args.bounds) if args.bounds else None
+        tiles = build_centroid_buffer_aois(
+            fields_path=os.path.expanduser(args.fields),
+            max_km2=float(args.max_km2),
+            buffer_m=float(args.buffer_m),
+            bounds_wsen=bounds,
+            simplify_tolerance_m=args.simplify_m,
+        )
+        out_shp = os.path.expanduser(args.out_shp)
+        write_aois_shapefile(tiles, out_shp)
+        print(f"AOI tiles written: {out_shp}")
         return 0
 
     if args.cmd == "stac":
