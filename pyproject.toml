@@ -37,6 +37,7 @@ dependencies = [
   "pystac>=1.8",
   "requests>=2.31",
   "tqdm>=4.65",
+  "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

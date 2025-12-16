@@ -1,5 +1,6 @@
 __all__ = [
-    "core",
+    "config",
+    "pipeline",
     "viz",
     "stac_3dep",
 ]

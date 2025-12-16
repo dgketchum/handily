@@ -3,7 +3,6 @@ import math
 import geopandas as gpd
 from shapely.geometry import box as shapely_box, LineString
 from shapely.ops import split
-from handily.core import get_flowlines_within_aoi  # unused; left per cleanup policy
 
 
 def _fishnet_chunks(geom_aea, max_km2):

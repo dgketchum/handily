@@ -1,0 +1,11 @@
+fields_path: ~/data/IrrigationGIS/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp
+out_dir: /home/dgketchum/data/IrrigationGIS/handily/outputs/
+flowlines_local_dir: ~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape
+ndwi_dir: ~/data/IrrigationGIS/handily/ndwi/beaverhead/
+stac_dir: ~/data/IrrigationGIS/handily/stac/3dep_1m/
+bounds: [-112.418, 45.445, -112.353, 45.49]  # [W, S, E, N] in EPSG:4326
+ndwi_threshold: 0.45
+
+overwrite_outputs: true
+viz_only: true
+bake_tiles: false

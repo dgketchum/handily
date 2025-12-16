@@ -1,123 +1,160 @@
 import os
-os.environ["OMP_NUM_THREADS"] = "12"
-os.environ["OMP_THREAD_LIMIT"] = "12"
+import sys
+import logging
+from pathlib import Path
+
+import yaml
 import geopandas as gpd
-import ee
-from handily.core import (
-    ensure_dir,
-    aoi_from_bounds,
-    tiles_for_bounds,
-    ndwi_files_for_tiles,
-    open_ndwi_mosaic,
-    get_flowlines_within_aoi,
-    get_dem_for_aoi_via_stac,
-    build_streams_mask_from_nhd_ndwi,
-    compute_rem_quick,
-    load_and_clip_fields,
-    compute_field_rem_stats,
-)
+import rioxarray as rxr
+
+from handily.config import HandilyConfig
+from handily.compute import compute_field_rem_stats
+from handily.io import aoi_from_bounds, ensure_dir
+from handily.pipeline import REMWorkflow
 from handily.viz import write_interactive_map
-from handily.aoi_split import build_centroid_buffer_aois, write_aois_shapefile
-from handily.ndwi_export import export_ndwi_for_polygons
 
 
-def dev_test_bounds_rem(fields_path, ndwi_dir, out_dir,
-                        stac_dir,
-                        flowlines_local_dir=None,
-                        bounds=None,
-                        ndwi_threshold=0.15,
-                        mgrs_shp_path="~/data/IrrigationGIS/boundaries/mgrs/mgrs_aea.shp"):
-    ensure_dir(out_dir)
-
-    aoi = aoi_from_bounds(bounds)
-    flowlines = get_flowlines_within_aoi(aoi, local_flowlines_dir=flowlines_local_dir)
-    tiles, tiles_gdf = tiles_for_bounds(bounds, mgrs_shp_path)
-    present_map, missing = ndwi_files_for_tiles(ndwi_dir, tiles)
-    if missing:
-        raise ValueError(f"Missing NDWI tiles: {missing}")
-    ndwi_clip = open_ndwi_mosaic(present_map, bounds)
-    dem_cache = os.path.join(out_dir, "dem_bounds_1m.tif")
-
-    dem = get_dem_for_aoi_via_stac(
-        aoi_gdf=aoi,
-        stac_dir=os.path.expanduser(stac_dir),
-        target_crs_epsg=5070,
-        cache_path=dem_cache,
-        overwrite=False,
-        stac_download_cache_dir=os.path.join(out_dir, 'stac_cache'),
-        stac_collection_id="usgs-3dep-1m-opr",
+def configure_logging() -> None:
+    level_name = os.environ.get("HANDILY_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s.%(msecs)03d | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
     )
-    dem_crs = dem.rio.crs
-    flowlines_dem = flowlines.to_crs(dem_crs)
-    streams = build_streams_mask_from_nhd_ndwi(flowlines_dem, dem, ndwi_da=ndwi_clip, ndwi_threshold=float(ndwi_threshold))
-    rem = compute_rem_quick(dem, streams)
-    fields = load_and_clip_fields(fields_path, aoi, dem_crs)
-    fields_stats = compute_field_rem_stats(fields, rem, stats=("mean",))
-    results = {
-        "aoi": aoi,
-        "flowlines": flowlines,
-        "ndwi": ndwi_clip,
-        "streams": streams,
-        "rem": rem,
-        "dem": dem,
-        "mgrs_tiles": tiles_gdf,
-        "fields": fields,
-        "fields_stats": fields_stats,
-        "summary": {
-            "total_fields": len(fields_stats),
-            "ndwi_threshold": float(ndwi_threshold),
-        },
-    }
-    return results
 
 
-if __name__ == '__main__':
-    fields = os.path.expanduser(
-        "~/data/IrrigationGIS/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp")
-    out_dir_ = "/home/dgketchum/data/IrrigationGIS/handily/outputs/"
-    flowlines_local_dir_ = os.path.expanduser("~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape")
-    ndwi_dir_ = os.path.expanduser("~/data/IrrigationGIS/handily/ndwi/beaverhead/")
-    stac_dir_ = os.path.expanduser("~/data/IrrigationGIS/handily/stac/3dep_1m/")
-    bounds_ = (-112.5, 45.4, -112.27, 45.6)
-    aoi_bounds = None  # (-112.8, 45.14, -112.27, 45.62)
-    aoi_out_dir = "/home/dgketchum/data/IrrigationGIS/handily/outputs/testing"
-    aoi_shp = os.path.join(aoi_out_dir, "ndwi_aois.shp")
-    aoi_max_km2 = 625
-    aoi_buffer_m = 5000
-    aoi_simplify_m = None
-    aoi_overwrite = False
-    ee.Initialize()
+def dev_test_bounds_rem(config: HandilyConfig, bounds_wsen, ndwi_threshold: float):
+    ensure_dir(config.out_dir)
+    aoi = aoi_from_bounds(bounds_wsen)
+    workflow = REMWorkflow(config=config, aoi=aoi)
+    result = workflow.run(ndwi_threshold=float(ndwi_threshold), stats=("mean",), cache_flowlines=True)
+    return result
 
-    if aoi_overwrite or not os.path.exists(aoi_shp):
-        aoi_tiles = build_centroid_buffer_aois(
-            fields_path=fields,
-            max_km2=aoi_max_km2,
-            buffer_m=aoi_buffer_m,
-            bounds_wsen=aoi_bounds,
-            simplify_tolerance_m=aoi_simplify_m,
-        )
-        write_aois_shapefile(aoi_tiles, aoi_shp)
+
+def _subset_results_to_aoi(results: dict, aoi_gdf: gpd.GeoDataFrame) -> dict:
+    out = dict(results)
+    out["aoi"] = aoi_gdf
+
+    for key in ("flowlines", "fields_stats"):
+        gdf = out.get(key)
+        if gdf is None or len(gdf) == 0:
+            continue
+        aoi_in_crs = aoi_gdf.to_crs(gdf.crs)
+        try:
+            out[key] = gpd.clip(gdf, aoi_in_crs)
+        except Exception:
+            out[key] = gpd.overlay(gdf, aoi_in_crs, how="intersection")
+
+    for key in ("rem", "dem", "streams"):
+        da = out.get(key)
+        if da is None:
+            continue
+        shapes = [aoi_gdf.to_crs(da.rio.crs).geometry.unary_union.__geo_interface__]
+        out[key] = da.rio.clip(shapes, all_touched=True)
+
+    return out
+
+
+def main(argv=None) -> int:
+    configure_logging()
+    argv = sys.argv[1:] if argv is None else argv
+    config_path = Path(argv[0]) if argv else Path(__file__).with_name("beaverhead_config.yaml")
+
+    aoi_select = None # [30]
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config must parse to a mapping, got {type(cfg).__name__}")
+
+    config = HandilyConfig.from_dict(cfg)
+    bounds_wsen = tuple(cfg["bounds"])
+    ndwi_threshold = float(cfg.get("ndwi_threshold", 0.15))
+    overwrite_outputs = bool(cfg.get("overwrite_outputs", False))
+    viz_only = bool(cfg.get("viz_only", False))
+    bake_tiles = bool(cfg.get("bake_tiles", False))
+
+    rem_path = os.path.join(config.out_dir, "rem_bounds.tif")
+    streams_path = os.path.join(config.out_dir, "streams_bounds.tif")
+    ndwi_path = os.path.join(config.out_dir, "ndwi_bounds.tif")
+    fields_fgb = os.path.join(config.out_dir, "fields_bounds.fgb")
+    dem_path = os.path.join(config.out_dir, "dem_bounds_1m.tif")
+
+    if viz_only:
+        aoi = aoi_from_bounds(bounds_wsen)
+        flowlines = gpd.read_file(os.path.join(config.out_dir, "flowlines_bounds.fgb"))
+
+        rem_da = rxr.open_rasterio(rem_path)
+        if "band" in rem_da.dims:
+            rem_da = rem_da.squeeze("band", drop=True)
+        dem_da = rxr.open_rasterio(dem_path)
+        if "band" in dem_da.dims:
+            dem_da = dem_da.squeeze("band", drop=True)
+
+        fields = gpd.read_file(fields_fgb)
+        fields_stats = compute_field_rem_stats(fields, rem_da, stats=("mean",))
+
+        if not bake_tiles:
+            rem_da = None
+            dem_da = None
+
+        results = {
+            "aoi": aoi,
+            "flowlines": flowlines,
+            "rem": rem_da,
+            "dem": dem_da,
+            "fields": fields,
+            "fields_stats": fields_stats,
+            "summary": {
+                "total_fields": len(fields_stats),
+                "ndwi_threshold": float(ndwi_threshold),
+            },
+        }
     else:
-        aoi_tiles = gpd.read_file(aoi_shp)
-    export_ndwi_for_polygons(
-        aoi_shapefile=aoi_shp,
-        bucket='wudr',
-        prefix='handily/ndwi/naip_ndwi_aoi',
-        start_date='2014-01-01',
-        end_date='2024-12-31',
-        skip_if_present_dir=ndwi_dir_,
-    )
+        results = dev_test_bounds_rem(config=config, bounds_wsen=bounds_wsen, ndwi_threshold=ndwi_threshold)
 
-    results = dev_test_bounds_rem(
-        fields_path=fields,
-        ndwi_dir=ndwi_dir_,
-        out_dir=out_dir_,
-        stac_dir=stac_dir_,
-        flowlines_local_dir=flowlines_local_dir_,
-        bounds=bounds_,
-        ndwi_threshold=0.15,
-    )
-    pass
-    # out_html = os.path.join(out_dir_, "debug_map.html")
-    # write_interactive_map(results, out_html, initial_threshold=2.0)
-# ========================= EOF ====================================================================
+        if overwrite_outputs and os.path.exists(rem_path):
+            os.remove(rem_path)
+        if overwrite_outputs and os.path.exists(streams_path):
+            os.remove(streams_path)
+        if overwrite_outputs and os.path.exists(ndwi_path):
+            os.remove(ndwi_path)
+        logging.getLogger("handily.beaverhead").info(
+            "Writing rasters (overwrite_outputs=%s): rem=%s streams=%s ndwi=%s",
+            overwrite_outputs,
+            rem_path,
+            streams_path,
+            ndwi_path,
+        )
+        results["rem"].rio.to_raster(rem_path, overwrite=overwrite_outputs)
+        results["streams"].rio.to_raster(streams_path, overwrite=overwrite_outputs)
+        if results.get("ndwi") is not None:
+            results["ndwi"].rio.to_raster(ndwi_path, overwrite=overwrite_outputs)
+
+        if overwrite_outputs and os.path.exists(fields_fgb):
+            os.remove(fields_fgb)
+        fields = results["fields"]
+        if "FID" in fields.columns:
+            fields = fields.rename(columns={"FID": "FID_"})
+        fields.to_file(fields_fgb, driver="FlatGeobuf")
+
+    out_html = os.path.join(config.out_dir, "debug_map.html")
+    write_interactive_map(results, out_html, initial_threshold=2.0)
+
+    print("--- Beaverhead Bounds REM Summary ---")
+    print(f"Fields total: {results['summary'].get('total_fields')}")
+    print(f"NDWI threshold: {results['summary'].get('ndwi_threshold')}")
+    print(f"Map: {out_html}")
+    print(f"REM GeoTIFF: {rem_path}")
+    print(f"Streams mask GeoTIFF: {streams_path}")
+    print(f"NDWI mosaic GeoTIFF: {ndwi_path}")
+    print(f"Fields FGB: {fields_fgb}")
+    return 0
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("OMP_NUM_THREADS", "12")
+    os.environ.setdefault("OMP_THREAD_LIMIT", "12")
+    raise SystemExit(main())

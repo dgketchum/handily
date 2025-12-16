@@ -19,10 +19,9 @@ def main(argv=None):
     p_bounds = sub.add_parser("bounds", help="Build REM within bounds using NHD flowlines + NAIP NDWI")
     p_bounds.add_argument("--bounds", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"), help="Bounds in EPSG:4326: W S E N")
     p_bounds.add_argument("--fields", required=True, help="Path to irrigation fields dataset (SHP/GPKG/etc.)")
-    p_bounds.add_argument("--ndwi-dir", required=True, help="Directory containing local NDWI tiles (by MGRS tile ID)")
+    p_bounds.add_argument("--ndwi-dir", required=True, help="Directory containing local NDWI GeoTIFFs")
     p_bounds.add_argument("--flowlines-local-dir", required=True, help="Path to local NHD state shapefile folder")
     p_bounds.add_argument("--stac-dir", required=True, help="Path to local 3DEP STAC catalog (required)")
-    p_bounds.add_argument("--mgrs-shp", default=os.path.expanduser("~/data/IrrigationGIS/boundaries/mgrs/mgrs_aea.shp"), help="Path to MGRS AEA shapefile with MGRS_TILE column")
     p_bounds.add_argument("--ndwi-threshold", type=float, default=0.15, help="NDWI threshold for water masking (default 0.15)")
     p_bounds.add_argument("--out-dir", required=True, help="Output directory for results")
 
@@ -52,7 +51,6 @@ def main(argv=None):
     configure_logging(args.v)
 
     if args.cmd == "bounds":
-        from handily.core import run_bounds_rem, ensure_dir, LOGGER as CORE_LOGGER
         from handily.viz import write_interactive_map
 
         ensure_dir(args.out_dir)
@@ -66,7 +64,6 @@ def main(argv=None):
             flowlines_local_dir=os.path.expanduser(args.flowlines_local_dir),
             out_dir=args.out_dir,
             ndwi_threshold=float(args.ndwi_threshold),
-            mgrs_shp_path=os.path.expanduser(args.mgrs_shp),
         )
         out_html = os.path.join(args.out_dir, "debug_map.html")
         write_interactive_map(results, out_html, initial_threshold=2.0)
@@ -77,9 +74,7 @@ def main(argv=None):
         results["streams"].rio.to_raster(streams_path)
         # Persist QA vectors
         fields_gpkg = os.path.join(args.out_dir, "fields_bounds.gpkg")
-        mgrs_gpkg = os.path.join(args.out_dir, "mgrs_tiles_bounds.gpkg")
         results["fields"].to_file(fields_gpkg, driver="GPKG")
-        results["mgrs_tiles"].to_file(mgrs_gpkg, driver="GPKG")
 
         print("--- Bounds REM Summary ---")
         print(f"Fields total: {results['summary'].get('total_fields')}")
@@ -88,7 +83,6 @@ def main(argv=None):
         print(f"REM GeoTIFF: {rem_path}")
         print(f"Streams mask GeoTIFF: {streams_path}")
         print(f"Fields GPKG: {fields_gpkg}")
-        print(f"MGRS tiles GPKG: {mgrs_gpkg}")
         return 0
 
     if args.cmd == "aoi":

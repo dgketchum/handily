@@ -45,7 +45,8 @@ def write_interactive_map(results, out_html, initial_threshold=2.0):
         raise ValueError("fields_stats with 'rem_mean' is required in results for visualization.")
 
     aoi_gj = _to_wgs84_geojson(aoi)
-    flow_gj = _to_wgs84_geojson(flowlines)
+    flow_geo = flowlines[['ObjectID', 'visibility', 'geometry']]
+    flow_gj = _to_wgs84_geojson(flow_geo)
     fields_gj = _to_wgs84_geojson(fields_stats)
 
     # Optional raster overlays (REM/DEM) as PNGs with WGS84 bounds
@@ -98,8 +99,8 @@ def write_interactive_map(results, out_html, initial_threshold=2.0):
     .legend .swatch {{ display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: middle; }}
   </style>
   <base target=\"_self\">
-  <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self' https://unpkg.com https://*.tile.openstreetmap.org; style-src 'self' 'unsafe-inline' https://unpkg.com;\" />
-  <!-- CSP keeps things tidy while allowing Leaflet and OSM tiles. -->
+	  <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self' https://unpkg.com https://*.tile.openstreetmap.org; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com;\" />
+	  <!-- CSP keeps things tidy while allowing Leaflet and OSM tiles. -->
 </head>
 <body>
   <div id=\"map\"></div>

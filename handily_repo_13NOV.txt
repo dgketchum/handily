@@ -1,0 +1,2548 @@
+--- START OF README.md ---
+
+# handily
+Application of Height Above Nearest Drainage algorithm to estimate groundwater interaction with riparian polygon objects (agricultural fields).
+
+## Installation
+
+This project is packaged with a standard `pyproject.toml`.
+
+### Option A: pip (venv or pipx)
+
+- Python 3.10 is required.
+- Create and activate a virtualenv, then install:
+  - `python -m venv .venv && source .venv/bin/activate`
+  - `pip install -U pip setuptools wheel`
+  - `pip install .`
+
+Notes:
+- Heavy geospatial wheels (geopandas, rasterio, fiona) install best on Linux/macOS with prebuilt wheels. If your platform lacks wheels, prefer the Conda/Mamba route below.
+- We pin `numpy<2` for RichDEM compatibility and include `pybind11` to help build if a wheel isn’t available.
+
+### Option B: uv (fast installer)
+
+- Install uv (see https://docs.astral.sh/uv/ for platform installers), then:
+  - Ensure Python 3.10 is available: `uv python install 3.10`
+  - Create and activate a venv: `uv venv --python 3.10 .venv && source .venv/bin/activate`
+  - Install the package: `uv pip install -U pip setuptools wheel && uv pip install .`
+
+Tool-style install (no venv activation):
+- `uv tool install .`  # installs a `handily` command in uv’s tool shim
+- Run: `handily --help`
+
+Dev install with extras:
+- `uv pip install -e .[dev]`
+
+Notes:
+- uv honors the `pyproject.toml` and will use prebuilt wheels when available. If wheels are missing for your platform, prefer Conda/Mamba below for GDAL/Fiona/Rasterio.
+
+### Option C: Conda/Mamba (robust for compiled deps)
+
+- `mamba create -n handily -c conda-forge python=3.10 geopandas rasterio rioxarray xarray scipy rasterstats pynhd numpy=1.26 -y`
+- `mamba activate handily`
+- `pip install -U pybind11 richdem`
+
+If you maintain a local RichDEM checkout and want to install from source instead of PyPI:
+- `pip install -v --no-binary :all: /path/to/richdem/wrappers/pyrichdem`
+
+## 3DEP 1 m STAC
+
+Build a local STAC catalog for USGS 3DEP OPR 1 m DEM tiles directly from the TNM S3 index:
+
+- Build for Montana (MT) only into `stac/3dep_1m`:
+  - `handily stac build --out-dir stac/3dep_1m --states MT`
+
+The builder crawls project → subproject → metadata, parses FGDC XMLs (for bbox and links), and creates one STAC Item per tile with links to the GeoTIFF and XML.
+
+## Usage
+
+After installation, use the CLI:
+
+- Run stratification (replace `--fields` with your dataset). Required: pass `--stac-dir` pointing to your local STAC:
+  - `handily run --huc10 1002000207 --fields /path/to/fields.shp --out-dir ./outputs/beaverhead --wbd-local-dir ~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape --stac-dir stac/3dep_1m -v`
+  - To use local NHD flowlines from the same state dataset, you can add `--flowlines-local-dir` (defaults to the WBD dir if omitted).
+  - DEM is LiDAR-only (~1 m). Runs abort if the service returns > 2 m.
+  - Optional: `--stac-download-cache-dir` for tile caching, `--stac-collection-id` to target a custom collection id.
+
+Caching and performance
+- The final mosaic is cached to `dem_huc10_<HUC>_1m.tif` in your `--out-dir` and reused unless `--overwrite-dem` is provided.
+- Individual STAC GeoTIFF tiles are downloaded once and cached under `--stac-download-cache-dir` (default: `<out-dir>/stac_cache`).
+
+Outputs (written to your `--out-dir`):
+- REM GeoTIFF, stratified fields (GPKG/SHP), and an interactive debug map (`debug_map.html`).
+
+## Troubleshooting
+
+- RichDEM build/import issues:
+  - Ensure Python 3.10, a C++ toolchain, and `pybind11` are present.
+  - If installing from PyPI, use `numpy<2` (e.g., `1.26.*`).
+  - As a fallback, consider installing RichDEM from local source as shown above.
+- Network access is required to fetch 3DEP DEMs. NHD flowlines can be loaded from the local state shapefiles by setting `--flowlines-local-dir`.
+  - Note: WBD boundaries are loaded from a local state shapefile (set `--wbd-local-dir` or env `HANDILY_WBD_DIR`).
+
+## Dev usage (without install)
+
+- You can still run the dev script:
+  - `python scripts/run_beaverhead.py --huc10 1002000207 --fields /path/to/fields.shp --out-dir ./outputs/beaverhead -v`
+  - The script now imports the in-repo package (`src/handily`) or an installed version.
+
+
+--- END OF README.md ---
+
+--- START OF pyproject.toml ---
+
+[build-system]
+requires = ["hatchling>=1.21.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "handily"
+version = "0.1.0"
+description = "Height Above Nearest Drainage (REM/HAND) stratification and Leaflet visualization"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10,<3.11"
+authors = [
+  { name = "dgketchum" }
+]
+keywords = ["hydrology", "GIS", "DEM", "HAND", "REM", "geospatial", "NHD", "3DEP", "raster"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+  "numpy>=1.24",
+  "geopandas>=0.13",
+  "rasterio>=1.3",
+  "rioxarray>=0.14",
+  "xarray>=2023.1",
+  "scipy>=1.10",
+  "rasterstats>=0.19",
+  "pynhd>=0.15",
+  "shapely>=2.0",
+  "fiona>=1.9",
+  "affine>=2.4",
+  "pystac>=1.8",
+  "requests>=2.31",
+  "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "black",
+  "isort",
+  "mypy",
+]
+
+[project.urls]
+Homepage = "https://example.com/handily"
+
+[project.scripts]
+handily = "handily.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/handily"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src",
+  "README.md",
+  "LICENSE",
+  "scripts",
+]
+
+
+--- END OF pyproject.toml ---
+
+--- START OF scripts/beaverhead.py ---
+
+import os
+os.environ["OMP_NUM_THREADS"] = "12"
+os.environ["OMP_THREAD_LIMIT"] = "12"
+import geopandas as gpd
+import ee
+from handily.core import (
+    ensure_dir,
+    aoi_from_bounds,
+    tiles_for_bounds,
+    ndwi_files_for_tiles,
+    open_ndwi_mosaic,
+    get_flowlines_within_aoi,
+    get_dem_for_aoi_via_stac,
+    build_streams_mask_from_nhd_ndwi,
+    compute_rem_quick,
+    load_and_clip_fields,
+    compute_field_rem_stats,
+)
+from handily.viz import write_interactive_map
+from handily.aoi_split import build_centroid_buffer_aois, write_aois_shapefile
+from handily.ndwi_export import export_ndwi_for_polygons
+
+
+def dev_test_bounds_rem(fields_path, ndwi_dir, out_dir,
+                        stac_dir,
+                        flowlines_local_dir=None,
+                        bounds=None,
+                        ndwi_threshold=0.15,
+                        mgrs_shp_path="~/data/IrrigationGIS/boundaries/mgrs/mgrs_aea.shp"):
+    ensure_dir(out_dir)
+
+    aoi = aoi_from_bounds(bounds)
+    flowlines = get_flowlines_within_aoi(aoi, local_flowlines_dir=flowlines_local_dir)
+    tiles, tiles_gdf = tiles_for_bounds(bounds, mgrs_shp_path)
+    present_map, missing = ndwi_files_for_tiles(ndwi_dir, tiles)
+    if missing:
+        raise ValueError(f"Missing NDWI tiles: {missing}")
+    ndwi_clip = open_ndwi_mosaic(present_map, bounds)
+    dem_cache = os.path.join(out_dir, "dem_bounds_1m.tif")
+
+    dem = get_dem_for_aoi_via_stac(
+        aoi_gdf=aoi,
+        stac_dir=os.path.expanduser(stac_dir),
+        target_crs_epsg=5070,
+        cache_path=dem_cache,
+        overwrite=False,
+        stac_download_cache_dir=os.path.join(out_dir, 'stac_cache'),
+        stac_collection_id="usgs-3dep-1m-opr",
+    )
+    dem_crs = dem.rio.crs
+    flowlines_dem = flowlines.to_crs(dem_crs)
+    streams = build_streams_mask_from_nhd_ndwi(flowlines_dem, dem, ndwi_da=ndwi_clip, ndwi_threshold=float(ndwi_threshold))
+    rem = compute_rem_quick(dem, streams)
+    fields = load_and_clip_fields(fields_path, aoi, dem_crs)
+    fields_stats = compute_field_rem_stats(fields, rem, stats=("mean",))
+    results = {
+        "aoi": aoi,
+        "flowlines": flowlines,
+        "ndwi": ndwi_clip,
+        "streams": streams,
+        "rem": rem,
+        "mgrs_tiles": tiles_gdf,
+        "fields": fields,
+        "fields_stats": fields_stats,
+        "summary": {
+            "total_fields": len(fields_stats),
+            "ndwi_threshold": float(ndwi_threshold),
+        },
+    }
+    return results
+
+
+if __name__ == '__main__':
+    fields = os.path.expanduser(
+        "~/data/IrrigationGIS/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp")
+    out_dir_ = "/home/dgketchum/data/IrrigationGIS/handily/outputs/"
+    flowlines_local_dir_ = os.path.expanduser("~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape")
+    ndwi_dir_ = os.path.expanduser("~/data/IrrigationGIS/surface_water/NDWI/")
+    stac_dir_ = os.path.expanduser("~/data/IrrigationGIS/handily/stac/3dep_1m/")
+    bounds_ = (-112.5, 45.4, -112.27, 45.6)
+    aoi_bounds = None  # (-112.8, 45.14, -112.27, 45.62)
+    aoi_out_dir = "/home/dgketchum/data/IrrigationGIS/handily/outputs/testing"
+    aoi_shp = os.path.join(aoi_out_dir, "ndwi_aois.shp")
+    aoi_max_km2 = 625
+    aoi_buffer_m = 5000
+    aoi_simplify_m = None
+    aoi_overwrite = False
+    ee.Initialize()
+
+    if aoi_overwrite or not os.path.exists(aoi_shp):
+        aoi_tiles = build_centroid_buffer_aois(
+            fields_path=fields,
+            max_km2=aoi_max_km2,
+            buffer_m=aoi_buffer_m,
+            bounds_wsen=aoi_bounds,
+            simplify_tolerance_m=aoi_simplify_m,
+        )
+        write_aois_shapefile(aoi_tiles, aoi_shp)
+    else:
+        aoi_tiles = gpd.read_file(aoi_shp)
+    export_ndwi_for_polygons(
+        aoi_shapefile=aoi_shp,
+        bucket='wudr',
+        prefix='naip_ndwi_aoi',
+        start_date='2014-01-01',
+        end_date='2024-12-31',
+        skip_if_present_dir=ndwi_dir_,
+    )
+
+    results = dev_test_bounds_rem(
+        fields_path=fields,
+        ndwi_dir=ndwi_dir_,
+        out_dir=out_dir_,
+        stac_dir=stac_dir_,
+        flowlines_local_dir=flowlines_local_dir_,
+        bounds=bounds_,
+        ndwi_threshold=0.15,
+    )
+    # out_html = os.path.join(out_dir_, "debug_map.html")
+    # write_interactive_map(results, out_html, initial_threshold=2.0)
+# ========================= EOF ====================================================================
+
+
+--- END OF scripts/beaverhead.py ---
+
+--- START OF src/handily/__init__.py ---
+
+__all__ = [
+    "core",
+    "viz",
+    "stac_3dep",
+]
+
+__version__ = "0.1.0"
+
+
+--- END OF src/handily/__init__.py ---
+
+--- START OF src/handily/aoi_split.py ---
+
+import os
+import math
+import geopandas as gpd
+from shapely.geometry import box as shapely_box, LineString
+from shapely.ops import split
+from handily.core import get_flowlines_within_aoi  # unused; left per cleanup policy
+
+
+def _fishnet_chunks(geom_aea, max_km2):
+    max_area_m2 = float(max_km2) * 1_000_000.0
+    cell = math.sqrt(max_area_m2)
+    minx, miny, maxx, maxy = geom_aea.bounds
+    xs = int(math.ceil((maxx - minx) / cell))
+    ys = int(math.ceil((maxy - miny) / cell))
+    parts = []
+    for ix in range(xs):
+        for iy in range(ys):
+            x0 = minx + ix * cell
+            y0 = miny + iy * cell
+            x1 = min(x0 + cell, maxx)
+            y1 = min(y0 + cell, maxy)
+            tile = shapely_box(x0, y0, x1, y1)
+            if not tile.intersects(geom_aea):
+                continue
+            inter = tile.intersection(geom_aea)
+            if inter.is_empty:
+                continue
+            parts.append(inter)
+    return parts
+
+
+def _geometry_area_m2(geom):
+    if geom.is_empty:
+        return 0.0
+    series = gpd.GeoSeries([geom], crs="EPSG:4326")
+    return float(series.to_crs("EPSG:5070").area.iloc[0])
+
+
+def _rectangle_area_m2(rect):
+    return _geometry_area_m2(rect)
+
+
+def _split_polygon_to_max(poly, max_area_m2):
+    out = []
+    stack = [poly]
+    while stack:
+        g = stack.pop()
+        if g.area <= max_area_m2:
+            out.append(g)
+            continue
+        minx, miny, maxx, maxy = g.bounds
+        width = maxx - minx
+        height = maxy - miny
+        if width >= height:
+            mid = (minx + maxx) / 2.0
+            line = LineString([(mid, miny - 1.0), (mid, maxy + 1.0)])
+        else:
+            mid = (miny + maxy) / 2.0
+            line = LineString([(minx - 1.0, mid), (maxx + 1.0, mid)])
+        parts = split(g, line)
+        if len(parts.geoms) == 1:  # GeometryCollection
+            if width >= height:
+                mid2 = (miny + maxy) / 2.0
+                line2 = LineString([(minx - 1.0, mid2), (maxx + 1.0, mid2)])
+            else:
+                mid2 = (minx + maxx) / 2.0
+                line2 = LineString([(mid2, miny - 1.0), (mid2, maxy + 1.0)])
+            parts = split(g, line2)
+        for p in parts.geoms:
+            stack.append(p)
+    return out
+
+
+def build_centroid_buffer_aois(fields_path,
+                               max_km2,
+                               buffer_m=1000,
+                               bounds_wsen=None,
+                               simplify_tolerance_m=None):
+    if bounds_wsen is not None:
+        w, s, e, n = bounds_wsen
+        fields = gpd.read_file(fields_path, bbox=(w, s, e, n))
+    else:
+        fields = gpd.read_file(fields_path)
+    fields = fields[~fields.geometry.is_empty & fields.geometry.notnull()].copy()
+    fields_aea = fields.to_crs("EPSG:5070")
+
+    cents = fields_aea.geometry.centroid
+    disks = cents.buffer(float(buffer_m))
+    dissolved = gpd.GeoSeries(disks, crs="EPSG:5070").unary_union
+    if dissolved.is_empty:
+        raise ValueError("Buffered centroids produced an empty geometry")
+    if simplify_tolerance_m is not None and float(simplify_tolerance_m) > 0:
+        dissolved = dissolved.simplify(float(simplify_tolerance_m), preserve_topology=True)
+    aoi_ll_geom = gpd.GeoSeries([dissolved], crs="EPSG:5070").to_crs(4326).iloc[0]
+
+    max_area_m2 = float(max_km2) * 1_000_000.0
+    w, s, e, n = aoi_ll_geom.bounds
+    stack = [(w, s, e, n)]
+    tiles = []
+    eps = 1e-9
+
+    while stack:
+        w_, s_, e_, n_ = stack.pop()
+        if e_ - w_ <= 0 or n_ - s_ <= 0:
+            continue
+        rect = shapely_box(w_, s_, e_, n_)
+        if not rect.intersects(aoi_ll_geom):
+            continue
+        inter_geom = rect.intersection(aoi_ll_geom)
+        if _geometry_area_m2(inter_geom) <= 0:
+            continue
+        rect_area = _rectangle_area_m2(rect)
+        if rect_area <= max_area_m2:
+            tiles.append(rect)
+            continue
+        width = e_ - w_
+        height = n_ - s_
+        if width >= height and width > eps:
+            mid = (w_ + e_) / 2.0
+            if mid == w_ or mid == e_:
+                tiles.append(rect)
+                continue
+            stack.append((mid, s_, e_, n_))
+            stack.append((w_, s_, mid, n_))
+        elif height > eps:
+            mid = (s_ + n_) / 2.0
+            if mid == s_ or mid == n_:
+                tiles.append(rect)
+                continue
+            stack.append((w_, mid, e_, n_))
+            stack.append((w_, s_, e_, mid))
+        else:
+            tiles.append(rect)
+
+    aoi_tiles = gpd.GeoDataFrame(geometry=gpd.GeoSeries(tiles, crs="EPSG:4326"))
+    aoi_tiles = aoi_tiles.reset_index(drop=True)
+    aoi_tiles["aoi_id"] = aoi_tiles.index.astype(int)
+    return aoi_tiles
+
+
+def build_envelope_aois(fields_path,
+                        max_km2,
+                        buffer_m=0,
+                        bounds_wsen=None,
+                        simplify_tolerance_m=None):
+    if bounds_wsen is not None:
+        w, s, e, n = bounds_wsen
+        fields = gpd.read_file(fields_path, bbox=(w, s, e, n))
+    else:
+        fields = gpd.read_file(fields_path)
+    fields = fields[~fields.geometry.is_empty & fields.geometry.notnull()].copy()
+    fields_aea = fields.to_crs("EPSG:5070")
+
+    minx, miny, maxx, maxy = fields_aea.total_bounds
+    pad = float(buffer_m)
+    env = shapely_box(minx - pad, miny - pad, maxx + pad, maxy + pad)
+
+    if simplify_tolerance_m is not None and float(simplify_tolerance_m) > 0:
+        env = env.simplify(float(simplify_tolerance_m), preserve_topology=True)
+
+    parts = _fishnet_chunks(env, max_km2)
+    aoi_ll = gpd.GeoDataFrame(geometry=gpd.GeoSeries(parts, crs="EPSG:5070").to_crs(4326))
+    aoi_ll = aoi_ll.reset_index(drop=True)
+    aoi_ll["aoi_id"] = aoi_ll.index.astype(int)
+    return aoi_ll
+
+
+def build_field_water_aois(fields_path,
+                           flowlines_local_dir,
+                           max_km2,
+                           buffer_m=100,
+                           bounds_wsen=None,
+                           simplify_tolerance_m=None,
+                           min_intersection_area_m2=1000):
+    if bounds_wsen is not None:
+        w, s, e, n = bounds_wsen
+        fields = gpd.read_file(fields_path, bbox=(w, s, e, n))
+    else:
+        fields = gpd.read_file(fields_path)
+    fields = fields[~fields.geometry.is_empty & fields.geometry.notnull()].copy()
+    fields_aea = fields.to_crs("EPSG:5070")
+
+    if bounds_wsen is None:
+        hull = fields.to_crs(4326).geometry.unary_union.envelope
+        aoi_ll = gpd.GeoDataFrame([{}], geometry=[hull], crs="EPSG:4326")
+    else:
+        aoi_ll = gpd.GeoDataFrame([{}], geometry=[shapely_box(*bounds_wsen)], crs="EPSG:4326")
+
+    flow = get_flowlines_within_aoi(aoi_ll, local_flowlines_dir=flowlines_local_dir)
+    flow_aea = flow.to_crs("EPSG:5070")
+
+    buf = flow_aea.buffer(float(buffer_m))
+    buf_gdf = gpd.GeoDataFrame(geometry=gpd.GeoSeries(buf, crs=flow_aea.crs))
+
+    hits = gpd.overlay(fields_aea, buf_gdf, how="intersection")
+    hits["__area__"] = hits.geometry.area
+    hits = hits[hits["__area__"] >= float(min_intersection_area_m2)].copy()
+
+    dissolved = gpd.GeoDataFrame(geometry=[hits.unary_union], crs=hits.crs)
+    dissolved = dissolved.explode(index_parts=False, ignore_index=True)
+
+    aoi_parts = []
+    for g in dissolved.geometry:
+        if g.is_empty:
+            continue
+        if g.area <= float(max_km2) * 1_000_000.0:
+            aoi_parts.append(g)
+        else:
+            aoi_parts.extend(_fishnet_chunks(g, max_km2))
+
+    if simplify_tolerance_m is not None:
+        aoi_parts = [g.simplify(float(simplify_tolerance_m), preserve_topology=True) for g in aoi_parts]
+        aoi_parts = [g for g in aoi_parts if not g.is_empty]
+
+    aoi_ll = gpd.GeoDataFrame(geometry=gpd.GeoSeries(aoi_parts, crs="EPSG:5070").to_crs(4326))
+    aoi_ll = aoi_ll.reset_index(drop=True)
+    aoi_ll["aoi_id"] = aoi_ll.index.astype(int)
+    return aoi_ll
+
+
+def write_aois_shapefile(aoi_gdf, shp_path):
+    out_dir = os.path.dirname(os.path.abspath(shp_path))
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+    aoi_gdf.to_file(shp_path)
+    print(f'wrote {shp_path}')
+    return shp_path
+
+
+if __name__ == "__main__":
+    fields_path = "~/data/IrrigationGIS/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp"
+    max_km2 = 300
+    buffer_m = 1000
+    simplify_tolerance_m = None
+    shp_out_dir = "/home/dgketchum/data/IrrigationGIS/handily/outputs/testing"
+    shp_out_path = os.path.join(shp_out_dir, "ndwi_aois.shp")
+
+    aoi_gdf = build_centroid_buffer_aois(
+        fields_path=fields_path,
+        max_km2=max_km2,
+        buffer_m=buffer_m,
+        bounds_wsen= (-113.8, 45., -112.27, 46.),
+        simplify_tolerance_m=simplify_tolerance_m,
+    )
+    write_aois_shapefile(aoi_gdf, shp_out_path)
+# ========================= EOF ====================================================================
+
+
+--- END OF src/handily/aoi_split.py ---
+
+--- START OF src/handily/cli.py ---
+
+#!/usr/bin/env python3
+import os
+import sys
+import logging
+import argparse
+
+
+def configure_logging(verbosity: int) -> None:
+    level = logging.INFO if verbosity == 0 else logging.DEBUG
+    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="handily", description="Handily CLI: REM/HAND pipeline and 3DEP STAC tools")
+    parser.add_argument("-v", action="count", default=0, help="Increase verbosity")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # bounds subcommand (bounds + NHD + NDWI quick REM)
+    p_bounds = sub.add_parser("bounds", help="Build REM within bounds using NHD flowlines + NAIP NDWI")
+    p_bounds.add_argument("--bounds", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"), help="Bounds in EPSG:4326: W S E N")
+    p_bounds.add_argument("--fields", required=True, help="Path to irrigation fields dataset (SHP/GPKG/etc.)")
+    p_bounds.add_argument("--ndwi-dir", required=True, help="Directory containing local NDWI tiles (by MGRS tile ID)")
+    p_bounds.add_argument("--flowlines-local-dir", required=True, help="Path to local NHD state shapefile folder")
+    p_bounds.add_argument("--stac-dir", required=True, help="Path to local 3DEP STAC catalog (required)")
+    p_bounds.add_argument("--mgrs-shp", default=os.path.expanduser("~/data/IrrigationGIS/boundaries/mgrs/mgrs_aea.shp"), help="Path to MGRS AEA shapefile with MGRS_TILE column")
+    p_bounds.add_argument("--ndwi-threshold", type=float, default=0.15, help="NDWI threshold for water masking (default 0.15)")
+    p_bounds.add_argument("--out-dir", required=True, help="Output directory for results")
+
+    p_aoi = sub.add_parser("aoi", help="Build buffered-field AOI tiles and write a shapefile")
+    p_aoi.add_argument("--fields", required=True, help="Path to statewide irrigation dataset")
+    p_aoi.add_argument("--out-shp", required=True, help="Output AOI shapefile path")
+    p_aoi.add_argument("--max-km2", type=float, default=625.0, help="Maximum AOI tile area in square kilometers")
+    p_aoi.add_argument("--buffer-m", type=float, default=1000.0, help="Centroid buffer radius in meters")
+    p_aoi.add_argument("--bounds", nargs=4, type=float, metavar=("W", "S", "E", "N"), help="Optional bounds in EPSG:4326 (W S E N)")
+    p_aoi.add_argument("--simplify-m", type=float, default=None, help="Optional simplify tolerance in meters")
+
+    # stac subcommand with nested build/extend
+    p_stac = sub.add_parser("stac", help="3DEP 1 m STAC tools")
+    stac_sub = p_stac.add_subparsers(dest="stac_cmd", required=True)
+
+    p_build = stac_sub.add_parser("build", help="Create a new STAC catalog from TNM S3 index")
+    p_build.add_argument("--out-dir", required=True, help="Output directory for the STAC catalog")
+    p_build.add_argument("--states", nargs="*", help="State abbreviations to include (e.g., MT ID). If omitted, all projects.")
+    p_build.add_argument("--collection-id", default="usgs-3dep-1m-opr", help="Collection ID (default: usgs-3dep-1m-opr)")
+
+    p_extend = stac_sub.add_parser("extend", help="Extend an existing STAC catalog with more states")
+    p_extend.add_argument("--out-dir", required=True, help="Existing STAC catalog directory")
+    p_extend.add_argument("--states", nargs="*", required=True, help="Additional state abbreviations (e.g., WA OR)")
+    p_extend.add_argument("--collection-id", default="usgs-3dep-1m-opr", help="Collection ID (default: usgs-3dep-1m-opr)")
+
+    args = parser.parse_args(argv)
+    configure_logging(args.v)
+
+    if args.cmd == "bounds":
+        from handily.core import run_bounds_rem, ensure_dir, LOGGER as CORE_LOGGER
+        from handily.viz import write_interactive_map
+
+        ensure_dir(args.out_dir)
+        CORE_LOGGER.info("Output directory: %s", args.out_dir)
+        CORE_LOGGER.info("Building REM within bounds: %s", args.bounds)
+        results = run_bounds_rem(
+            bounds_wsen=tuple(args.bounds),
+            fields_path=os.path.expanduser(args.fields),
+            ndwi_dir=os.path.expanduser(args.ndwi_dir),
+            stac_dir=os.path.expanduser(args.stac_dir),
+            flowlines_local_dir=os.path.expanduser(args.flowlines_local_dir),
+            out_dir=args.out_dir,
+            ndwi_threshold=float(args.ndwi_threshold),
+            mgrs_shp_path=os.path.expanduser(args.mgrs_shp),
+        )
+        out_html = os.path.join(args.out_dir, "debug_map.html")
+        write_interactive_map(results, out_html, initial_threshold=2.0)
+        # Persist QA rasters
+        rem_path = os.path.join(args.out_dir, "rem_bounds.tif")
+        streams_path = os.path.join(args.out_dir, "streams_bounds.tif")
+        results["rem"].rio.to_raster(rem_path)
+        results["streams"].rio.to_raster(streams_path)
+        # Persist QA vectors
+        fields_gpkg = os.path.join(args.out_dir, "fields_bounds.gpkg")
+        mgrs_gpkg = os.path.join(args.out_dir, "mgrs_tiles_bounds.gpkg")
+        results["fields"].to_file(fields_gpkg, driver="GPKG")
+        results["mgrs_tiles"].to_file(mgrs_gpkg, driver="GPKG")
+
+        print("--- Bounds REM Summary ---")
+        print(f"Fields total: {results['summary'].get('total_fields')}")
+        print(f"NDWI threshold: {results['summary'].get('ndwi_threshold')}")
+        print(f"Map: {out_html}")
+        print(f"REM GeoTIFF: {rem_path}")
+        print(f"Streams mask GeoTIFF: {streams_path}")
+        print(f"Fields GPKG: {fields_gpkg}")
+        print(f"MGRS tiles GPKG: {mgrs_gpkg}")
+        return 0
+
+    if args.cmd == "aoi":
+        from handily.aoi_split import build_centroid_buffer_aois, write_aois_shapefile
+
+        bounds = tuple(args.bounds) if args.bounds else None
+        tiles = build_centroid_buffer_aois(
+            fields_path=os.path.expanduser(args.fields),
+            max_km2=float(args.max_km2),
+            buffer_m=float(args.buffer_m),
+            bounds_wsen=bounds,
+            simplify_tolerance_m=args.simplify_m,
+        )
+        out_shp = os.path.expanduser(args.out_shp)
+        write_aois_shapefile(tiles, out_shp)
+        print(f"AOI tiles written: {out_shp}")
+        return 0
+
+    if args.cmd == "stac":
+        from handily.stac_3dep import build_3dep_stac, extend_3dep_stac
+
+        def parse_states(values):
+            states = []
+            for v in values or []:
+                parts = [p for p in v.replace(",", " ").split() if p]
+                states.extend(parts)
+            # unique uppercase
+            seen = set()
+            uniq = []
+            for s in [s.upper() for s in states]:
+                if s not in seen:
+                    seen.add(s)
+                    uniq.append(s)
+            return uniq
+
+        if args.stac_cmd == "build":
+            states = parse_states(args.states)
+            root = build_3dep_stac(args.out_dir, states=states or None, collection_id=args.collection_id)
+            print(f"STAC catalog written: {root}")
+            return 0
+        elif args.stac_cmd == "extend":
+            states = parse_states(args.states)
+            root = extend_3dep_stac(args.out_dir, states=states, collection_id=args.collection_id)
+            print(f"STAC catalog updated: {root}")
+            return 0
+
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        logging.getLogger("handily.cli").exception("Unhandled error: %s", exc)
+        sys.exit(1)
+
+
+--- END OF src/handily/cli.py ---
+
+--- START OF src/handily/core.py ---
+
+import glob
+import logging
+import os
+
+import fiona
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import rioxarray as rxr
+import xarray as xr
+from pynhd import NHD
+from pyproj import CRS as _CRS
+from rasterio import features
+from rasterstats import zonal_stats
+from scipy import ndimage as ndi
+from rioxarray.merge import merge_arrays
+
+LOGGER = logging.getLogger("handily.core")
+
+
+def ensure_dir(path):
+    """
+    Create a directory if it doesn't exist.
+    Uses os.path.* per constraints.
+    """
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+
+def get_huc10_boundary(huc10: str, wbd_local_dir: str | None = None) -> gpd.GeoDataFrame:
+    """Get HUC-10 boundary, preferring a local WBD HU10 shapefile.
+
+    This implementation avoids network calls. It expects a local state WBD
+    dataset such as:
+      ~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape/WBDHU10.shp
+
+    Parameters
+    ----------
+    huc10 : str
+        HUC-10 ID, e.g., "1002000207".
+    wbd_local_dir : str, optional
+        Directory containing a WBDHU10 shapefile or a direct path to WBDHU10.shp.
+
+    Parameters
+    ----------
+    huc10 : str
+        HUC-10 ID, e.g., "1002000207".
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Single-row GeoDataFrame for the requested HUC-10.
+    """
+    if wbd_local_dir is None:
+        raise ValueError(
+            "wbd_local_dir is required to load WBDHU10 locally; e.g., "
+            "~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape"
+        )
+
+    path = os.path.expanduser(wbd_local_dir)
+    shp_path = None
+    if os.path.isdir(path):
+        # Try common locations first
+        candidates = [
+            os.path.join(path, "WBDHU10.shp"),
+            os.path.join(path, "Shape", "WBDHU10.shp"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                shp_path = c
+                break
+        if shp_path is None:
+            # Search recursively as a fallback
+            hits = glob.glob(os.path.join(path, "**", "WBDHU10.shp"), recursive=True)
+            if hits:
+                shp_path = hits[0]
+    elif os.path.isfile(path) and path.lower().endswith(".shp"):
+        shp_path = path
+
+    if shp_path is None or not os.path.exists(shp_path):
+        raise FileNotFoundError(
+            "Could not find WBDHU10.shp. Ensure the state WBD zip is extracted, e.g.:\n"
+            "  wget https://prd-tnm.s3.amazonaws.com/StagedProducts/Hydrography/NHD/State/Shape/NHD_H_Montana_State_Shape.zip\n"
+            "  unzip -d ~/data/IrrigationGIS/boundaries/wbd ~/Downloads/NHD_H_Montana_State_Shape.zip\n"
+            "and set wbd_local_dir to that '.../NHD_H_Montana_State_Shape/Shape' folder."
+        )
+
+    LOGGER.info("Loading WBDHU10 from local shapefile: %s", shp_path)
+    hu10 = gpd.read_file(shp_path)
+    # Robust column detection for HUC10
+    col = None
+    for c in hu10.columns:
+        lc = c.lower()
+        if lc == "huc10" or lc == "huc_10":
+            col = c
+            break
+    if col is None:
+        raise ValueError("HUC10 attribute not found in WBDHU10 shapefile.")
+
+    gdf = hu10[hu10[col].astype(str) == str(huc10)].copy()
+    if gdf.empty:
+        raise ValueError(f"HUC10 {huc10} not found in local WBDHU10 shapefile: {shp_path}")
+    # Normalize column name
+    if col != "huc10":
+        gdf = gdf.rename(columns={col: "huc10"})
+    return gdf.reset_index(drop=True)
+
+
+def get_flowlines_within_aoi(aoi_gdf: gpd.GeoDataFrame, local_flowlines_dir: str | None = None) -> gpd.GeoDataFrame:
+    """
+    Get NHD flowlines intersecting the AOI.
+
+    Prefer local state shapefiles (NHDFlowline*.shp) if a directory is provided.
+    Otherwise, fetch from the USGS NHD ArcGIS service via PyNHD.
+
+    Parameters
+    ----------
+    aoi_gdf : GeoDataFrame
+        AOI polygon, any CRS.
+    local_flowlines_dir : str, optional
+        Directory containing state NHD shapefiles (expects files like NHDFlowline_*.shp).
+
+    Returns
+    -------
+    GeoDataFrame
+        Flowlines clipped to AOI (in the dataset/native CRS). Caller should reproject to target raster CRS.
+    """
+    if local_flowlines_dir:
+        path = os.path.expanduser(local_flowlines_dir)
+        # Common locations
+        search_roots = [path]
+        if os.path.isdir(path) and os.path.basename(path).lower() != "shape":
+            shape_dir = os.path.join(path, "Shape")
+            if os.path.isdir(shape_dir):
+                search_roots.append(shape_dir)
+
+        shp_paths = []
+        for root in search_roots:
+            shp_paths.extend(glob.glob(os.path.join(root, "NHDFlowline*.shp")))
+        if not shp_paths:
+            # Recursive search
+            shp_paths = glob.glob(os.path.join(path, "**", "NHDFlowline*.shp"), recursive=True)
+
+        if not shp_paths:
+            raise FileNotFoundError(
+                f"No NHDFlowline shapefiles found under {path}. Ensure the state NHD zip is extracted."
+            )
+
+        LOGGER.info("Loading local NHDFlowline shapefiles (%d files)", len(shp_paths))
+        parts = []
+        for shp in shp_paths:
+            try:
+                with fiona.open(shp) as src:
+                    src_crs = src.crs_wkt if src.crs_wkt else src.crs
+                # Compute AOI bbox in source CRS to minimize IO
+                aoi_bbox = aoi_gdf.to_crs(src_crs).total_bounds.tolist()
+                gdf = gpd.read_file(shp, bbox=tuple(aoi_bbox))
+                if not gdf.empty:
+                    parts.append(gdf)
+            except Exception:
+                # Fallback to full read if bbox fails
+                gdf = gpd.read_file(shp)
+                if not gdf.empty:
+                    parts.append(gdf)
+        if not parts:
+            raise ValueError("No flowline features found in local shapefiles for the AOI extent.")
+        flow = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=parts[0].crs)
+        # Clip to AOI to remove bbox overshoot
+        try:
+            flow = gpd.clip(flow, aoi_gdf.to_crs(flow.crs))
+        except Exception:
+            flow = gpd.overlay(flow, aoi_gdf.to_crs(flow.crs), how="intersection")
+        flow = flow.reset_index(drop=True)
+        LOGGER.info("Local flowlines selected: %d", len(flow))
+        return flow
+
+    # Remote fallback: Use NHD high-resolution flowlines from ArcGIS REST
+    LOGGER.info("Fetching NHDPlus flowlines within AOI via service")
+    geom = aoi_gdf.to_crs(4326).geometry.unary_union
+    nhd = NHD("flowline_hr")
+    fl = nhd.bygeom(geom, geo_crs=4326)
+    fl = gpd.clip(fl, aoi_gdf)
+    fl = fl.reset_index(drop=True)
+    return fl
+
+
+def _filter_flowlines_nhd(fl, natural_perennial=False, exclude_artificial=False):
+    """
+    Optionally filter NHD flowlines to natural perennial streams and/or exclude artificial paths.
+    Uses robust attribute lookups across common NHD schema variants.
+    """
+    if len(fl) == 0:
+        return fl
+    df = fl.copy()
+
+    # Common attribute names
+    fcode_col = None
+    for c in ("FCODE", "FCode", "fcode"):
+        if c in df.columns:
+            fcode_col = c
+            break
+    ftype_col = None
+    for c in ("FTYPE", "FType", "ftype"):
+        if c in df.columns:
+            ftype_col = c
+            break
+
+    # Perennial stream/river FCODE in NHD is typically 46006.
+    if natural_perennial:
+        if fcode_col is not None:
+            df = df[df[fcode_col] == 46006]
+        elif ftype_col is not None:
+            df = df[df[ftype_col].astype(str).str.lower().isin(["streamriver"])]
+
+    if exclude_artificial and ftype_col is not None:
+        drop_types = {"artificialpath", "canalditch"}
+        df = df[~df[ftype_col].astype(str).str.lower().isin(drop_types)]
+
+    return df.reset_index(drop=True)
+
+
+def rasterize_lines_to_grid(lines_gdf, template_da, burn_value=1):
+    """
+    Rasterize line features to match a template DataArray grid.
+
+    Parameters
+    ----------
+    lines_gdf : GeoDataFrame
+        Line geometries in the same CRS as `template_da`.
+    template_da : xarray.DataArray
+        Raster providing transform, shape, and CRS.
+    burn_value : numeric
+        Value to burn for stream cells; others get 0.
+
+    Returns
+    -------
+    xarray.DataArray
+        Boolean/int mask DataArray with stream cells burned as `burn_value`.
+    """
+    transform = template_da.rio.transform()
+    shape = template_da.shape
+
+    # Prepare shapes iterable for rasterize: (geometry, value)
+    shapes = [(geom, burn_value) for geom in lines_gdf.geometry if geom is not None]
+    if len(shapes) == 0:
+        raise ValueError("No valid geometries found to rasterize.")
+
+    stream_arr = features.rasterize(
+        shapes=shapes,
+        out_shape=shape,
+        transform=transform,
+        fill=0,
+        all_touched=True,
+        dtype="uint8",
+    )
+
+    stream_da = xr.DataArray(
+        stream_arr,
+        dims=template_da.dims,
+        coords=template_da.coords,
+        name="streams",
+    )
+    stream_da = stream_da.rio.write_crs(template_da.rio.crs, inplace=False)
+    return stream_da
+
+def build_streams_mask_from_nhd_ndwi(flowlines_gdf, dem_da, ndwi_da=None, ndwi_threshold=None):
+    """
+    Build a streams/water mask on the DEM grid by combining NHD flowlines with an NDWI raster.
+
+    - Rasterize flowlines to the DEM grid.
+    - If NDWI is provided, reproject to DEM grid, threshold at ndwi_threshold, and union with flowlines mask.
+    """
+    if dem_da.rio.crs is None:
+        raise ValueError("DEM must have a valid CRS.")
+    if flowlines_gdf.crs is None or str(flowlines_gdf.crs) != str(dem_da.rio.crs):
+        flowlines_gdf = flowlines_gdf.to_crs(dem_da.rio.crs)
+
+    fl_mask = rasterize_lines_to_grid(flowlines_gdf, dem_da, burn_value=1)
+    streams_mask = fl_mask
+
+    if ndwi_da is not None and ndwi_threshold is not None:
+        ndwi_match = ndwi_da
+        if str(ndwi_da.rio.crs) != str(dem_da.rio.crs) or ndwi_da.shape != dem_da.shape:
+            ndwi_match = ndwi_da.rio.reproject_match(dem_da)
+        water = (ndwi_match > float(ndwi_threshold)).astype("uint8")
+        water = water.rio.write_crs(dem_da.rio.crs, inplace=False)
+        combo = xr.DataArray(
+            np.maximum(np.asarray(streams_mask.data, dtype="uint8"), np.asarray(water.data, dtype="uint8")),
+            dims=dem_da.dims,
+            coords=dem_da.coords,
+            name="streams",
+        )
+        combo = combo.rio.write_crs(dem_da.rio.crs, inplace=False)
+        streams_mask = combo
+
+    return streams_mask
+
+def compute_rem_quick(dem_da, streams_da):
+    """
+    Compute a quick Relative Elevation Model using Euclidean nearest-stream height without sink filling.
+    """
+    if dem_da.rio.crs is None or streams_da.rio.crs is None:
+        raise ValueError("Both DEM and streams rasters must have a valid CRS.")
+    if str(dem_da.rio.crs) != str(streams_da.rio.crs) or dem_da.shape != streams_da.shape:
+        raise ValueError("DEM and streams must share grid shape and CRS.")
+
+    dem_np = np.asarray(dem_da.data)
+    streams_np = np.asarray(streams_da.data).astype(bool)
+    if streams_np.sum() == 0:
+        raise ValueError("Stream mask has no active cells after combination.")
+
+    row_ind, col_ind = ndi.distance_transform_edt(
+        ~streams_np, return_distances=False, return_indices=True
+    )
+    base_elev = dem_np[row_ind, col_ind]
+    rem_np = dem_np - base_elev
+    rem_np = np.where(rem_np < 0, 0, rem_np)
+
+    rem_da = xr.DataArray(
+        rem_np,
+        dims=dem_da.dims,
+        coords=dem_da.coords,
+        name="REM",
+        attrs={"description": "Quick REM (euclidean nearest stream; no sink filling)"},
+    )
+    rem_da = rem_da.rio.write_crs(dem_da.rio.crs, inplace=False)
+    return rem_da
+
+def aoi_from_bounds(bounds_wsen):
+    w, s, e, n = bounds_wsen
+    aoi = gpd.GeoDataFrame([{}], geometry=[gpd.GeoSeries.from_bounds(w, s, e, n).iloc[0]], crs="EPSG:4326")
+    return aoi
+
+def tiles_for_bounds(bounds_wsen, mgrs_shp_path):
+    w, s, e, n = bounds_wsen
+    aoi_ll = gpd.GeoDataFrame([{}], geometry=[gpd.GeoSeries.from_bounds(w, s, e, n).iloc[0]], crs="EPSG:4326")
+    mgrs = gpd.read_file(os.path.expanduser(mgrs_shp_path))
+    mgrs_aea = mgrs.to_crs("EPSG:5070")
+    aoi_aea = aoi_ll.to_crs("EPSG:5070")
+    hits = mgrs_aea[mgrs_aea.intersects(aoi_aea.unary_union)].copy()
+    if hits.empty:
+        raise ValueError("No MGRS tiles intersect bounds.")
+    name_col = "MGRS_TILE"
+    tiles = list(hits[name_col].astype(str).unique())
+    return tiles, hits
+
+def ndwi_files_for_tiles(ndwi_dir, tiles):
+    ndwi_dir = os.path.expanduser(ndwi_dir)
+    present = {}
+    missing = []
+    for t in tiles:
+        matches = sorted(glob.glob(os.path.join(ndwi_dir, f"*{t}*.tif")))
+        if matches:
+            present[t] = matches
+        else:
+            missing.append(t)
+    return present, missing
+
+def open_ndwi_mosaic(present_map, bounds_wsen):
+    rasters = []
+    for paths in present_map.values():
+        first = rxr.open_rasterio(paths[0])
+        if "band" in first.dims:
+            first = first.squeeze("band", drop=True)
+        rasters.append(first)
+    if len(rasters) == 1:
+        ndwi = rasters[0]
+    else:
+        ndwi = merge_arrays(rasters)
+    aoi_ll = gpd.GeoDataFrame([{}], geometry=[gpd.GeoSeries.from_bounds(*bounds_wsen).iloc[0]], crs="EPSG:4326")
+    shapes = [aoi_ll.to_crs(ndwi.rio.crs).geometry.unary_union.__geo_interface__]
+    ndwi_clip = ndwi.rio.clip(shapes, all_touched=True)
+    return ndwi_clip
+
+def run_bounds_rem(bounds_wsen,
+                        fields_path,
+                        ndwi_dir,
+                        stac_dir,
+                        flowlines_local_dir,
+                        out_dir,
+                        ndwi_threshold=0.15,
+                        mgrs_shp_path="~/data/IrrigationGIS/boundaries/mgrs/mgrs_aea.shp"):
+    ensure_dir(out_dir)
+    aoi = aoi_from_bounds(bounds_wsen)
+    flowlines = get_flowlines_within_aoi(aoi, local_flowlines_dir=flowlines_local_dir)
+    tiles, tiles_gdf = tiles_for_bounds(bounds_wsen, mgrs_shp_path)
+    present_map, missing = ndwi_files_for_tiles(ndwi_dir, tiles)
+    if missing:
+        raise ValueError(f"Missing NDWI tiles: {missing}")
+    ndwi_clip = open_ndwi_mosaic(present_map, bounds_wsen)
+
+    dem_cache = os.path.join(out_dir, "dem_bounds_1m.tif")
+    dem = get_dem_for_aoi_via_stac(
+        aoi_gdf=aoi,
+        stac_dir=os.path.expanduser(stac_dir),
+        target_crs_epsg=5070,
+        cache_path=dem_cache,
+        overwrite=False,
+        stac_download_cache_dir=os.path.join(out_dir, 'stac_cache'),
+        stac_collection_id="usgs-3dep-1m-opr",
+    )
+    dem_crs = dem.rio.crs
+    flowlines_dem = flowlines.to_crs(dem_crs)
+    streams = build_streams_mask_from_nhd_ndwi(flowlines_dem, dem, ndwi_da=ndwi_clip, ndwi_threshold=float(ndwi_threshold))
+    rem = compute_rem_quick(dem, streams)
+    fields = load_and_clip_fields(fields_path, aoi, dem_crs)
+    fields_stats = compute_field_rem_stats(fields, rem, stats=("mean",))
+    return {
+        "aoi": aoi,
+        "flowlines": flowlines,
+        "ndwi": ndwi_clip,
+        "streams": streams,
+        "rem": rem,
+        "mgrs_tiles": tiles_gdf,
+        "fields": fields,
+        "fields_stats": fields_stats,
+        "summary": {"total_fields": len(fields_stats), "ndwi_threshold": float(ndwi_threshold)},
+    }
+
+def load_and_clip_fields(fields_path, aoi_gdf, target_crs):
+    """
+    Load the statewide irrigation dataset and clip to AOI, reprojecting to target CRS.
+
+    Parameters
+    ----------
+    fields_path : str
+        Path to the statewide irrigation shapefile.
+    aoi_gdf : GeoDataFrame
+        AOI polygon.
+    target_crs : str or dict
+        CRS to project the output to (e.g., DEM CRS).
+
+    Returns
+    -------
+    GeoDataFrame
+        Clipped fields in target_crs.
+    """
+    LOGGER.info("Loading irrigation dataset: %s", fields_path)
+    # Assume path exists; if wrong, let it fail upstream per instructions.
+    fields = None
+    try:
+        # Discover file CRS and read with AOI bbox in that CRS to avoid full load
+        with fiona.open(fields_path) as src:
+            fields_crs = src.crs_wkt if src.crs_wkt else src.crs
+        aoi_in_fields = aoi_gdf.to_crs(fields_crs)
+        bounds = tuple(aoi_in_fields.total_bounds.tolist())
+        fields = gpd.read_file(fields_path, bbox=bounds)
+    except Exception:
+        fields = gpd.read_file(fields_path)  # fallback to full read
+    # Ensure valid geometries; drop empties
+    fields = fields[~fields.geometry.is_empty & fields.geometry.notnull()].copy()
+
+    LOGGER.info("Clipping irrigation dataset to AOI")
+    try:
+        clipped = gpd.clip(fields, aoi_gdf)
+    except Exception:
+        clipped = gpd.overlay(fields, aoi_gdf, how="intersection")
+
+    clipped = clipped.to_crs(target_crs)
+    clipped = clipped.reset_index(drop=True)
+    return clipped
+
+
+def compute_field_rem_stats(fields_gdf, rem_da, stats=("mean",)):
+    """
+    Compute zonal statistics of REM over irrigation polygons.
+
+    Parameters
+    ----------
+    fields_gdf : GeoDataFrame
+        Polygons reprojected to the same CRS as rem_da.
+    rem_da : xarray.DataArray
+        REM raster with CRS/transform.
+    stats : tuple of str
+        Statistics to compute via rasterstats (default: mean).
+
+    Returns
+    -------
+    GeoDataFrame
+        Input fields_gdf with added columns for each requested stat, prefixed by 'rem_'.
+    """
+    LOGGER.info("Computing zonal statistics over fields (stats: %s)", ",".join(stats))
+
+    # Ensure CRS consistency; reproject fields to REM CRS if needed.
+    rem_crs = rem_da.rio.crs
+    if rem_crs is None:
+        raise ValueError("REM raster has no CRS; cannot compute zonal stats.")
+    if fields_gdf.crs is None:
+        raise ValueError("Fields GeoDataFrame has no CRS; cannot compute zonal stats.")
+    try:
+        if not _CRS.from_user_input(fields_gdf.crs).equals(_CRS.from_user_input(rem_crs)):
+            fields_gdf = fields_gdf.to_crs(rem_crs)
+    except Exception:
+        if str(fields_gdf.crs) != str(rem_crs):
+            fields_gdf = fields_gdf.to_crs(rem_crs)
+
+    affine = rem_da.rio.transform()
+    raster = np.asarray(rem_da.data)
+    # Mask NaNs so mean ignores nodata
+    raster = np.ma.array(raster, mask=~np.isfinite(raster))
+
+    zs = zonal_stats(
+        vectors=fields_gdf.geometry,
+        raster=raster,
+        affine=affine,
+        stats=list(stats),
+        nodata=None,
+        all_touched=True,
+        geojson_out=False,
+    )
+
+    df_stats = pd.DataFrame(zs)
+    # Prefix columns for clarity
+    df_stats = df_stats.rename(columns={s: f"rem_{s}" for s in df_stats.columns})
+    result = fields_gdf.reset_index(drop=True).join(df_stats)
+    return result
+
+
+def stratify_fields_by_rem(fields_with_stats_gdf, threshold_m=2.0):
+    """
+    Add a boolean field 'partitioned' where mean REM < threshold.
+
+    Parameters
+    ----------
+    fields_with_stats_gdf : GeoDataFrame
+        Fields with at least 'rem_mean' column.
+    threshold_m : float
+        Relative elevation threshold in meters for partitioned fields.
+
+    Returns
+    -------
+    GeoDataFrame
+        Input with added 'partitioned' bool flag.
+    """
+    if "rem_mean" not in fields_with_stats_gdf.columns:
+        raise ValueError("'rem_mean' column not found; compute stats first.")
+    out = fields_with_stats_gdf.copy()
+    out["partitioned"] = out["rem_mean"] < float(threshold_m)
+    return out
+
+
+def get_dem_for_aoi_via_stac(
+        aoi_gdf,
+        stac_dir: str,
+        target_crs_epsg: int = 5070,
+        cache_path: str | None = None,
+        overwrite: bool = False,
+        stac_download_cache_dir: str | None = None,
+        stac_collection_id: str = "usgs-3dep-1m-opr",
+):
+    """
+    Build a DEM mosaic from a local 3DEP STAC for the AOI.
+
+    Parameters
+    ----------
+    aoi_gdf : GeoDataFrame
+        AOI polygon.
+    stac_dir : str
+        Path to the local STAC directory (containing catalog.json).
+    target_crs_epsg : int
+        Output DEM CRS.
+    cache_path : str, optional
+        If provided, write the resulting DEM to this GeoTIFF path and read from it if
+        present (unless overwrite=True).
+    overwrite : bool
+        Overwrite cached DEM if present.
+    stac_download_cache_dir : str, optional
+        Directory to cache downloaded GeoTIFF tiles referenced by the STAC.
+        If not provided, defaults to a sibling folder of cache_path named 'stac_cache'
+        or to './stac_cache' in the current working directory.
+    stac_collection_id : str
+        Collection ID inside the STAC (default: 'usgs-3dep-1m-opr').
+
+    Returns
+    -------
+    xarray.DataArray
+        DEM with CRS/transform set, clipped to AOI, reprojected to target_crs_epsg.
+    """
+    from handily.stac_3dep import mosaic_from_stac
+
+    target_crs = f"EPSG:{int(target_crs_epsg)}"
+
+    # Cached DEM
+    if cache_path and (not overwrite) and os.path.exists(cache_path):
+        LOGGER.info("Loading cached DEM (STAC): %s", cache_path)
+        dem_cached = rxr.open_rasterio(cache_path)
+        if "band" in dem_cached.dims:
+            dem_cached = dem_cached.squeeze("band", drop=True)
+        return dem_cached
+
+    # Determine download cache for individual STAC tiles
+    if stac_download_cache_dir is None:
+        if cache_path:
+            base = os.path.dirname(os.path.abspath(cache_path))
+            stac_download_cache_dir = os.path.join(base, "stac_cache")
+        else:
+            stac_download_cache_dir = os.path.join(os.getcwd(), "stac_cache")
+
+    LOGGER.info(
+        "Mosaicking DEM from STAC at %s (tiles cached in %s)", stac_dir, stac_download_cache_dir
+    )
+    dem = mosaic_from_stac(
+        stac_dir=stac_dir,
+        aoi_gdf=aoi_gdf,
+        cache_dir=stac_download_cache_dir,
+        collection_id=stac_collection_id,
+        target_crs_epsg=int(target_crs_epsg),
+    )
+
+    if str(dem.rio.crs) != target_crs:
+        dem = dem.rio.reproject(target_crs)
+
+    # Optionally persist to cache_path
+    if cache_path:
+        ensure_dir(os.path.dirname(os.path.abspath(cache_path)))
+        LOGGER.info("Saving DEM mosaic to cache: %s", cache_path)
+        dem.rio.to_raster(cache_path)
+    return dem
+
+
+# Legacy HUC10/RichDEM path removed; use run_bounds_rem
+
+
+--- END OF src/handily/core.py ---
+
+--- START OF src/handily/ndwi_export.py ---
+
+import os
+import glob
+import geopandas as gpd
+from shapely.geometry import box as shapely_box
+import ee
+
+
+def _tiles_for_bounds(bounds_wsen, mgrs_shp_path):
+    w, s, e, n = bounds_wsen
+    aoi_ll = gpd.GeoDataFrame([{}], geometry=[shapely_box(w, s, e, n)], crs="EPSG:4326")
+    mgrs = gpd.read_file(os.path.expanduser(mgrs_shp_path))
+    mgrs_aea = mgrs.to_crs("EPSG:5070")
+    aoi_aea = aoi_ll.to_crs("EPSG:5070")
+    hits = mgrs_aea[mgrs_aea.intersects(aoi_aea.unary_union)].copy()
+    name_col = "MGRS_TILE"
+    tiles = list(hits[name_col].astype(str).unique())
+    hits_ll = hits.to_crs("EPSG:4326")
+    return tiles, hits_ll
+
+
+def _ee_geom(geom):
+    gj = gpd.GeoSeries([geom], crs="EPSG:4326").__geo_interface__["features"][0]["geometry"]
+    g = ee.Geometry(gj)
+    return g
+
+
+def _naip_ndwi_image(region_geom, start_date, end_date):
+    col = ee.ImageCollection('USDA/NAIP/DOQQ').filterBounds(region_geom).filterDate(start_date, end_date)
+    img = col.mosaic()
+    ndwi = img.normalizedDifference(['G', 'N']).rename('ndwi')
+    ndwi = ndwi.clip(region_geom)
+    return ndwi
+
+
+def export_ndwi_for_bounds(bounds_wsen,
+                           mgrs_shp_path,
+                           bucket='wudr',
+                           prefix='naip_ndwi',
+                           start_date='2014-01-01',
+                           end_date='2024-12-31',
+                           skip_if_present_dir=None):
+    tiles, tiles_ll = _tiles_for_bounds(bounds_wsen, mgrs_shp_path)
+
+    skip = set()
+    if skip_if_present_dir:
+        for t in tiles:
+            matches = glob.glob(os.path.join(os.path.expanduser(skip_if_present_dir), f"*{t}*.tif"))
+            if matches:
+                skip.add(t)
+
+    tasks = []
+    for i, row in tiles_ll.iterrows():
+        tile = str(row['MGRS_TILE'])
+        if tile in skip:
+            continue
+        region = _ee_geom(row.geometry)
+        ndwi = _naip_ndwi_image(region, start_date, end_date)
+
+        fname = f"{prefix}_{tile}"
+        task = ee.batch.Export.image.toCloudStorage(
+            image=ndwi, bucket=bucket, fileNamePrefix=fname, description=fname,
+            region=region, scale=1, maxPixels=1e13)
+        task.start()
+        tasks.append(task)
+        print(f'exported {fname}')
+
+        # Only export raw NDWI; thresholding occurs downstream.
+
+    return tasks
+
+
+def export_ndwi_for_polygons(aoi_shapefile,
+                             bucket='wudr',
+                             prefix='naip_ndwi_aoi',
+                             start_date='2014-01-01',
+                             end_date='2024-12-31',
+                             skip_if_present_dir=None):
+    shp_path = os.path.expanduser(aoi_shapefile)
+    aoi_gdf = gpd.read_file(shp_path)
+    tasks = []
+    for i, row in aoi_gdf.iterrows():
+        geom = row.geometry
+        region = _ee_geom(geom)
+        ndwi = _naip_ndwi_image(region, start_date, end_date)
+        idx = int(row['aoi_id']) if 'aoi_id' in aoi_gdf.columns else int(i)
+        fname = f"{prefix}_{idx:04d}"
+        if skip_if_present_dir:
+            present = glob.glob(os.path.join(os.path.expanduser(skip_if_present_dir), f"{fname}*.tif"))
+            if present:
+                continue
+        task = ee.batch.Export.image.toCloudStorage(
+            image=ndwi, bucket=bucket, fileNamePrefix=fname, description=fname,
+            region=region, scale=1, maxPixels=1e13)
+        task.start()
+        tasks.append(task)
+    return tasks
+
+
+if __name__ == '__main__':
+    ee.Initialize()
+    shp_path = '/home/dgketchum/data/IrrigationGIS/handily/outputs/testing/ndwi_aois.shp'
+    ndwi_dir = os.path.expanduser('~/data/IrrigationGIS/surface_water/NDWI/')
+    tasks = export_ndwi_for_polygons(
+        aoi_shapefile=shp_path,
+        bucket='wudr',
+        prefix='naip_ndwi_aoi',
+        start_date='2014-01-01',
+        end_date='2024-12-31',
+        skip_if_present_dir=ndwi_dir,
+    )
+# ========================= EOF ====================================================================
+
+
+--- END OF src/handily/ndwi_export.py ---
+
+--- START OF src/handily/stac_3dep.py ---
+
+import os
+import re
+import json
+import logging
+from tqdm import tqdm
+from typing import Iterable, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+
+import requests
+import geopandas as gpd
+import numpy as np
+import rasterio
+import xarray as xr
+import rioxarray as rxr
+from rasterio.merge import merge as rio_merge
+from shapely.geometry import box as shapely_box
+from shapely.strtree import STRtree
+import shapely
+import pystac
+import xml.etree.ElementTree as ET
+from urllib.parse import quote
+
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - optional at runtime
+    def tqdm(x, **kwargs):
+        return x
+
+LOGGER = logging.getLogger("handily.stac_3dep")
+
+S3_BASE = "https://prd-tnm.s3.amazonaws.com"
+# 3DEP 1 m Project tiles live under this prefix, e.g.:
+# https://prd-tnm.s3.amazonaws.com/index.html?prefix=StagedProducts/Elevation/1m/Projects/MT_Statewide_Phase4_B22/metadata/
+S3_PREFIX_PROJECTS = "StagedProducts/Elevation/1m/Projects/"
+PROJECTS_INDEX = f"{S3_BASE}/?delimiter=/&prefix={quote(S3_PREFIX_PROJECTS)}"
+PROJECTS_ROOT = f"{S3_BASE}/{S3_PREFIX_PROJECTS}"
+
+
+def _http_get(url: str, timeout: float = 30.0) -> str:
+    headers = {"User-Agent": "handily-stac-builder/0.1"}
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.text
+
+
+def _http_get_with_retry(url: str, timeout: float = 30.0, retries: int = 3, backoff: float = 0.5) -> str:
+    attempt = 0
+    while True:
+        try:
+            return _http_get(url, timeout=timeout)
+        except Exception:
+            attempt += 1
+            if attempt > int(retries):
+                raise
+            time.sleep(float(backoff) * (2 ** (attempt - 1)))
+
+
+def _parse_s3_common_prefixes(xml_text: str) -> List[str]:
+    # Parse AWS S3 ListBucketResult and extract <CommonPrefixes><Prefix> entries
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    ns = {"s3": root.tag.split("}")[0].strip("{") if "}" in root.tag else ""}
+    prefixes = []
+    # Handle with and without namespace
+    if ns["s3"]:
+        path = f".//{{{ns['s3']}}}CommonPrefixes/{{{ns['s3']}}}Prefix"
+    else:
+        path = ".//CommonPrefixes/Prefix"
+    for el in root.findall(path):
+        if el.text:
+            prefixes.append(el.text.strip())
+    return prefixes
+
+
+def _parse_s3_contents(xml_text: str) -> List[str]:
+    # Parse <Contents><Key> object keys
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    ns = {"s3": root.tag.split("}")[0].strip("{") if "}" in root.tag else ""}
+    keys = []
+    if ns["s3"]:
+        path = f".//{{{ns['s3']}}}Contents/{{{ns['s3']}}}Key"
+    else:
+        path = ".//Contents/Key"
+    for el in root.findall(path):
+        if el.text:
+            keys.append(el.text.strip())
+    return keys
+
+
+def _list_projects(states: Optional[Iterable[str]] = None) -> List[str]:
+    xml = _http_get(PROJECTS_INDEX)
+    entries = _parse_s3_common_prefixes(xml)
+    # entries are full prefixes like 'StagedProducts/Elevation/1m/Projects/MT_.../'
+    norm = []
+    for e in entries:
+        if not e.endswith("/"):
+            continue
+        # Extract last segment after projects/
+        seg = e.split(S3_PREFIX_PROJECTS, 1)[-1]
+        if seg and seg.endswith("/"):
+            norm.append(seg)
+    if states:
+        states_u = {s.upper() for s in states}
+        norm = [d for d in norm if any(d.upper().startswith(f"{s}_") for s in states_u)]
+    return sorted({d for d in norm})
+
+
+def _list_metadata_xmls(project_dir: str) -> List[str]:
+    """List tile metadata XML filenames under <project>/metadata/.
+
+    Example project_dir: 'MT_Statewide_Phase4_B22/'
+    """
+    pref = S3_PREFIX_PROJECTS + project_dir + "metadata/"
+    url = f"{S3_BASE}/?prefix={quote(pref)}"
+    xml = _http_get(url)
+    keys = _parse_s3_contents(xml)
+    # Return filenames for xmls
+    names = [os.path.basename(k) for k in keys if k.lower().endswith(".xml")]
+    return sorted({n for n in names})
+
+
+def _fetch_item_meta(proj: str, name: str):
+    """Fetch and parse a single tile XML for a given project."""
+    xml_url = f"{S3_BASE}/{S3_PREFIX_PROJECTS}{proj}metadata/{name}"
+    try:
+        xml_text = _http_get_with_retry(xml_url, timeout=30.0, retries=3, backoff=0.5)
+        meta = _parse_fgdc_xml(xml_text)
+    except Exception:
+        return None
+    bbox = meta.get("bbox")
+    tif_href = meta.get("tif_href")
+    if not bbox or None in bbox or not tif_href:
+        return None
+    item_id = os.path.splitext(os.path.basename(name))[0]
+    iso_pub = _to_iso_date(meta.get("pubdate"))
+    iso_beg = _to_iso_date(meta.get("begdate"))
+    iso_end = _to_iso_date(meta.get("enddate"))
+    dt = iso_end or iso_pub or iso_beg
+    return {
+        "item_id": item_id,
+        "bbox": list(bbox),
+        "tif_href": tif_href,
+        "xml_url": xml_url,
+        "jpg_href": meta.get("jpg_href"),
+        "iso_beg": iso_beg,
+        "iso_end": iso_end,
+        "dt": dt,
+    }
+
+
+def _parse_fgdc_xml(xml_text: str) -> dict:
+    # Lightweight FGDC CSDGM extraction using regexes against known tags
+    def _find(tag: str) -> Optional[str]:
+        m = re.search(fr"<{tag}>(.*?)</{tag}>", xml_text, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        return None
+
+    def _findall(tag: str) -> List[str]:
+        return [m.strip() for m in re.findall(fr"<{tag}>(.*?)</{tag}>", xml_text, flags=re.IGNORECASE | re.DOTALL)]
+
+    title = _find("title")
+    pubdate = _find("pubdate")
+    begdate = _find("begdate")
+    enddate = _find("enddate")
+    west = _find("westbc")
+    east = _find("eastbc")
+    north = _find("northbc")
+    south = _find("southbc")
+    # Distribution URLs
+    onlinks = _findall("networkr") or _findall("onlink")
+    tif_href = next((u for u in onlinks if u.lower().endswith(".tif")), None)
+    jpg_href = next((u for u in onlinks if u.lower().endswith(".jpg")), None)
+    if not jpg_href:
+        # Some records provide thumbnail in <browsen> under <browse>
+        jpg_href = _find("browsen")
+
+    # Rows/cols if present
+    rowcount = _find("rowcount")
+    colcount = _find("colcount")
+
+    return {
+        "title": title,
+        "pubdate": pubdate,
+        "begdate": begdate,
+        "enddate": enddate,
+        "bbox": (
+            float(west) if west else None,
+            float(south) if south else None,
+            float(east) if east else None,
+            float(north) if north else None,
+        ),
+        "tif_href": tif_href,
+        "jpg_href": jpg_href,
+        "rows": int(rowcount) if rowcount and rowcount.isdigit() else None,
+        "cols": int(colcount) if colcount and colcount.isdigit() else None,
+    }
+
+
+def _to_iso_date(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+    return s
+
+
+def _bbox_to_geojson_polygon(bbox: Tuple[float, float, float, float]) -> dict:
+    w, s, e, n = bbox
+    return {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [w, s],
+                [e, s],
+                [e, n],
+                [w, n],
+                [w, s],
+            ]
+        ],
+    }
+
+
+def build_3dep_stac(out_dir: str,
+                    states: Optional[Iterable[str]] = None,
+                    collection_id: str = "usgs-3dep-1m-opr",
+                    project_head: Optional[str] = None,
+                    search_string: Optional[str] = None,
+                    num_workers: int = 12,
+                    items_shapefile: Optional[str] = None) -> str:
+    """
+    Build a STAC Collection of 3DEP 1 m DEM tiles.
+
+    Modes:
+    - State scan (default): pass states to scan all matching projects.
+    - Project scoped: pass project_head and optionally search_string to restrict to a subproject.
+
+    Returns the path to the root catalog.json.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    catalog = pystac.Catalog(id=f"{collection_id}-catalog", description="USGS 3DEP 1 m DEM tiles")
+    collection = pystac.Collection(
+        id=collection_id,
+        description="USGS 3DEP 1 m DEM tiles (LiDAR-derived)",
+        extent=pystac.Extent(
+            pystac.SpatialExtent([[-180.0, -90.0, 180.0, 90.0]]),
+            pystac.TemporalExtent([(None, None)]),
+        ),
+        license="public-domain",
+        title="USGS 3DEP 1 m DEM",
+        keywords=["USGS", "3DEP", "LiDAR", "DEM", "1m"],
+        providers=[
+            pystac.Provider(name="U.S. Geological Survey",
+                            roles=[pystac.ProviderRole.PRODUCER, pystac.ProviderRole.LICENSOR]),
+        ],
+    )
+    catalog.add_child(collection)
+
+    if project_head:
+        projects = [project_head.rstrip("/") + "/"]
+    else:
+        projects = _list_projects(states)
+    LOGGER.info("Projects to build: %d (states=%s, project_head=%s, subfilter=%s)",
+                len(projects), list(states) if states else None, project_head, search_string)
+    total_items = 0
+    for proj in tqdm(projects, desc="Projects", unit="proj"):
+        # List XMLs directly under <project>/metadata/
+        try:
+            xml_names = _list_metadata_xmls(proj)
+        except Exception:
+            xml_names = []
+        if search_string:
+            xml_names = [n for n in xml_names if search_string in n]
+        if not xml_names:
+            continue
+
+        bar = tqdm(total=len(xml_names), desc=f"{proj}metadata/", position=1, unit="xml", leave=False)
+        workers = max(1, int(num_workers))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_fetch_item_meta, proj, name) for name in xml_names]
+            for fut in as_completed(futures):
+                try:
+                    d = fut.result()
+                finally:
+                    try:
+                        bar.update(1)
+                    except Exception:
+                        pass
+                if not d:
+                    continue
+                geom = _bbox_to_geojson_polygon(d["bbox"])  # type: ignore[arg-type]
+                item = pystac.Item(
+                    id=d["item_id"],
+                    geometry=geom,
+                    bbox=d["bbox"],  # type: ignore[arg-type]
+                    datetime=pystac.utils.str_to_datetime(d["dt"]) if d["dt"] else None,
+                    properties={},
+                )
+                if d.get("iso_beg"):
+                    item.properties["start_datetime"] = pystac.utils.str_to_datetime(d["iso_beg"]).isoformat()
+                if d.get("iso_end"):
+                    item.properties["end_datetime"] = pystac.utils.str_to_datetime(d["iso_end"]).isoformat()
+                item.properties["gsd"] = 1.0
+                item.add_asset(
+                    "data",
+                    pystac.Asset(href=d["tif_href"], media_type="image/tiff", roles=["data"], title="DEM 1m (GeoTIFF)"),
+                )
+                item.add_asset(
+                    "metadata",
+                    pystac.Asset(href=d["xml_url"], media_type="application/xml", roles=["metadata"], title="FGDC metadata"),
+                )
+                if d.get("jpg_href"):
+                    item.add_asset(
+                        "thumbnail",
+                        pystac.Asset(href=d["jpg_href"], media_type="image/jpeg", roles=["thumbnail"], title="Thumbnail"),
+                    )
+                collection.add_item(item)
+                total_items += 1
+
+        try:
+            bar.close()
+        except Exception:
+            pass
+
+    catalog.normalize_hrefs(out_dir)
+    catalog.make_all_asset_hrefs_absolute()
+    catalog.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
+    LOGGER.info("Wrote STAC: %s (items=%d)", os.path.join(out_dir, "catalog.json"), total_items)
+    # Persist spatial index for fast AOI queries
+    try:
+        _write_bbox_index(out_dir, collection_id)
+    except Exception:
+        pass
+    if items_shapefile:
+        shp_path = os.path.expanduser(items_shapefile)
+        shp_dir = os.path.dirname(shp_path)
+        if shp_dir and not os.path.exists(shp_dir):
+            os.makedirs(shp_dir)
+        root = os.path.join(out_dir, "catalog.json")
+        cat = pystac.read_file(root)
+        coll = next((c for c in cat.get_children() if isinstance(c, pystac.Collection) and c.id == collection_id), None)
+        if coll is None:
+            raise ValueError(f"Collection {collection_id} not found in catalog.")
+        ids, geoms = [], []
+        for it in coll.get_items():
+            if it.bbox:
+                ids.append(it.id)
+                geoms.append(shapely_box(*it.bbox))
+        gdf = gpd.GeoDataFrame({"id": ids}, geometry=geoms, crs="EPSG:4326")
+        gdf.to_file(shp_path)
+        print(f'wrote stac shapefiles to {shp_path}')
+    return os.path.join(out_dir, "catalog.json")
+
+
+def tiles_for_aoi(stac_dir: str, aoi_bbox_4326: Tuple[float, float, float, float],
+                  collection_id: str = "usgs-3dep-1m-opr") -> list[pystac.Item]:
+    """
+    Return a list of STAC Items whose bbox intersects the given AOI bbox (EPSG:4326).
+
+    Uses a Shapely STRtree spatial index for fast intersection queries over item bboxes.
+    """
+    root = os.path.join(stac_dir, "catalog.json")
+    cat = pystac.read_file(root)
+    coll = next((c for c in cat.get_children() if isinstance(c, pystac.Collection) and c.id == collection_id), None)
+    if coll is None:
+        raise ValueError(f"Collection {collection_id} not found in catalog.")
+
+    aoi_poly = shapely_box(*aoi_bbox_4326)
+    loaded = _load_bbox_index(stac_dir, collection_id)
+    if loaded is None:
+        items_all = list(coll.get_items())
+        geoms = []
+        ids = []
+        for it in items_all:
+            ib = it.bbox
+            if ib:
+                geoms.append(shapely_box(*ib))
+                ids.append(it.id)
+        try:
+            _write_bbox_index(stac_dir, collection_id)
+        except Exception:
+            pass
+    else:
+        geoms, ids = loaded
+
+    if not geoms:
+        return []
+
+    tree = STRtree(geoms)
+    matches = tree.query(aoi_poly, predicate="intersects")
+    # Shapely 2.x may return either integer indices (np.ndarray) or geometry objects.
+    wkb_to_idx = {g.wkb: i for i, g in enumerate(geoms)}
+    idxs = []
+    try:
+        # numpy array of indices path
+        import numpy as _np  # local import to avoid top-level constraints
+        if hasattr(matches, "dtype") and _np.issubdtype(matches.dtype, _np.integer):
+            idxs = [int(i) for i in matches.tolist()]
+        else:
+            for m in matches:
+                if isinstance(m, (int,)):
+                    idxs.append(int(m))
+                else:
+                    i = wkb_to_idx.get(m.wkb)
+                    if i is not None:
+                        idxs.append(i)
+    except Exception:
+        for m in matches:
+            try:
+                i = wkb_to_idx.get(m.wkb)
+            except Exception:
+                i = None
+            if i is not None:
+                idxs.append(i)
+
+    seen = set()
+    out = []
+    for i in idxs:
+        if i in seen:
+            continue
+        seen.add(i)
+        it = cat.get_item(ids[i], recursive=True)
+        if it is not None:
+            out.append(it)
+    return out
+
+
+def _index_path(stac_dir: str, collection_id: str) -> str:
+    return os.path.join(stac_dir, f"{collection_id}_bbox_index.json")
+
+
+def _write_bbox_index(stac_dir: str, collection_id: str) -> str:
+    root = os.path.join(stac_dir, "catalog.json")
+    cat = pystac.read_file(root)
+    coll = next((c for c in cat.get_children() if isinstance(c, pystac.Collection) and c.id == collection_id), None)
+    if coll is None:
+        raise ValueError(f"Collection {collection_id} not found in catalog.")
+    ids = []
+    bboxes = []
+    for it in coll.get_items():
+        if it.bbox:
+            ids.append(it.id)
+            bboxes.append(list(it.bbox))
+    data = {"collection_id": collection_id, "ids": ids, "bboxes": bboxes}
+    path = _index_path(stac_dir, collection_id)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    return path
+
+
+def _load_bbox_index(stac_dir: str, collection_id: str):
+    path = _index_path(stac_dir, collection_id)
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    ids = data.get("ids") or []
+    bboxes = data.get("bboxes") or []
+    if not ids or not bboxes or len(ids) != len(bboxes):
+        return None
+    geoms = [shapely_box(*bbox) for bbox in bboxes]
+    return geoms, ids
+
+
+def mosaic_from_stac(stac_dir: str,
+                     aoi_gdf,
+                     cache_dir: str,
+                     collection_id: str = "usgs-3dep-1m-opr",
+                     target_crs_epsg: int = 5070) -> xr.DataArray:
+    """
+    Select tiles overlapping the AOI from a local 3DEP STAC and mosaic into a DEM DataArray.
+
+    - Downloads GeoTIFFs into cache_dir if not present.
+    - Merges with rasterio.merge.
+    - Reprojects to target_crs_epsg and clips to AOI.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    bbox4326 = tuple(aoi_gdf.to_crs(4326).total_bounds.tolist())
+    items = tiles_for_aoi(stac_dir, bbox4326, collection_id=collection_id)
+    if not items:
+        raise ValueError("No STAC tiles intersect AOI.")
+
+    tifs_local: list[str] = []
+    for it in tqdm(items, total=len(items), desc='Mosaic from STAC'):
+        asset = it.assets.get("data")
+        if asset is None:
+            continue
+        href = asset.href
+        fname = os.path.basename(href)
+        local = os.path.join(cache_dir, fname)
+        if not os.path.exists(local):
+            # stream download
+            with requests.get(href, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(local, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            f.write(chunk)
+        tifs_local.append(local)
+
+    if not tifs_local:
+        raise ValueError("No GeoTIFF assets available among intersecting Items.")
+
+    srcs = [rasterio.open(p) for p in tifs_local]
+    mosaic, mosaic_tr = rio_merge(srcs)
+    crs = srcs[0].crs
+    for ds in srcs:
+        try:
+            ds.close()
+        except Exception:
+            pass
+
+    dem = xr.DataArray(mosaic[0].astype("float32"), dims=("y", "x"), name="elevation")
+    dem = dem.rio.write_crs(crs, inplace=False)
+    dem = dem.rio.write_transform(mosaic_tr)
+    epsg = crs.to_epsg()
+    if (epsg is None) or (int(epsg) != int(target_crs_epsg)):
+        dem = dem.rio.reproject(f"EPSG:{int(target_crs_epsg)}")
+
+    dem = dem.rio.clip(aoi_gdf.to_crs(dem.rio.crs).geometry, aoi_gdf.to_crs(dem.rio.crs).crs)
+    # Replace nodata with NaN consistently
+    nd = dem.rio.nodata
+    if nd is not None and np.isfinite(nd):
+        dem = dem.where(dem != nd)
+        dem = dem.rio.write_nodata(np.nan)
+
+    # Enforce LiDAR resolution sanity (1 m nominal)
+    try:
+        resx, resy = dem.rio.resolution()
+        if max(abs(resx), abs(resy)) > 2.0:
+            raise ValueError(
+                f"Mosaic resolution too coarse: {abs(resx):.2f} x {abs(resy):.2f} m (> 2 m)."
+            )
+    except Exception:
+        pass
+    return dem
+
+
+--- END OF src/handily/stac_3dep.py ---
+
+--- START OF src/handily/viz.py ---
+
+import os
+import json
+import logging
+import math
+
+import numpy as np
+import geopandas as gpd
+from shapely.geometry import box
+import rasterio
+from rasterio.transform import from_bounds
+from rasterio.warp import reproject, Resampling
+
+LOGGER = logging.getLogger("handily.viz")
+
+
+def _to_wgs84_geojson(gdf):
+    """
+    Convert a GeoDataFrame to WGS84 (EPSG:4326) and return a GeoJSON string.
+    Leaflet expects lon/lat in degrees.
+    """
+    if gdf is None or len(gdf) == 0:
+        empty = json.dumps({"type": "FeatureCollection", "features": []})
+        return empty
+    gj = gdf.to_crs("EPSG:4326").to_json()
+    return gj
+
+
+def write_interactive_map(results, out_html, initial_threshold=2.0):
+    """
+    Write a self-contained HTML (Leaflet) for interactive debugging of REM thresholds.
+
+    Layers:
+    - AOI boundary
+    - NHD flowlines (optionally filtered upstream)
+    - Fields polygons colored by rem_mean compared to a user-controlled threshold
+
+    The slider changes the partitioning classification (rem_mean < threshold) client-side,
+    updating styling and counts without re-running Python.
+    """
+    aoi = results.get("aoi")
+    flowlines = results.get("flowlines")
+    fields_stats = results.get("fields_stats")
+
+    if fields_stats is None or "rem_mean" not in fields_stats.columns:
+        raise ValueError("fields_stats with 'rem_mean' is required in results for visualization.")
+
+    aoi_gj = _to_wgs84_geojson(aoi)
+    flow_gj = _to_wgs84_geojson(flowlines)
+    fields_gj = _to_wgs84_geojson(fields_stats)
+
+    # Optional raster overlays (REM/DEM) as PNGs with WGS84 bounds
+    # Using single-image overlays keeps things simple without a tile pyramid.
+    out_dir = os.path.dirname(os.path.abspath(out_html))
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    # Bake XYZ tiles for REM/DEM with selectable color ramps
+    rem_da = results.get("rem")
+    dem_da = results.get("dem")
+
+    rem_schemes = ["blue-red", "viridis", "terrain", "grayscale"]
+    dem_schemes = ["grayscale", "terrain", "viridis"]
+
+    rem_tiles_js = "const remLayers = {}\n"
+    dem_tiles_js = "const demLayers = {}\n"
+
+    if rem_da is not None:
+        rem_tiles_dir = os.path.join(out_dir, "tiles", "rem")
+        _bake_xyz_tiles(rem_da, rem_tiles_dir, mode="rem", schemes=rem_schemes, zmin=9, zmax=14)
+        # Build JS dictionary
+        parts = []
+        for s in rem_schemes:
+            url = f"tiles/rem/{s}/{{{{z}}}}/{{{{x}}}}/{{{{y}}}}.png"
+            parts.append(f"  '{s}': L.tileLayer('{url}', {{ maxZoom: 22, opacity: 0.6 }})")
+        rem_tiles_js = "const remLayers = {\n" + ",\n".join(parts) + "\n};\n"
+
+    if dem_da is not None:
+        dem_tiles_dir = os.path.join(out_dir, "tiles", "dem")
+        _bake_xyz_tiles(dem_da, dem_tiles_dir, mode="dem", schemes=dem_schemes, zmin=9, zmax=14)
+        parts = []
+        for s in dem_schemes:
+            url = f"tiles/dem/{s}/{{{{z}}}}/{{{{x}}}}/{{{{y}}}}.png"
+            parts.append(f"  '{s}': L.tileLayer('{url}', {{ maxZoom: 22, opacity: 0.5 }})")
+        dem_tiles_js = "const demLayers = {\n" + ",\n".join(parts) + "\n};\n"
+
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+  <title>HAND/REM Debug Map</title>
+  <link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\" />
+  <style>
+    html, body, #map {{ height: 100%; margin: 0; padding: 0; }}
+    .control-panel {{ position: absolute; top: 10px; left: 10px; z-index: 1000; background: #fff; padding: 8px 10px; border-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.3); }}
+    .legend {{ position: absolute; bottom: 10px; left: 10px; background: #fff; padding: 6px 8px; border-radius: 4px; font: 12px/14px Arial, sans-serif; box-shadow: 0 1px 4px rgba(0,0,0,0.3); }}
+    .legend .swatch {{ display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: middle; }}
+  </style>
+  <base target=\"_self\">
+  <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self' https://unpkg.com https://*.tile.openstreetmap.org; style-src 'self' 'unsafe-inline' https://unpkg.com;\" />
+  <!-- CSP keeps things tidy while allowing Leaflet and OSM tiles. -->
+</head>
+<body>
+  <div id=\"map\"></div>
+  <div class=\"control-panel\"> 
+    <div><strong>REM Threshold (m)</strong></div>
+    <input id=\"thr\" type=\"range\" min=\"0\" max=\"5\" step=\"0.1\" value=\"{float(initial_threshold)}\" />
+    <span id=\"thrval\">{float(initial_threshold):.1f}</span>
+    <div id=\"counts\" style=\"margin-top:6px\"></div>
+    <div style=\"margin-top:6px\">REM Tiles <input type=\"checkbox\" id=\"toggleRem\" checked> 
+      <select id=\"remRamp\"> 
+        <option value=\"blue-red\">blue-red</option>
+        <option value=\"viridis\">viridis</option>
+        <option value=\"terrain\">terrain</option>
+        <option value=\"grayscale\">grayscale</option>
+      </select>
+    </div>
+    <div style=\"margin-top:6px\">DEM Tiles <input type=\"checkbox\" id=\"toggleDem\"> 
+      <select id=\"demRamp\"> 
+        <option value=\"grayscale\">grayscale</option>
+        <option value=\"terrain\">terrain</option>
+        <option value=\"viridis\">viridis</option>
+      </select>
+    </div>
+  </div>
+  <div class=\"legend\">
+    <div><span class=\"swatch\" style=\"background:#d7191c\"></span> Partitioned (rem_mean &lt; threshold)</div>
+    <div><span class=\"swatch\" style=\"background:#2c7bb6\"></span> Not partitioned</div>
+  </div>
+  <script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>
+  <script>
+    const AOI = {aoi_gj};
+    const FLOW = {flow_gj};
+    const FIELDS = {fields_gj};
+
+    const map = L.map('map');
+    // Multiple free basemaps with toggle
+    const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ maxZoom: 19, attribution: '&copy; OpenStreetMap' }});
+    const esri = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{x}}/{{y}}', {{ maxZoom: 19, attribution: 'Tiles &copy; Esri' }});
+    const usgsTopo = L.tileLayer('https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{{z}}/{{x}}/{{y}}', {{ maxZoom: 19, attribution: 'USGS' }});
+    osm.addTo(map);
+
+    const aoiStyle = {{ color: '#222', weight: 2, fill: false }};
+    const flowStyle = {{ color: '#008800', weight: 1 }};
+
+    const aoiLayer = L.geoJSON(AOI, {{ style: aoiStyle }}).addTo(map);
+    const flowLayer = L.geoJSON(FLOW, {{ style: flowStyle }}).addTo(map);
+
+    const thr = document.getElementById('thr');
+    const thrval = document.getElementById('thrval');
+    const counts = document.getElementById('counts');
+    const remRampSel = document.getElementById('remRamp');
+    const demRampSel = document.getElementById('demRamp');
+    const toggleRem = document.getElementById('toggleRem');
+    const toggleDem = document.getElementById('toggleDem');
+
+    function styleForFeature(f, t) {{
+      const m = f.properties && typeof f.properties.rem_mean === 'number' ? f.properties.rem_mean : null;
+      const part = (m !== null) && (m < t);
+      return {{
+        color: '#555',
+        weight: 0.7,
+        fill: true,
+        fillOpacity: 0.5,
+        fillColor: part ? '#d7191c' : '#2c7bb6'
+      }};
+    }}
+
+    function onEachField(f, layer) {{
+      const m = f.properties && typeof f.properties.rem_mean === 'number' ? f.properties.rem_mean : null;
+      const txt = 'rem_mean: ' + (m === null ? 'n/a' : m.toFixed(2));
+      layer.bindPopup(txt);
+    }}
+
+    let fieldsLayer = L.geoJSON(FIELDS, {{ style: (f)=>styleForFeature(f, parseFloat(thr.value)), onEachFeature: onEachField }}).addTo(map);
+
+    function updateCounts(t) {{
+      const feats = FIELDS.features || [];
+      let tot = 0, part = 0;
+      for (let i=0; i<feats.length; i++) {{
+        const m = feats[i].properties && typeof feats[i].properties.rem_mean === 'number' ? feats[i].properties.rem_mean : null;
+        if (m !== null) {{
+          tot += 1;
+          if (m < t) part += 1;
+        }}
+      }}
+      counts.innerText = 'Fields: ' + part + ' / ' + tot + ' partitioned';
+    }}
+
+    function refresh() {{
+      const t = parseFloat(thr.value);
+      thrval.innerText = t.toFixed(1);
+      fieldsLayer.setStyle((f)=>styleForFeature(f, t));
+      updateCounts(t);
+    }}
+
+    thr.addEventListener('input', refresh);
+
+    // Tile layers baked from REM/DEM (injected from Python)
+{rem_tiles_js}
+{dem_tiles_js}
+
+    let activeRem = null;
+    let activeDem = null;
+
+    function setRemLayer(name) {{
+      if (typeof remLayers === 'undefined' || !remLayers[name]) return;
+      if (activeRem) {{ try {{ map.removeLayer(activeRem); }} catch(e) {{}} }}
+      activeRem = remLayers[name];
+      if (toggleRem.checked) activeRem.addTo(map);
+    }}
+    function setDemLayer(name) {{
+      if (typeof demLayers === 'undefined' || !demLayers[name]) return;
+      if (activeDem) {{ try {{ map.removeLayer(activeDem); }} catch(e) {{}} }}
+      activeDem = demLayers[name];
+      if (toggleDem.checked) activeDem.addTo(map);
+    }}
+
+    remRampSel.addEventListener('change', () => setRemLayer(remRampSel.value));
+    demRampSel.addEventListener('change', () => setDemLayer(demRampSel.value));
+    toggleRem.addEventListener('change', () => {{ if (activeRem) {{ if (toggleRem.checked) activeRem.addTo(map); else map.removeLayer(activeRem); }} }});
+    toggleDem.addEventListener('change', () => {{ if (activeDem) {{ if (toggleDem.checked) activeDem.addTo(map); else map.removeLayer(activeDem); }} }});
+
+    // Fit map to AOI or fields
+    let fitBounds = null;
+    try {{ fitBounds = aoiLayer.getBounds(); }} catch (e) {{}}
+    if (!fitBounds || !fitBounds.isValid()) {{
+      try {{ fitBounds = fieldsLayer.getBounds(); }} catch (e) {{}}
+    }}
+    if (fitBounds && fitBounds.isValid()) {{
+      map.fitBounds(fitBounds.pad(0.05));
+    }} else {{
+      map.setView([45.0, -112.5], 9);
+    }}
+
+    // Base/overlay layer control (vector overlays)
+    const baseLayers = {{ 'OpenStreetMap': osm, 'Esri World Imagery': esri, 'USGS Topo': usgsTopo }};
+    const overlays = {{ 'AOI': aoiLayer, 'Flowlines': flowLayer, 'Fields': fieldsLayer }};
+    L.control.layers(baseLayers, overlays, {{ collapsed: true }}).addTo(map);
+
+    // Initial UI update
+    updateCounts(parseFloat(thr.value));
+
+    // Initialize tile layers
+    if (typeof remLayers !== 'undefined' && remLayers['blue-red']) {{
+      setRemLayer('blue-red');
+    }}
+    if (typeof demLayers !== 'undefined' && demLayers['grayscale']) {{
+      // leave DEM off by default; toggle if checkbox is checked
+      if (toggleDem.checked) setDemLayer('grayscale');
+    }}
+  </script>
+</body>
+</html>
+"""
+
+    with open(out_html, "w", encoding="utf-8") as f:
+        f.write(html)
+    return out_html
+
+
+# ----- Helpers: raster overlays -----
+
+def _export_overlay_png(da, out_png, mode="rem"):
+    """
+    Colorize an xarray DataArray (DEM/REM) to a PNG with RGBA bands and return WGS84 bounds.
+    The PNG is georeferenced implicitly via Leaflet bounds (no world file required).
+    """
+    if getattr(da, "rio", None) is None or da.rio.crs is None:
+        raise ValueError("DataArray must have a valid CRS via rioxarray.")
+
+    data = np.asarray(da.data)
+    data = data.astype("float32")
+    mask = np.isfinite(data)
+
+    if not np.any(mask):
+        raise ValueError("Overlay source has no finite values.")
+
+    vals = data[mask]
+    if str(mode) == "rem":
+        vmin = 0.0
+        vmax_guess = float(np.nanpercentile(vals, 99.0)) if vals.size > 100 else float(np.nanmax(vals))
+        vmax = max(1.0, min(vmax_guess, 10.0))  # keep dynamic range reasonable for REM
+        rgba = _colormap_linear(data, vmin, vmax, scheme="blue-red", mask=mask)
+    else:
+        # DEM grayscale by percentile stretch
+        vmin = float(np.nanpercentile(vals, 2.0)) if vals.size > 100 else float(np.nanmin(vals))
+        vmax = float(np.nanpercentile(vals, 98.0)) if vals.size > 100 else float(np.nanmax(vals))
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        rgba = _colormap_linear(data, vmin, vmax, scheme="grayscale", mask=mask)
+
+    # Write PNG (RGBA)
+    h, w = rgba.shape[1], rgba.shape[2]
+    profile = {
+        "driver": "PNG",
+        "width": w,
+        "height": h,
+        "count": 4,
+        "dtype": "uint8",
+    }
+    with rasterio.open(out_png, "w", **profile) as dst:
+        dst.write(rgba[0], 1)
+        dst.write(rgba[1], 2)
+        dst.write(rgba[2], 3)
+        dst.write(rgba[3], 4)
+
+    # Bounds in WGS84 for Leaflet
+    minx, miny, maxx, maxy = da.rio.bounds()
+    g = gpd.GeoSeries([box(minx, miny, maxx, maxy)], crs=da.rio.crs)
+    bnd = g.to_crs("EPSG:4326").total_bounds  # [minx, miny, maxx, maxy]
+    south, west, north, east = float(bnd[1]), float(bnd[0]), float(bnd[3]), float(bnd[2])
+    return (south, west), (north, east)
+
+
+def _colormap_linear(arr, vmin, vmax, scheme="blue-red", mask=None):
+    """
+    Map data in [vmin, vmax] to RGBA uint8 using simple ramps.
+    - 'blue-red': blue (#2c7bb6) -> red (#d7191c)
+    - 'grayscale': 0..255 gray
+    - 'terrain': dark green -> yellow -> brown -> white
+    - 'viridis': approximate using key stops
+    Returns array shaped (4, H, W).
+    """
+    a = np.asarray(arr, dtype="float32")
+    if mask is None:
+        mask = np.isfinite(a)
+    norm = (a - float(vmin)) / max(1e-6, float(vmax) - float(vmin))
+    norm = np.clip(norm, 0.0, 1.0)
+
+    h, w = a.shape[-2], a.shape[-1]
+    r = np.zeros((h, w), dtype="float32")
+    g = np.zeros((h, w), dtype="float32")
+    b = np.zeros((h, w), dtype="float32")
+    alpha = np.zeros((h, w), dtype="float32")
+
+    def lerp(a0, a1, t):
+        return a0 + (a1 - a0) * t
+
+    def apply_stops(stops, t):
+        # stops: list of (pos in 0..1, (r,g,b)) ascending
+        if t <= stops[0][0]:
+            return stops[0][1]
+        if t >= stops[-1][0]:
+            return stops[-1][1]
+        for i in range(len(stops) - 1):
+            p0, c0 = stops[i]
+            p1, c1 = stops[i + 1]
+            if t >= p0 and t <= p1:
+                tt = (t - p0) / max(1e-6, (p1 - p0))
+                return (
+                    lerp(c0[0], c1[0], tt),
+                    lerp(c0[1], c1[1], tt),
+                    lerp(c0[2], c1[2], tt),
+                )
+        return stops[-1][1]
+
+    if scheme == "blue-red":
+        stops = [
+            (0.0, (44, 123, 182)),  # #2c7bb6
+            (1.0, (215, 25, 28)),  # #d7191c
+        ]
+        alpha_val = 200.0
+    elif scheme == "grayscale":
+        # handled separately below
+        stops = None
+        alpha_val = 180.0
+    elif scheme == "terrain":
+        stops = [
+            (0.0, (26, 102, 26)),  # dark green
+            (0.35, (190, 190, 60)),  # yellowish
+            (0.7, (160, 82, 45)),  # brown
+            (1.0, (245, 245, 245)),  # near white
+        ]
+        alpha_val = 180.0
+    elif scheme == "viridis":
+        stops = [
+            (0.0, (68, 1, 84)),  # #440154
+            (0.33, (49, 104, 142)),  # #31688e
+            (0.66, (53, 183, 121)),  # #35b779
+            (1.0, (253, 231, 37)),  # #fde725
+        ]
+        alpha_val = 180.0
+    else:
+        # default to grayscale
+        stops = None
+        alpha_val = 180.0
+
+    if stops is None and scheme == "grayscale":
+        gray = 255.0 * norm
+        r = gray
+        g = gray
+        b = gray
+    else:
+        # vectorized stop interpolation
+        # approximate by binning t into 256 steps for performance
+        tvals = norm
+        rmap = np.zeros_like(tvals)
+        gmap = np.zeros_like(tvals)
+        bmap = np.zeros_like(tvals)
+        # evaluate by mapping each pixel independently; vectorization via np.nditer could be heavy
+        # tradeoff: compute 256-step LUT
+        lut_r = np.zeros(256, dtype="float32")
+        lut_g = np.zeros(256, dtype="float32")
+        lut_b = np.zeros(256, dtype="float32")
+        for i in range(256):
+            ti = i / 255.0
+            rr, gg, bb = apply_stops(stops, ti)
+            lut_r[i] = rr
+            lut_g[i] = gg
+            lut_b[i] = bb
+        idx = (tvals * 255.0).astype("int32")
+        idx = np.clip(idx, 0, 255)
+        r = lut_r[idx]
+        g = lut_g[idx]
+        b = lut_b[idx]
+
+    alpha[mask] = alpha_val
+
+    r = r.astype("uint8")
+    g = g.astype("uint8")
+    b = b.astype("uint8")
+    a8 = alpha.astype("uint8")
+    rgba = np.stack([r, g, b, a8], axis=0)
+    return rgba
+
+
+def _compute_vminmax(da, mode):
+    data = np.asarray(da.data).astype("float32")
+    mask = np.isfinite(data)
+    vals = data[mask]
+    if vals.size == 0:
+        return 0.0, 1.0
+    if str(mode) == "rem":
+        vmin = 0.0
+        vmax_guess = float(np.nanpercentile(vals, 99.0)) if vals.size > 100 else float(np.nanmax(vals))
+        vmax = max(1.0, min(vmax_guess, 10.0))
+        return vmin, vmax
+    # DEM
+    vmin = float(np.nanpercentile(vals, 2.0)) if vals.size > 100 else float(np.nanmin(vals))
+    vmax = float(np.nanpercentile(vals, 98.0)) if vals.size > 100 else float(np.nanmax(vals))
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+    return vmin, vmax
+
+
+def _lonlat_bounds_from_tile(z, x, y):
+    n = float(1 << int(z))
+    lon_w = x / n * 360.0 - 180.0
+    lon_e = (x + 1.0) / n * 360.0 - 180.0
+
+    def lat_from_y(ty):
+        t = math.pi * (1.0 - 2.0 * (ty / n))
+        return math.degrees(math.atan(math.sinh(t)))
+
+    lat_n = lat_from_y(float(y))
+    lat_s = lat_from_y(float(y + 1))
+    return lon_w, lat_s, lon_e, lat_n
+
+
+def _merc_from_lonlat(lon, lat):
+    # Web Mercator
+    max_lat = 85.05112878
+    lat = max(-max_lat, min(max_lat, float(lat)))
+    x = 6378137.0 * math.radians(float(lon))
+    y = 6378137.0 * math.log(math.tan(math.pi / 4.0 + math.radians(lat) / 2.0))
+    return x, y
+
+
+def _bake_xyz_tiles(da, out_root, mode, schemes, zmin=9, zmax=14):
+    # Compute global scaling for consistent colors
+    vmin, vmax = _compute_vminmax(da, mode)
+    data = np.asarray(da.data).astype("float32")
+    src_transform = da.rio.transform()
+    src_crs = da.rio.crs
+    nd = da.rio.nodata
+
+    # Bounds in lon/lat for tile coverage
+    minx, miny, maxx, maxy = da.rio.bounds()
+    g = gpd.GeoSeries([box(minx, miny, maxx, maxy)], crs=src_crs)
+    lonmin, latmin, lonmax, latmax = g.to_crs("EPSG:4326").total_bounds
+
+    for z in range(int(zmin), int(zmax) + 1):
+        n = 1 << z
+        # x range
+        x0 = int(math.floor((lonmin + 180.0) / 360.0 * n))
+        x1 = int(math.floor((lonmax + 180.0) / 360.0 * n))
+        x0 = max(0, min(n - 1, x0))
+        x1 = max(0, min(n - 1, x1))
+
+        # y range (note: y increases southward)
+        def y_from_lat(lat):
+            lat = max(-85.05112878, min(85.05112878, float(lat)))
+            lat_rad = math.radians(lat)
+            return int(math.floor((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n))
+
+        y0 = y_from_lat(latmax)
+        y1 = y_from_lat(latmin)
+        y0 = max(0, min(n - 1, y0))
+        y1 = max(0, min(n - 1, y1))
+
+        for x in range(x0, x1 + 1):
+            for y in range(y0, y1 + 1):
+                lon_w, lat_s, lon_e, lat_n = _lonlat_bounds_from_tile(z, x, y)
+                minxm, minym = _merc_from_lonlat(lon_w, lat_s)
+                maxxm, maxym = _merc_from_lonlat(lon_e, lat_n)
+                dst_transform = from_bounds(minxm, minym, maxxm, maxym, 256, 256)
+                dst = np.full((256, 256), np.nan, dtype="float32")
+                reproject(
+                    source=data,
+                    destination=dst,
+                    src_transform=src_transform,
+                    src_crs=src_crs,
+                    src_nodata=nd if nd is not None else np.nan,
+                    dst_transform=dst_transform,
+                    dst_crs="EPSG:3857",
+                    dst_nodata=np.nan,
+                    resampling=Resampling.bilinear,
+                )
+
+                mask = np.isfinite(dst)
+                for scheme in schemes:
+                    rgba = _colormap_linear(dst, vmin, vmax, scheme=scheme, mask=mask)
+                    out_png = os.path.join(out_root, scheme, str(z), str(x), f"{y}.png")
+                    out_dir = os.path.dirname(out_png)
+                    if not os.path.exists(out_dir):
+                        os.makedirs(out_dir)
+                    profile = {
+                        "driver": "PNG",
+                        "width": 256,
+                        "height": 256,
+                        "count": 4,
+                        "dtype": "uint8",
+                    }
+                    with rasterio.open(out_png, "w", **profile) as dst_img:
+                        dst_img.write(rgba[0], 1)
+                        dst_img.write(rgba[1], 2)
+                        dst_img.write(rgba[2], 3)
+                        dst_img.write(rgba[3], 4)
+
+# EOF
+
+
+--- END OF src/handily/viz.py ---
+
