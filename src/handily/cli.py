@@ -47,13 +47,31 @@ def main(argv=None):
     p_extend.add_argument("--states", nargs="*", required=True, help="Additional state abbreviations (e.g., WA OR)")
     p_extend.add_argument("--collection-id", default="usgs-3dep-1m-opr", help="Collection ID (default: usgs-3dep-1m-opr)")
 
+    p_et = sub.add_parser("et", help="ET workflows (PT-JPL)")
+    et_sub = p_et.add_subparsers(dest="et_cmd", required=True)
+
+    p_et_export = et_sub.add_parser("export", help="Export PT-JPL capture-date zonal stats to GCS")
+    p_et_export.add_argument("--config", required=True, help="YAML config path")
+
+    p_et_join = et_sub.add_parser("join", help="Join local PT-JPL CSVs with GridMET parquet and write joined parquet")
+    p_et_join.add_argument("--config", required=True, help="YAML config path")
+
+    p_met = sub.add_parser("met", help="Meteorology workflows (GridMET)")
+    met_sub = p_met.add_subparsers(dest="met_cmd", required=True)
+
+    p_met_download = met_sub.add_parser("download", help="Download GridMET time series at field centroids")
+    p_met_download.add_argument("--config", required=True, help="YAML config path")
+
+    p_partition = sub.add_parser("partition", help="Partition ET into subsurface and irrigation components")
+    p_partition.add_argument("--config", required=True, help="YAML config path")
+
     args = parser.parse_args(argv)
     configure_logging(args.v)
 
     if args.cmd == "bounds":
         from handily.viz import write_interactive_map
 
-        ensure_dir(args.out_dir)
+        ensure_dir(args.out_dir)  # BUG?: ensure_dir/run_bounds_rem/CORE_LOGGER not defined in this module
         CORE_LOGGER.info("Output directory: %s", args.out_dir)
         CORE_LOGGER.info("Building REM within bounds: %s", args.bounds)
         results = run_bounds_rem(
@@ -126,8 +144,93 @@ def main(argv=None):
         elif args.stac_cmd == "extend":
             states = parse_states(args.states)
             root = extend_3dep_stac(args.out_dir, states=states, collection_id=args.collection_id)
-            print(f"STAC catalog updated: {root}")
+        print(f"STAC catalog updated: {root}")
+        return 0
+
+    if args.cmd == "met":
+        from handily.config import HandilyConfig
+        from handily.et.gridmet import download_gridmet
+
+        config = HandilyConfig.from_yaml(args.config)
+        bounds_wsen = None
+        if config.bounds:
+            bounds_wsen = tuple(config.bounds)
+        download_gridmet(
+            config.fields_path,
+            config.gridmet_parquet_dir,
+            gridmet_centroids_path=config.gridmet_centroids_path,
+            gridmet_centroid_parquet_dir=config.gridmet_centroid_parquet_dir,
+            bounds_wsen=bounds_wsen,
+            start=config.met_start,
+            end=config.met_end,
+            overwrite=False,
+            feature_id=config.feature_id,
+            gridmet_id_col=config.gridmet_id_col,
+            return_df=False,
+        )
+        return 0
+
+    if args.cmd == "et":
+        from handily.config import HandilyConfig
+
+        config = HandilyConfig.from_yaml(args.config)
+        bounds_wsen = None
+        if config.bounds:
+            bounds_wsen = tuple(config.bounds)
+
+        if args.et_cmd == "export":
+            from handily.et.image_export import export_ptjpl_et_fraction
+
+            export_ptjpl_et_fraction(
+                config.fields_path,
+                config.et_bucket,
+                feature_id=config.feature_id,
+                select=None,
+                start_yr=config.ptjpl_start_yr,
+                end_yr=config.ptjpl_end_yr,
+                overwrite=False,
+                check_dir=config.ptjpl_check_dir,
+                buffer=None,
+                bounds_wsen=bounds_wsen,
+                cloud_cover_max=70,
+                landsat_collections=None,
+            )
             return 0
+
+        if args.et_cmd == "join":
+            from handily.et.join import join_gridmet_ptjpl
+
+            join_gridmet_ptjpl(
+                config.gridmet_parquet_dir,
+                config.ptjpl_csv_dir,
+                config.et_join_parquet_dir,
+                ptjpl_csv_template=config.ptjpl_csv_template,
+                fields_path=config.fields_path,
+                bounds_wsen=bounds_wsen,
+                feature_id=config.feature_id,
+                eto_col="eto",
+                prcp_col="prcp",
+            )
+            return 0
+
+    if args.cmd == "partition":
+        from handily.config import HandilyConfig
+        from handily.et.partition import partition_et
+
+        config = HandilyConfig.from_yaml(args.config)
+        bounds_wsen = None
+        if config.bounds:
+            bounds_wsen = tuple(config.bounds)
+        partition_et(
+            config.fields_path,
+            config.partition_joined_parquet_dir,
+            config.partition_out_parquet_dir,
+            feature_id=config.feature_id,
+            strata_col=config.partition_strata_col,
+            pattern_col=config.partition_pattern_col,
+            bounds_wsen=bounds_wsen,
+        )
+        return 0
 
     parser.print_help()
     return 2

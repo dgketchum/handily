@@ -9,6 +9,10 @@ import rioxarray as rxr
 
 from handily.config import HandilyConfig
 from handily.compute import compute_field_rem_stats
+from handily.et.gridmet import download_gridmet
+from handily.et.image_export import export_ptjpl_et_fraction
+from handily.et.join import join_gridmet_ptjpl
+from handily.et.partition import partition_et
 from handily.io import aoi_from_bounds, ensure_dir
 from handily.pipeline import REMWorkflow
 from handily.viz import write_interactive_map
@@ -32,6 +36,63 @@ def dev_test_bounds_rem(config: HandilyConfig, bounds_wsen, ndwi_threshold: floa
     result = workflow.run(ndwi_threshold=float(ndwi_threshold), stats=("mean",), cache_flowlines=True)
     return result
 
+
+def dev_test_met(config: HandilyConfig, overwrite: bool = False):
+    download_gridmet(
+        config.fields_path,
+        config.gridmet_parquet_dir,
+        gridmet_centroids_path=config.gridmet_centroids_path,
+        gridmet_centroid_parquet_dir=config.gridmet_centroid_parquet_dir,
+        bounds_wsen=tuple(config.bounds) if config.bounds else None,
+        start=config.met_start,
+        end=config.met_end,
+        overwrite=overwrite,
+        feature_id=config.feature_id,
+        gridmet_id_col=config.gridmet_id_col,
+        return_df=False,
+    )
+
+
+def dev_test_et(config: HandilyConfig):
+    export_ptjpl_et_fraction(
+        config.fields_path,
+        config.et_bucket,
+        feature_id=config.feature_id,
+        select=None,
+        start_yr=config.ptjpl_start_yr,
+        end_yr=config.ptjpl_end_yr,
+        overwrite=False,
+        check_dir=config.ptjpl_check_dir,
+        buffer=None,
+        bounds_wsen=tuple(config.bounds) if config.bounds else None,
+        cloud_cover_max=70,
+        landsat_collections=None,
+    )
+
+
+def dev_test_join(config: HandilyConfig):
+    join_gridmet_ptjpl(
+        config.gridmet_parquet_dir,
+        config.ptjpl_csv_dir,
+        config.et_join_parquet_dir,
+        ptjpl_csv_template=config.ptjpl_csv_template,
+        fields_path=config.fields_path,
+        bounds_wsen=tuple(config.bounds) if config.bounds else None,
+        feature_id=config.feature_id,
+        eto_col="eto",
+        prcp_col="prcp",
+    )
+
+def dev_test_partition(config: HandilyConfig):
+    partition_et(
+        config.fields_path,
+        config.partition_joined_parquet_dir,
+        config.partition_out_parquet_dir,
+        feature_id=config.feature_id,
+        strata_col=config.partition_strata_col,
+        pattern_col=config.partition_pattern_col,
+        bounds_wsen=tuple(config.bounds) if config.bounds else None,
+    )
 
 def _subset_results_to_aoi(results: dict, aoi_gdf: gpd.GeoDataFrame) -> dict:
     out = dict(results)
@@ -75,6 +136,23 @@ def main(argv=None) -> int:
     overwrite_outputs = bool(cfg.get("overwrite_outputs", False))
     viz_only = bool(cfg.get("viz_only", False))
     bake_tiles = bool(cfg.get("bake_tiles", False))
+
+    run_met = bool(cfg.get("run_met", False))
+    run_et = bool(cfg.get("run_et", False))
+    run_join = bool(cfg.get("run_join", False))
+    run_partition = bool(cfg.get("run_partition", False))
+
+    if run_met:
+        dev_test_met(config=config, overwrite=bool(cfg.get("overwrite_met", False)))
+
+    if run_et:
+        dev_test_et(config=config)
+
+    if run_join:
+        dev_test_join(config=config)
+
+    if run_partition:
+        dev_test_partition(config=config)
 
     rem_path = os.path.join(config.out_dir, "rem_bounds.tif")
     streams_path = os.path.join(config.out_dir, "streams_bounds.tif")

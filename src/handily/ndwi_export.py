@@ -12,17 +12,27 @@ def _ee_geom(geom):
 
 
 def _naip_ndwi_image(region_geom, start_date, end_date):
-    col = ee.ImageCollection('USDA/NAIP/DOQQ').filterBounds(region_geom).filterDate(start_date, end_date)
-    img = col.mosaic()
-    ndwi = img.normalizedDifference(['G', 'N']).rename('ndwi')
-    ndwi = ndwi.clip(region_geom)
-    return ndwi
+    """
+    Build a single NDWI image for a region by taking the per-pixel maximum NDWI value
+    across all NAIP images in the date range.
+
+    This mirrors the Earth Engine JS workflow:
+      ndwiCollection = NAIP.map(addNDWI).select('ndwi')
+      maxNdwi = ndwiCollection.max()
+    """
+    col = ee.ImageCollection("USDA/NAIP/DOQQ").filterBounds(region_geom).filterDate(start_date, end_date)
+
+    def _add_ndwi(img):
+        return img.normalizedDifference(["G", "N"]).rename("ndwi")
+
+    ndwi = col.map(_add_ndwi).select("ndwi").max()
+    return ndwi.clip(region_geom)
 
 
 def export_ndwi_for_polygons(aoi_shapefile,
                              bucket='wudr',
                              prefix=None,
-                             start_date='2014-01-01',
+                             start_date='2010-01-01',
                              end_date='2024-12-31',
                              skip_if_present_dir=None):
     shp_path = os.path.expanduser(aoi_shapefile)
@@ -55,7 +65,7 @@ if __name__ == '__main__':
         aoi_shapefile=shp_path,
         bucket='wudr',
         prefix='naip_ndwi_aoi',
-        start_date='2014-01-01',
+        start_date='2010-01-01',
         end_date='2024-12-31',
         skip_if_present_dir=ndwi_dir,
     )

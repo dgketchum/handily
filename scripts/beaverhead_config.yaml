@@ -9,3 +9,30 @@ ndwi_threshold: 0.45
 overwrite_outputs: true
 viz_only: true
 bake_tiles: false
+
+feature_id: FID
+
+run_met: true
+met_start: 2017-01-01
+met_end: 2021-12-31
+gridmet_parquet_dir: /home/dgketchum/data/IrrigationGIS/handily/et/gridmet_parquet/
+gridmet_centroids_path: ~/data/IrrigationGIS/handily/gridmet/gis/gridmet_centroids.shp
+gridmet_centroid_parquet_dir: /home/dgketchum/data/IrrigationGIS/handily/et/gridmet_centroid_parquet/
+gridmet_id_col: GFID
+
+run_et: true
+et_bucket: wudr
+ptjpl_start_yr: 2017
+ptjpl_end_yr: 2021
+ptjpl_check_dir: /home/dgketchum/data/IrrigationGIS/handily/et/checks/
+
+run_join: true
+ptjpl_csv_dir: /home/dgketchum/data/IrrigationGIS/handily/et/ptjpl_csv/
+ptjpl_csv_template: /home/dgketchum/data/IrrigationGIS/handily/et/ptjpl_csv/{fid}.csv
+et_join_parquet_dir: /home/dgketchum/data/IrrigationGIS/handily/et/joined_parquet/
+
+run_partition: true
+partition_joined_parquet_dir: /home/dgketchum/data/IrrigationGIS/handily/et/joined_parquet/
+partition_out_parquet_dir: /home/dgketchum/data/IrrigationGIS/handily/et/partitioned_parquet/
+partition_strata_col: strata
+partition_pattern_col: pattern
