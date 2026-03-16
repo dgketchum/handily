@@ -81,7 +81,12 @@ class REMWorkflow:
             stac_collection_id=stac_collection_id,
         )
 
-    def compute_rem(self, ndwi_threshold: float = 0.15, stats: tuple[str, ...] = ("mean",)) -> None:
+    def compute_rem(
+        self,
+        ndwi_threshold: float = 0.15,
+        stats: tuple[str, ...] = ("mean",),
+        flowlines_buffer_m: float | None = None,
+    ) -> None:
         if self.dem is None:
             raise RuntimeError("DEM not available; call fetch_dem() first.")
         if self.flowlines is None or self.ndwi is None:
@@ -90,7 +95,11 @@ class REMWorkflow:
         dem_crs = self.dem.rio.crs
         flowlines_dem = self.flowlines.to_crs(dem_crs)
         self.streams = compute.build_streams_mask_from_nhd_ndwi(
-            flowlines_dem, self.dem, ndwi_da=self.ndwi, ndwi_threshold=float(ndwi_threshold)
+            flowlines_dem,
+            self.dem,
+            ndwi_da=self.ndwi,
+            ndwi_threshold=float(ndwi_threshold),
+            flowlines_buffer_m=flowlines_buffer_m,
         )
         self.rem = compute.compute_rem_quick(self.dem, self.streams)
         self.fields = io.load_and_clip_fields(self.config.fields_path, self.aoi_gdf, dem_crs)
@@ -118,8 +127,11 @@ class REMWorkflow:
         stats: tuple[str, ...] = ("mean",),
         cache_flowlines: bool = False,
         overwrite_flowlines_cache: bool = False,
+        flowlines_buffer_m: float | None = None,
     ) -> dict[str, Any]:
         self.fetch_vectors(cache_flowlines=cache_flowlines, overwrite_flowlines_cache=overwrite_flowlines_cache)
         self.fetch_dem()
-        self.compute_rem(ndwi_threshold=ndwi_threshold, stats=stats)
+        self.compute_rem(
+            ndwi_threshold=ndwi_threshold, stats=stats, flowlines_buffer_m=flowlines_buffer_m
+        )
         return self.results(ndwi_threshold=ndwi_threshold)
