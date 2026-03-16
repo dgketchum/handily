@@ -211,3 +211,9 @@ __marimo__/
 /.idea/.gitignore
 /klamath.txt
 .DS_Store
+
+# Local/generated outputs (keep untracked)
+/PROGRESS.md
+/handily_repo*.txt
+/handily_repo.txt
+/nohup.out

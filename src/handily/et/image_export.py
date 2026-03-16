@@ -86,45 +86,33 @@ def export_ptjpl_et_fraction(
             end_date=f"{end_yr}-12-31",
             geometry=polygon,
             cloud_cover_max=cloud_cover_max,
+            model_args={
+                "et_reference_source": "IDAHO_EPSCOR/GRIDMET",
+                "et_reference_band": "eto",
+                "et_reference_factor": 1.0,
+                "et_reference_resample": "bilinear",
+            },
         )
 
-        scenes = coll.get_image_ids()
-        scenes = list(set(scenes))
-        scenes = sorted(scenes, key=lambda item: item.split("_")[-1])
+        # Use server-side mapping to avoid client-side payload size limits
+        img_coll = coll.overpass(variables=["et_fraction"])
 
-        features = []
-        with tqdm(scenes, desc=f"PT-JPL scenes for {fid}", total=len(scenes)) as pbar:
-            for img_id in scenes:
-                pbar.set_description(f"PT-JPL scenes for {fid} ({img_id})")
+        def compute_zonal_stats(img):
+            """Server-side function to compute zonal stats for each image."""
+            etf_img = img.select("et_fraction").clip(polygon)
+            time_start = img.get("system:time_start")
+            date = ee.Date(time_start).format("YYYY-MM-dd")
+            img_id = img.get("system:id")
 
-                ptjpl_img = ptjpl.Image.from_landsat_c2_sr(
-                    img_id,
-                    et_reference_source="ERA5LAND",
-                    et_reference_band="eto",
-                    et_reference_factor=1.0,
-                    et_reference_resample="bilinear",
+            stats = etf_img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=polygon,
+                scale=30,
+                maxPixels=1e13,
+            )
+            return ee.Feature(None, stats).set(feature_id, fid).set("date", date).set("img_id", img_id)
 
-                    ta_source="ERA5LAND",
-                    ea_source="ERA5LAND",
-                    windspeed_source="ERA5LAND",
-                    rs_source="ERA5LAND",
-                    LWin_source="ERA5LAND",
-                )
-
-                etf_img = ptjpl_img.et_fraction.select("et_fraction").clip(polygon)
-                time_start = ee.Image(img_id).get("system:time_start")
-                date = ee.Date(time_start).format("YYYY-MM-dd")
-
-                stats = etf_img.reduceRegion(
-                    reducer=ee.Reducer.mean(),
-                    geometry=polygon,
-                    scale=30,
-                    maxPixels=1e13,
-                )
-                feat = ee.Feature(None, stats).set(feature_id, fid).set("date", date).set("img_id", img_id)
-                features.append(feat)
-
-        fc = ee.FeatureCollection(features)
+        fc = ee.FeatureCollection(img_coll.map(compute_zonal_stats))
         task = ee.batch.Export.table.toCloudStorage(
             collection=fc,
             description=desc,

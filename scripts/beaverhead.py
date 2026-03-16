@@ -1,21 +1,45 @@
+"""Beaverhead development script for handily workflow testing.
+
+This script exposes all module-level functions for dev testing and walkthrough.
+Each step can be run independently via config flags or --step CLI argument.
+
+Usage:
+    python scripts/beaverhead.py [config.yaml]
+    python scripts/beaverhead.py --step rem          # Run only REM workflow
+    python scripts/beaverhead.py --step stratify     # Run only stratification
+    python scripts/beaverhead.py --step irrmapper    # Run only IrrMapper export
+    python scripts/beaverhead.py --step pattern      # Run only pattern selection
+    python scripts/beaverhead.py --step met          # Run only GridMET download
+    python scripts/beaverhead.py --step et           # Run only PT-JPL export
+    python scripts/beaverhead.py --step join         # Run only ET join
+    python scripts/beaverhead.py --step partition    # Run only ET partition
+    python scripts/beaverhead.py --step viz          # Run only visualization
+"""
+import argparse
+import logging
 import os
 import sys
-import logging
 from pathlib import Path
 
-import yaml
 import geopandas as gpd
 import rioxarray as rxr
+import yaml
 
-from handily.config import HandilyConfig
 from handily.compute import compute_field_rem_stats
+from handily.config import HandilyConfig
 from handily.et.gridmet import download_gridmet
 from handily.et.image_export import export_ptjpl_et_fraction
+from handily.et.irrmapper import export_irrigation_frequency, load_irrigation_frequency
 from handily.et.join import join_gridmet_ptjpl
 from handily.et.partition import partition_et
 from handily.io import aoi_from_bounds, ensure_dir
+from handily.nhd import classify_flowlines, filter_flowlines_for_stratification
+from handily.pattern import assign_pattern_from_irrmapper, pattern_workflow
 from handily.pipeline import REMWorkflow
+from handily.stratify import stratify, stratify_from_results
 from handily.viz import write_interactive_map
+
+LOGGER = logging.getLogger("handily.beaverhead")
 
 
 def configure_logging() -> None:
@@ -29,7 +53,16 @@ def configure_logging() -> None:
     )
 
 
-def dev_test_bounds_rem(config: HandilyConfig, bounds_wsen, ndwi_threshold: float):
+# =============================================================================
+# REM Workflow
+# =============================================================================
+
+
+def dev_test_bounds_rem(config: HandilyConfig, bounds_wsen, ndwi_threshold: float) -> dict:
+    """Run REM workflow for bounds AOI.
+
+    Returns dict with keys: aoi, flowlines, dem, rem, streams, ndwi, fields, fields_stats, summary
+    """
     ensure_dir(config.out_dir)
     aoi = aoi_from_bounds(bounds_wsen)
     workflow = REMWorkflow(config=config, aoi=aoi)
@@ -37,7 +70,254 @@ def dev_test_bounds_rem(config: HandilyConfig, bounds_wsen, ndwi_threshold: floa
     return result
 
 
-def dev_test_met(config: HandilyConfig, overwrite: bool = False):
+# =============================================================================
+# Stratification Workflow
+# =============================================================================
+
+
+def dev_test_stratify(
+    config: HandilyConfig,
+    results: dict | None = None,
+    rem_threshold: float = 2.0,
+    max_stream_distance: float | None = None,
+) -> gpd.GeoDataFrame:
+    """Run stratification workflow.
+
+    If results dict is provided, uses those. Otherwise loads from disk.
+    Returns GeoDataFrame with strata column.
+    """
+    if results is not None:
+        LOGGER.info("Running stratification from provided results")
+        return stratify_from_results(
+            results,
+            rem_threshold=rem_threshold,
+            max_stream_distance=max_stream_distance,
+        )
+
+    # Load from disk
+    rem_path = os.path.join(config.out_dir, "rem_bounds.tif")
+    flowlines_path = os.path.join(config.out_dir, "flowlines_bounds.fgb")
+    fields_path = os.path.join(config.out_dir, "fields_bounds.fgb")
+
+    if not all(os.path.exists(p) for p in [rem_path, flowlines_path, fields_path]):
+        raise FileNotFoundError(
+            "Missing required files. Run REM workflow first (run_rem=true or --step rem)"
+        )
+
+    LOGGER.info("Loading data from disk for stratification")
+    rem_da = rxr.open_rasterio(rem_path)
+    if "band" in rem_da.dims:
+        rem_da = rem_da.squeeze("band", drop=True)
+
+    flowlines = gpd.read_file(flowlines_path)
+    fields = gpd.read_file(fields_path)
+
+    return stratify(
+        fields=fields,
+        flowlines=flowlines,
+        rem_da=rem_da,
+        rem_threshold=rem_threshold,
+        max_stream_distance=max_stream_distance,
+    )
+
+
+def dev_test_classify_flowlines(
+    config: HandilyConfig,
+    flowlines: gpd.GeoDataFrame | None = None,
+) -> gpd.GeoDataFrame:
+    """Classify flowlines by stream category (for inspection).
+
+    Useful for debugging NHD feature type mapping.
+    """
+    if flowlines is None:
+        flowlines_path = os.path.join(config.out_dir, "flowlines_bounds.fgb")
+        if not os.path.exists(flowlines_path):
+            raise FileNotFoundError(f"Flowlines not found: {flowlines_path}")
+        flowlines = gpd.read_file(flowlines_path)
+
+    classified = classify_flowlines(flowlines)
+    LOGGER.info("Flowline classification complete")
+    LOGGER.info("Categories: %s", classified["stream_category"].value_counts().to_dict())
+    return classified
+
+
+# =============================================================================
+# IrrMapper Workflow
+# =============================================================================
+
+
+def dev_test_irrmapper(
+    config: HandilyConfig,
+    fields: gpd.GeoDataFrame | str | None = None,
+    start_year: int = 1987,
+    end_year: int = 2024,
+    dest: str = "bucket",
+    desc: str | None = None,
+) -> None:
+    """Export IrrMapper irrigation frequency via Earth Engine.
+
+    Can accept:
+    - GeoDataFrame: converted directly to EE FeatureCollection (no upload needed)
+    - str: EE asset path or local file path
+    - None: loads from config.fields_path or config.ee_fields_asset
+
+    Exports to: gs://{bucket}/{bucket_prefix}/{project_name}/irrmapper/{desc}_irr_freq.csv
+
+    Note: This is an async operation. Check EE task manager for progress.
+    After export completes, run dev_test_sync_irrmapper() to download locally.
+    """
+    import ee
+    ee.Initialize()
+
+    # Determine fields source
+    if fields is None:
+        # Try loading from disk first (preferred - no EE asset upload needed)
+        fields_fgb = os.path.join(config.out_dir, "fields_bounds.fgb")
+        if os.path.exists(fields_fgb):
+            LOGGER.info("Loading fields from: %s", fields_fgb)
+            fields = gpd.read_file(fields_fgb)
+        elif config.ee_fields_asset:
+            fields = config.ee_fields_asset
+        else:
+            raise ValueError(
+                "No fields source found. Either run REM workflow first, "
+                "or set ee_fields_asset in config."
+            )
+
+    if desc is None:
+        desc = f"{config.project_name}_{config.feature_id}"
+
+    # Build bucket path using config
+    # Result: handily/beaverhead/irrmapper/{desc}_irr_freq
+    file_prefix = f"{config.bucket_prefix}/{config.project_name}"
+
+    export_irrigation_frequency(
+        fields=fields,
+        desc=desc,
+        feature_id=config.feature_id,
+        start_year=start_year,
+        end_year=end_year,
+        dest=dest,
+        bucket=config.et_bucket,
+        file_prefix=file_prefix,
+    )
+
+    # Log expected local path after sync
+    expected_csv = f"{desc}_irr_freq.csv"
+    if config.local_data_root:
+        local_path = config.get_local_path("irrmapper", expected_csv)
+        LOGGER.info("After sync, CSV will be at: %s", local_path)
+
+
+def dev_test_sync_irrmapper(
+    config: HandilyConfig,
+    overwrite: bool = False,
+    dry_run: bool = False,
+) -> str | None:
+    """Sync IrrMapper exports from bucket to local filesystem.
+
+    Returns path to local CSV if found.
+    """
+    from handily.bucket import sync_bucket_to_local
+
+    if config.local_data_root is None:
+        raise ValueError("local_data_root not set in config")
+
+    full_prefix = f"{config.bucket_prefix}/{config.project_name}"
+
+    result = sync_bucket_to_local(
+        bucket=config.et_bucket,
+        bucket_prefix=full_prefix,
+        local_root=config.local_data_root,
+        subdir="irrmapper",
+        glob_pattern="irr_freq",
+        overwrite=overwrite,
+        dry_run=dry_run,
+    )
+
+    if result["copied"] > 0 or result["skipped"] > 0:
+        local_dir = config.get_local_path("irrmapper")
+        csvs = [f for f in os.listdir(local_dir) if f.endswith(".csv")]
+        if csvs:
+            return os.path.join(local_dir, csvs[0])
+
+    return None
+
+
+def dev_test_load_irrmapper(
+    irrmapper_csv: str,
+    feature_id: str = "FID",
+) -> tuple:
+    """Load and inspect IrrMapper data.
+
+    Returns (irr_stats_df, summary_dict) for inspection.
+    """
+    irr_stats = load_irrigation_frequency(irrmapper_csv, feature_id=feature_id)
+
+    summary = {
+        "n_fields": len(irr_stats),
+        "mean_irr_freq": irr_stats["irr_freq"].mean(),
+        "mean_irr_mean": irr_stats["irr_mean"].mean(),
+        "n_never_irrigated": (irr_stats["irr_count"] == 0).sum(),
+        "n_always_irrigated": (irr_stats["irr_freq"] > 0.9).sum(),
+    }
+
+    LOGGER.info("IrrMapper summary: %s", summary)
+    return irr_stats, summary
+
+
+# =============================================================================
+# Pattern Selection Workflow
+# =============================================================================
+
+
+def dev_test_pattern(
+    config: HandilyConfig,
+    fields: gpd.GeoDataFrame | None = None,
+    irrmapper_csv: str | None = None,
+    max_irr_freq: float = 0.1,
+    max_irr_mean: float = 0.05,
+) -> gpd.GeoDataFrame:
+    """Run pattern selection workflow.
+
+    Requires either:
+    - irrmapper_csv: path to exported IrrMapper CSV
+    - Or run dev_test_irrmapper first and wait for export to complete
+    """
+    if fields is None:
+        fields_path = os.path.join(config.out_dir, "fields_stratified.fgb")
+        if os.path.exists(fields_path):
+            fields = gpd.read_file(fields_path)
+        else:
+            fields_path = os.path.join(config.out_dir, "fields_bounds.fgb")
+            if not os.path.exists(fields_path):
+                raise FileNotFoundError("Fields file not found. Run REM workflow first.")
+            fields = gpd.read_file(fields_path)
+
+    if irrmapper_csv is None:
+        irrmapper_csv = config.irrmapper_csv
+        if irrmapper_csv is None or not os.path.exists(irrmapper_csv):
+            raise FileNotFoundError(
+                "IrrMapper CSV required. Run dev_test_irrmapper first, "
+                "wait for export, then provide irrmapper_csv path."
+            )
+
+    return pattern_workflow(
+        fields=fields,
+        irrmapper_csv=irrmapper_csv,
+        feature_id=config.feature_id,
+        max_irr_freq=max_irr_freq,
+        max_irr_mean=max_irr_mean,
+    )
+
+
+# =============================================================================
+# ET Workflow Functions (existing)
+# =============================================================================
+
+
+def dev_test_met(config: HandilyConfig, overwrite: bool = False) -> None:
+    """Download GridMET data for fields."""
     download_gridmet(
         config.fields_path,
         config.gridmet_parquet_dir,
@@ -53,7 +333,12 @@ def dev_test_met(config: HandilyConfig, overwrite: bool = False):
     )
 
 
-def dev_test_et(config: HandilyConfig):
+def dev_test_et(config: HandilyConfig) -> None:
+    """Export PT-JPL ET fraction via Earth Engine.
+
+    Exports to: gs://{bucket}/ptjpl_tables/etf_zonal/{fid}/{desc}.csv
+    After export completes, run dev_test_sync_ptjpl() to download locally.
+    """
     export_ptjpl_et_fraction(
         config.fields_path,
         config.et_bucket,
@@ -70,7 +355,89 @@ def dev_test_et(config: HandilyConfig):
     )
 
 
-def dev_test_join(config: HandilyConfig):
+def dev_test_sync_ptjpl(
+    config: HandilyConfig,
+    overwrite: bool = False,
+    dry_run: bool = False,
+) -> int:
+    """Sync PT-JPL exports from bucket to local filesystem.
+
+    PT-JPL exports go to: gs://{bucket}/ptjpl_tables/etf_zonal/{fid}/...
+    Syncs to: {ptjpl_csv_dir}/ (e.g., .../ptjpl_tables/etf_zonal/)
+
+    Returns number of files synced.
+    """
+    from handily.bucket import sync_bucket_to_local
+
+    if config.ptjpl_csv_dir is None:
+        raise ValueError("ptjpl_csv_dir not set in config")
+
+    # PT-JPL uses bucket path: ptjpl_tables/etf_zonal/
+    # ptjpl_csv_dir should already point to the target: .../ptjpl_tables/etf_zonal/
+    # We need local_root to be 2 levels up, then bucket_prefix/subdir adds them back
+    csv_dir = os.path.expanduser(config.ptjpl_csv_dir).rstrip("/")
+    # Go up 2 levels: etf_zonal -> ptjpl_tables -> parent
+    local_root = os.path.dirname(os.path.dirname(csv_dir))
+
+    result = sync_bucket_to_local(
+        bucket=config.et_bucket,
+        bucket_prefix="ptjpl_tables",
+        local_root=local_root,
+        subdir="etf_zonal",
+        glob_pattern="*.csv",
+        overwrite=overwrite,
+        dry_run=dry_run,
+    )
+
+    return result["copied"] + result["skipped"]
+
+
+def check_ptjpl_data_exists(config: HandilyConfig, min_files: int = 1) -> bool:
+    """Check if PT-JPL CSV data exists locally.
+
+    Returns True if at least min_files CSV files exist.
+    PT-JPL exports go to: ptjpl_csv_dir/{fid}/ptjpl_etf_zonal_{fid}_YYYY_YYYY.csv
+    """
+    if config.ptjpl_csv_dir is None:
+        return False
+
+    csv_dir = os.path.expanduser(config.ptjpl_csv_dir)
+
+    if not os.path.exists(csv_dir):
+        return False
+
+    # Check recursively for CSV files (PT-JPL uses subdirectories per FID)
+    csv_count = 0
+    for root, dirs, files in os.walk(csv_dir):
+        csv_count += sum(1 for f in files if f.endswith(".csv"))
+        if csv_count >= min_files:
+            return True
+
+    return csv_count >= min_files
+
+
+def check_irrmapper_data_exists(config: HandilyConfig) -> str | None:
+    """Check if IrrMapper CSV data exists locally.
+
+    Returns path to CSV if found, None otherwise.
+    """
+    # Check explicit config path first
+    if config.irrmapper_csv and os.path.exists(os.path.expanduser(config.irrmapper_csv)):
+        return os.path.expanduser(config.irrmapper_csv)
+
+    # Check expected location based on project structure
+    if config.local_data_root:
+        local_dir = config.get_local_path("irrmapper")
+        if os.path.exists(local_dir):
+            csvs = [f for f in os.listdir(local_dir) if f.endswith(".csv") and "irr_freq" in f]
+            if csvs:
+                return os.path.join(local_dir, csvs[0])
+
+    return None
+
+
+def dev_test_join(config: HandilyConfig) -> None:
+    """Join GridMET with PT-JPL ET fraction."""
     join_gridmet_ptjpl(
         config.gridmet_parquet_dir,
         config.ptjpl_csv_dir,
@@ -83,84 +450,54 @@ def dev_test_join(config: HandilyConfig):
         prcp_col="prcp",
     )
 
-def dev_test_partition(config: HandilyConfig):
+
+def dev_test_partition(config: HandilyConfig) -> None:
+    """Run ET partition workflow.
+
+    Uses fields_pattern.fgb which has strata and pattern columns
+    from the stratify and pattern steps.
+    """
+    # Use processed fields file with strata/pattern columns
+    fields_fgb = os.path.join(config.out_dir, "fields_pattern.fgb")
+    if not os.path.exists(fields_fgb):
+        LOGGER.warning("Fields file not found: %s", fields_fgb)
+        LOGGER.warning("Run stratify and pattern steps first")
+        return
+
     partition_et(
-        config.fields_path,
+        fields_fgb,
         config.partition_joined_parquet_dir,
         config.partition_out_parquet_dir,
         feature_id=config.feature_id,
         strata_col=config.partition_strata_col,
         pattern_col=config.partition_pattern_col,
-        bounds_wsen=tuple(config.bounds) if config.bounds else None,
     )
 
-def _subset_results_to_aoi(results: dict, aoi_gdf: gpd.GeoDataFrame) -> dict:
-    out = dict(results)
-    out["aoi"] = aoi_gdf
 
-    for key in ("flowlines", "fields_stats"):
-        gdf = out.get(key)
-        if gdf is None or len(gdf) == 0:
-            continue
-        aoi_in_crs = aoi_gdf.to_crs(gdf.crs)
-        try:
-            out[key] = gpd.clip(gdf, aoi_in_crs)
-        except Exception:
-            out[key] = gpd.overlay(gdf, aoi_in_crs, how="intersection")
-
-    for key in ("rem", "dem", "streams"):
-        da = out.get(key)
-        if da is None:
-            continue
-        shapes = [aoi_gdf.to_crs(da.rio.crs).geometry.unary_union.__geo_interface__]
-        out[key] = da.rio.clip(shapes, all_touched=True)
-
-    return out
+# =============================================================================
+# Visualization
+# =============================================================================
 
 
-def main(argv=None) -> int:
-    configure_logging()
-    argv = sys.argv[1:] if argv is None else argv
-    config_path = Path(argv[0]) if argv else Path(__file__).with_name("beaverhead_config.yaml")
+def dev_test_viz(
+    config: HandilyConfig,
+    results: dict | None = None,
+    bounds_wsen: tuple | None = None,
+    ndwi_threshold: float = 0.15,
+    bake_tiles: bool = False,
+) -> str:
+    """Generate interactive debug map.
 
-    aoi_select = None # [30]
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    if not isinstance(cfg, dict):
-        raise ValueError(f"Config must parse to a mapping, got {type(cfg).__name__}")
-
-    config = HandilyConfig.from_dict(cfg)
-    bounds_wsen = tuple(cfg["bounds"])
-    ndwi_threshold = float(cfg.get("ndwi_threshold", 0.15))
-    overwrite_outputs = bool(cfg.get("overwrite_outputs", False))
-    viz_only = bool(cfg.get("viz_only", False))
-    bake_tiles = bool(cfg.get("bake_tiles", False))
-
-    run_met = bool(cfg.get("run_met", False))
-    run_et = bool(cfg.get("run_et", False))
-    run_join = bool(cfg.get("run_join", False))
-    run_partition = bool(cfg.get("run_partition", False))
-
-    if run_met:
-        dev_test_met(config=config, overwrite=bool(cfg.get("overwrite_met", False)))
-
-    if run_et:
-        dev_test_et(config=config)
-
-    if run_join:
-        dev_test_join(config=config)
-
-    if run_partition:
-        dev_test_partition(config=config)
-
+    Returns path to output HTML file.
+    """
     rem_path = os.path.join(config.out_dir, "rem_bounds.tif")
-    streams_path = os.path.join(config.out_dir, "streams_bounds.tif")
-    ndwi_path = os.path.join(config.out_dir, "ndwi_bounds.tif")
-    fields_fgb = os.path.join(config.out_dir, "fields_bounds.fgb")
     dem_path = os.path.join(config.out_dir, "dem_bounds_1m.tif")
+    fields_fgb = os.path.join(config.out_dir, "fields_bounds.fgb")
 
-    if viz_only:
+    if results is None:
+        if bounds_wsen is None:
+            bounds_wsen = tuple(config.bounds)
+
         aoi = aoi_from_bounds(bounds_wsen)
         flowlines = gpd.read_file(os.path.join(config.out_dir, "flowlines_bounds.fgb"))
 
@@ -190,45 +527,240 @@ def main(argv=None) -> int:
                 "ndwi_threshold": float(ndwi_threshold),
             },
         }
-    else:
-        results = dev_test_bounds_rem(config=config, bounds_wsen=bounds_wsen, ndwi_threshold=ndwi_threshold)
-
-        if overwrite_outputs and os.path.exists(rem_path):
-            os.remove(rem_path)
-        if overwrite_outputs and os.path.exists(streams_path):
-            os.remove(streams_path)
-        if overwrite_outputs and os.path.exists(ndwi_path):
-            os.remove(ndwi_path)
-        logging.getLogger("handily.beaverhead").info(
-            "Writing rasters (overwrite_outputs=%s): rem=%s streams=%s ndwi=%s",
-            overwrite_outputs,
-            rem_path,
-            streams_path,
-            ndwi_path,
-        )
-        results["rem"].rio.to_raster(rem_path, overwrite=overwrite_outputs)
-        results["streams"].rio.to_raster(streams_path, overwrite=overwrite_outputs)
-        if results.get("ndwi") is not None:
-            results["ndwi"].rio.to_raster(ndwi_path, overwrite=overwrite_outputs)
-
-        if overwrite_outputs and os.path.exists(fields_fgb):
-            os.remove(fields_fgb)
-        fields = results["fields"]
-        if "FID" in fields.columns:
-            fields = fields.rename(columns={"FID": "FID_"})
-        fields.to_file(fields_fgb, driver="FlatGeobuf")
 
     out_html = os.path.join(config.out_dir, "debug_map.html")
     write_interactive_map(results, out_html, initial_threshold=2.0)
+    LOGGER.info("Debug map written: %s", out_html)
+    return out_html
 
-    print("--- Beaverhead Bounds REM Summary ---")
-    print(f"Fields total: {results['summary'].get('total_fields')}")
-    print(f"NDWI threshold: {results['summary'].get('ndwi_threshold')}")
-    print(f"Map: {out_html}")
-    print(f"REM GeoTIFF: {rem_path}")
-    print(f"Streams mask GeoTIFF: {streams_path}")
-    print(f"NDWI mosaic GeoTIFF: {ndwi_path}")
-    print(f"Fields FGB: {fields_fgb}")
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+
+def _subset_results_to_aoi(results: dict, aoi_gdf: gpd.GeoDataFrame) -> dict:
+    """Clip results to AOI extent."""
+    out = dict(results)
+    out["aoi"] = aoi_gdf
+
+    for key in ("flowlines", "fields_stats"):
+        gdf = out.get(key)
+        if gdf is None or len(gdf) == 0:
+            continue
+        aoi_in_crs = aoi_gdf.to_crs(gdf.crs)
+        try:
+            out[key] = gpd.clip(gdf, aoi_in_crs)
+        except Exception:
+            out[key] = gpd.overlay(gdf, aoi_in_crs, how="intersection")
+
+    for key in ("rem", "dem", "streams"):
+        da = out.get(key)
+        if da is None:
+            continue
+        shapes = [aoi_gdf.to_crs(da.rio.crs).geometry.unary_union.__geo_interface__]
+        out[key] = da.rio.clip(shapes, all_touched=True)
+
+    return out
+
+
+def save_outputs(config: HandilyConfig, results: dict, overwrite: bool = False) -> dict:
+    """Save workflow outputs to disk.
+
+    Returns dict of output paths.
+    """
+    paths = {
+        "rem": os.path.join(config.out_dir, "rem_bounds.tif"),
+        "streams": os.path.join(config.out_dir, "streams_bounds.tif"),
+        "ndwi": os.path.join(config.out_dir, "ndwi_bounds.tif"),
+        "fields": os.path.join(config.out_dir, "fields_bounds.fgb"),
+        "flowlines": os.path.join(config.out_dir, "flowlines_bounds.fgb"),
+        "dem": os.path.join(config.out_dir, "dem_bounds_1m.tif"),
+    }
+
+    # Remove existing files if overwrite
+    if overwrite:
+        for path in paths.values():
+            if os.path.exists(path):
+                os.remove(path)
+
+    # Save rasters
+    for key in ("rem", "streams", "ndwi", "dem"):
+        da = results.get(key)
+        if da is not None:
+            LOGGER.info("Writing %s: %s", key, paths[key])
+            da.rio.to_raster(paths[key], overwrite=overwrite)
+
+    # Save vectors - prefer fields_stats (has rem_mean) over raw fields
+    fields_to_save = results.get("fields_stats")
+    if fields_to_save is None:
+        fields_to_save = results.get("fields")
+    if fields_to_save is not None:
+        fields = fields_to_save.copy()
+        if "FID" in fields.columns:
+            fields = fields.rename(columns={"FID": "FID_"})
+        fields.to_file(paths["fields"], driver="FlatGeobuf")
+        LOGGER.info("Writing fields: %s", paths["fields"])
+
+    if results.get("flowlines") is not None:
+        results["flowlines"].to_file(paths["flowlines"], driver="FlatGeobuf")
+        LOGGER.info("Writing flowlines: %s", paths["flowlines"])
+
+    return paths
+
+
+def save_stratified_fields(config: HandilyConfig, fields: gpd.GeoDataFrame) -> str:
+    """Save stratified fields to disk."""
+    path = os.path.join(config.out_dir, "fields_stratified.fgb")
+    if "FID" in fields.columns:
+        fields = fields.rename(columns={"FID": "FID_"})
+    fields.to_file(path, driver="FlatGeobuf")
+    LOGGER.info("Stratified fields saved: %s", path)
+    return path
+
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+
+def main(argv=None) -> int:
+    configure_logging()
+
+    parser = argparse.ArgumentParser(description="Beaverhead development workflow")
+    parser.add_argument("config", nargs="?", default=None, help="Config YAML path")
+    parser.add_argument("--step", choices=[
+        "rem", "stratify", "irrmapper", "pattern",
+        "met", "et", "join", "partition", "viz", "all"
+    ], help="Run specific step only")
+
+    argv = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(argv)
+
+    config_path = Path(args.config) if args.config else Path(__file__).with_name("beaverhead_config.yaml")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config must parse to a mapping, got {type(cfg).__name__}")
+
+    config = HandilyConfig.from_dict(cfg)
+    bounds_wsen = tuple(cfg["bounds"])
+    ndwi_threshold = float(cfg.get("ndwi_threshold", 0.15))
+    overwrite_outputs = bool(cfg.get("overwrite_outputs", False))
+    viz_only = bool(cfg.get("viz_only", False))
+    bake_tiles = bool(cfg.get("bake_tiles", False))
+
+    # Config flags for each step
+    run_rem = bool(cfg.get("run_rem", not viz_only))
+    run_stratify = bool(cfg.get("run_stratify", False))
+    run_irrmapper = bool(cfg.get("run_irrmapper", False))
+    run_pattern = bool(cfg.get("run_pattern", False))
+    run_met = bool(cfg.get("run_met", False))
+    run_et = bool(cfg.get("run_et", False))
+    run_join = bool(cfg.get("run_join", False))
+    run_partition = bool(cfg.get("run_partition", False))
+
+    # Override with --step if provided
+    if args.step:
+        run_rem = args.step in ("rem", "all")
+        run_stratify = args.step in ("stratify", "all")
+        run_irrmapper = args.step in ("irrmapper", "all")
+        run_pattern = args.step in ("pattern", "all")
+        run_met = args.step in ("met", "all")
+        run_et = args.step in ("et", "all")
+        run_join = args.step in ("join", "all")
+        run_partition = args.step in ("partition", "all")
+        viz_only = args.step == "viz"
+
+    ensure_dir(config.out_dir)
+    results = None
+
+    # Step 1: REM workflow
+    if run_rem and not viz_only:
+        LOGGER.info("=== Step: REM Workflow ===")
+        results = dev_test_bounds_rem(
+            config=config,
+            bounds_wsen=bounds_wsen,
+            ndwi_threshold=ndwi_threshold,
+        )
+        save_outputs(config, results, overwrite=overwrite_outputs)
+
+    # Step 2: Stratification
+    if run_stratify:
+        LOGGER.info("=== Step: Stratification ===")
+        rem_threshold = float(cfg.get("rem_threshold", 2.0))
+        fields_stratified = dev_test_stratify(
+            config=config,
+            results=results,
+            rem_threshold=rem_threshold,
+        )
+        save_stratified_fields(config, fields_stratified)
+
+    # Step 3: IrrMapper export
+    if run_irrmapper:
+        LOGGER.info("=== Step: IrrMapper Export ===")
+        # Prefer using local fields GeoDataFrame (no EE asset upload needed)
+        irr_fields = None
+        fields_fgb = os.path.join(config.out_dir, "fields_bounds.fgb")
+        if os.path.exists(fields_fgb):
+            irr_fields = gpd.read_file(fields_fgb)
+            LOGGER.info("Using local fields: %s (%d features)", fields_fgb, len(irr_fields))
+        dev_test_irrmapper(config=config, fields=irr_fields)
+
+    # Step 4: Pattern selection
+    if run_pattern:
+        LOGGER.info("=== Step: Pattern Selection ===")
+        irrmapper_csv = cfg.get("irrmapper_csv")
+        if irrmapper_csv and os.path.exists(irrmapper_csv):
+            fields_with_pattern = dev_test_pattern(
+                config=config,
+                irrmapper_csv=irrmapper_csv,
+            )
+            pattern_path = os.path.join(config.out_dir, "fields_pattern.fgb")
+            fields_with_pattern.to_file(pattern_path, driver="FlatGeobuf")
+            LOGGER.info("Pattern fields saved: %s", pattern_path)
+        else:
+            LOGGER.warning("irrmapper_csv not found; skipping pattern selection")
+
+    # Step 5: GridMET
+    if run_met:
+        LOGGER.info("=== Step: GridMET Download ===")
+        dev_test_met(config=config, overwrite=bool(cfg.get("overwrite_met", False)))
+
+    # Step 6: PT-JPL ET export
+    if run_et:
+        LOGGER.info("=== Step: PT-JPL Export ===")
+        dev_test_et(config=config)
+
+    # Step 7: Join
+    if run_join:
+        LOGGER.info("=== Step: ET Join ===")
+        dev_test_join(config=config)
+
+    # Step 8: Partition
+    if run_partition:
+        LOGGER.info("=== Step: ET Partition ===")
+        dev_test_partition(config=config)
+
+    # Visualization
+    if viz_only or (results is not None):
+        LOGGER.info("=== Step: Visualization ===")
+        out_html = dev_test_viz(
+            config=config,
+            results=results,
+            bounds_wsen=bounds_wsen,
+            ndwi_threshold=ndwi_threshold,
+            bake_tiles=bake_tiles,
+        )
+
+        print("--- Beaverhead Workflow Summary ---")
+        if results:
+            print(f"Fields total: {results['summary'].get('total_fields')}")
+            print(f"NDWI threshold: {results['summary'].get('ndwi_threshold')}")
+        print(f"Output dir: {config.out_dir}")
+        print(f"Debug map: {out_html}")
+
     return 0
 
 

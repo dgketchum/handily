@@ -125,10 +125,14 @@ def stratify(
     LOGGER.info("REM threshold: %.1f m, max_stream_distance: %s",
                 rem_threshold, max_stream_distance)
 
-    # Step 1: Compute REM statistics
-    LOGGER.info("Step 1: Computing REM zonal statistics")
-    fields_stats = compute_field_rem_stats(fields, rem_da, stats=rem_stats)
-    LOGGER.info("Computed stats for %d fields", len(fields_stats))
+    # Step 1: Compute REM statistics (skip if already present)
+    if "rem_mean" in fields.columns:
+        LOGGER.info("Step 1: Using existing rem_mean column (%d fields)", len(fields))
+        fields_stats = fields.copy()
+    else:
+        LOGGER.info("Step 1: Computing REM zonal statistics")
+        fields_stats = compute_field_rem_stats(fields, rem_da, stats=rem_stats)
+        LOGGER.info("Computed stats for %d fields", len(fields_stats))
 
     # Step 2: Assign partition status based on REM threshold
     LOGGER.info("Step 2: Applying REM threshold (%.1f m)", rem_threshold)

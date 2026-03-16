@@ -65,24 +65,46 @@ def main(argv=None):
     p_partition = sub.add_parser("partition", help="Partition ET into subsurface and irrigation components")
     p_partition.add_argument("--config", required=True, help="YAML config path")
 
+    # Bucket sync subcommand
+    p_sync = sub.add_parser("sync", help="Sync EE exports from GCS bucket to local filesystem")
+    p_sync.add_argument("--config", required=True, help="YAML config path")
+    p_sync.add_argument("--subdir", default="irrmapper", help="Subdirectory to sync (default: irrmapper)")
+    p_sync.add_argument("--glob", default="*", help="Glob pattern to filter files")
+    p_sync.add_argument("--overwrite", action="store_true", help="Overwrite existing local files")
+    p_sync.add_argument("--dry-run", action="store_true", help="Print files without copying")
+
     args = parser.parse_args(argv)
     configure_logging(args.v)
 
     if args.cmd == "bounds":
+        from handily.config import HandilyConfig
+        from handily.io import aoi_from_bounds, ensure_dir
+        from handily.pipeline import REMWorkflow
         from handily.viz import write_interactive_map
 
-        ensure_dir(args.out_dir)  # BUG?: ensure_dir/run_bounds_rem/CORE_LOGGER not defined in this module
-        CORE_LOGGER.info("Output directory: %s", args.out_dir)
-        CORE_LOGGER.info("Building REM within bounds: %s", args.bounds)
-        results = run_bounds_rem(
-            bounds_wsen=tuple(args.bounds),
-            fields_path=os.path.expanduser(args.fields),
+        logger = logging.getLogger("handily.cli")
+        ensure_dir(args.out_dir)
+        logger.info("Output directory: %s", args.out_dir)
+        logger.info("Building REM within bounds: %s", args.bounds)
+
+        # Build config from CLI args
+        config = HandilyConfig(
+            out_dir=args.out_dir,
+            flowlines_local_dir=os.path.expanduser(args.flowlines_local_dir),
             ndwi_dir=os.path.expanduser(args.ndwi_dir),
             stac_dir=os.path.expanduser(args.stac_dir),
-            flowlines_local_dir=os.path.expanduser(args.flowlines_local_dir),
-            out_dir=args.out_dir,
-            ndwi_threshold=float(args.ndwi_threshold),
+            fields_path=os.path.expanduser(args.fields),
+            bounds=list(args.bounds),
         )
+
+        aoi = aoi_from_bounds(tuple(args.bounds))
+        workflow = REMWorkflow(config=config, aoi=aoi)
+        results = workflow.run(
+            ndwi_threshold=float(args.ndwi_threshold),
+            stats=("mean",),
+            cache_flowlines=True,
+        )
+
         out_html = os.path.join(args.out_dir, "debug_map.html")
         write_interactive_map(results, out_html, initial_threshold=2.0)
         # Persist QA rasters
@@ -91,8 +113,11 @@ def main(argv=None):
         results["rem"].rio.to_raster(rem_path)
         results["streams"].rio.to_raster(streams_path)
         # Persist QA vectors
-        fields_gpkg = os.path.join(args.out_dir, "fields_bounds.gpkg")
-        results["fields"].to_file(fields_gpkg, driver="GPKG")
+        fields_fgb = os.path.join(args.out_dir, "fields_bounds.fgb")
+        fields = results.get("fields_stats") or results["fields"]
+        if "FID" in fields.columns:
+            fields = fields.rename(columns={"FID": "FID_"})
+        fields.to_file(fields_fgb, driver="FlatGeobuf")
 
         print("--- Bounds REM Summary ---")
         print(f"Fields total: {results['summary'].get('total_fields')}")
@@ -100,7 +125,7 @@ def main(argv=None):
         print(f"Map: {out_html}")
         print(f"REM GeoTIFF: {rem_path}")
         print(f"Streams mask GeoTIFF: {streams_path}")
-        print(f"Fields GPKG: {fields_gpkg}")
+        print(f"Fields FGB: {fields_fgb}")
         return 0
 
     if args.cmd == "aoi":
@@ -230,6 +255,31 @@ def main(argv=None):
             pattern_col=config.partition_pattern_col,
             bounds_wsen=bounds_wsen,
         )
+        return 0
+
+    if args.cmd == "sync":
+        from handily.bucket import sync_bucket_to_local
+        from handily.config import HandilyConfig
+
+        config = HandilyConfig.from_yaml(args.config)
+
+        if config.local_data_root is None:
+            print("Error: local_data_root not set in config")
+            return 1
+
+        full_prefix = f"{config.bucket_prefix}/{config.project_name}"
+
+        result = sync_bucket_to_local(
+            bucket=config.et_bucket,
+            bucket_prefix=full_prefix,
+            local_root=config.local_data_root,
+            subdir=args.subdir,
+            glob_pattern=args.glob,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+        )
+
+        print(f"Sync complete: copied={result['copied']}, skipped={result['skipped']}, errors={result['errors']}")
         return 0
 
     parser.print_help()

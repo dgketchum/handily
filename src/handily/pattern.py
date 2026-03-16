@@ -73,9 +73,19 @@ def assign_pattern_from_irrmapper(
     # Join to fields
     fields = fields.copy()
 
+    # Ensure feature_id is a column (not just the index)
+    # Handle FID -> FID_ rename from FlatGeobuf/OGR
+    if feature_id not in fields.columns:
+        if fields.index.name == feature_id:
+            fields = fields.reset_index()
+        elif f"{feature_id}_" in fields.columns:
+            # FlatGeobuf renames FID to FID_ to avoid OGR reserved column
+            fields = fields.rename(columns={f"{feature_id}_": feature_id})
+        else:
+            raise KeyError(f"Feature ID column '{feature_id}' not found in fields. Available: {list(fields.columns)}")
+
     # Ensure feature_id types match
-    if feature_id in fields.columns:
-        fields[feature_id] = fields[feature_id].astype(str)
+    fields[feature_id] = fields[feature_id].astype(str)
     irr_with_patterns[feature_id] = irr_with_patterns[feature_id].astype(str)
 
     # Select columns to join

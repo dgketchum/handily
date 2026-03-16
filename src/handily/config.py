@@ -36,6 +36,18 @@ class HandilyConfig:
     partition_strata_col: str = "strata"
     partition_pattern_col: str = "pattern"
 
+    # IrrMapper / stratification
+    ee_fields_asset: str | None = None
+    irrmapper_csv: str | None = None
+    rem_threshold: float = 2.0
+
+    # Bucket / local mirror structure
+    # Bucket path: gs://{bucket}/{bucket_prefix}/{project_name}/{subdir}/
+    # Local path:  {local_data_root}/{bucket_prefix}/{project_name}/{subdir}/
+    project_name: str = "default"
+    bucket_prefix: str = "handily"
+    local_data_root: str | None = None  # e.g., ~/data/IrrigationGIS/handily
+
     def __post_init__(self) -> None:
         self.out_dir = os.path.expanduser(self.out_dir)
         self.flowlines_local_dir = os.path.expanduser(self.flowlines_local_dir)
@@ -58,6 +70,32 @@ class HandilyConfig:
             self.partition_joined_parquet_dir = os.path.expanduser(self.partition_joined_parquet_dir)
         if self.partition_out_parquet_dir is not None:
             self.partition_out_parquet_dir = os.path.expanduser(self.partition_out_parquet_dir)
+        if self.irrmapper_csv is not None:
+            self.irrmapper_csv = os.path.expanduser(self.irrmapper_csv)
+        if self.local_data_root is not None:
+            self.local_data_root = os.path.expanduser(self.local_data_root)
+
+    def get_bucket_path(self, subdir: str, filename: str | None = None) -> str:
+        """Get bucket path for EE export (without gs:// prefix).
+
+        Example: handily/beaverhead/irrmapper/beaverhead_irr_freq
+        """
+        base = f"{self.bucket_prefix}/{self.project_name}/{subdir}"
+        if filename:
+            return f"{base}/{filename}"
+        return base
+
+    def get_local_path(self, subdir: str, filename: str | None = None) -> str:
+        """Get local path mirroring bucket structure.
+
+        Example: ~/data/IrrigationGIS/handily/handily/beaverhead/irrmapper/beaverhead_irr_freq.csv
+        """
+        if self.local_data_root is None:
+            raise ValueError("local_data_root not set in config")
+        base = os.path.join(self.local_data_root, self.bucket_prefix, self.project_name, subdir)
+        if filename:
+            return os.path.join(base, filename)
+        return base
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "HandilyConfig":
@@ -89,6 +127,12 @@ class HandilyConfig:
             partition_out_parquet_dir=data.get("partition_out_parquet_dir"),
             partition_strata_col=str(data.get("partition_strata_col", "strata")),
             partition_pattern_col=str(data.get("partition_pattern_col", "pattern")),
+            ee_fields_asset=data.get("ee_fields_asset"),
+            irrmapper_csv=data.get("irrmapper_csv"),
+            rem_threshold=float(data.get("rem_threshold", 2.0)),
+            project_name=str(data.get("project_name", "default")),
+            bucket_prefix=str(data.get("bucket_prefix", "handily")),
+            local_data_root=data.get("local_data_root"),
         )
         return cfg
 

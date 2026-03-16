@@ -26,15 +26,19 @@ from beaverhead import (
     dev_test_classify_flowlines,
     dev_test_stratify,
     dev_test_irrmapper,
+    dev_test_sync_irrmapper,
     dev_test_load_irrmapper,
     dev_test_pattern,
     dev_test_met,
     dev_test_et,
+    dev_test_sync_ptjpl,
     dev_test_join,
     dev_test_partition,
     dev_test_viz,
     save_outputs,
     save_stratified_fields,
+    check_irrmapper_data_exists,
+    check_ptjpl_data_exists,
 )
 
 
@@ -73,9 +77,11 @@ def main():
         if "band" in rem_da.dims:
             rem_da = rem_da.squeeze("band", drop=True)
 
+        fields = gpd.read_file(fields_path)
         results = {
             "rem": rem_da,
-            "fields": gpd.read_file(fields_path),
+            "fields": fields,
+            "fields_stats": fields,  # viz.py expects this key with rem_mean
             "flowlines": gpd.read_file(flowlines_path),
             "aoi": aoi_from_bounds(bounds_wsen),
             "summary": {"ndwi_threshold": ndwi_threshold},
@@ -128,24 +134,30 @@ def main():
     print(f"  Partitioned: {fields_stratified['partitioned'].sum()} / {len(fields_stratified)}")
 
     # =========================================================================
-    # Step 4: IrrMapper Export (async)
+    # Step 4: IrrMapper Data (check local -> sync bucket -> export)
     # =========================================================================
-    # NOTE: This starts an async EE export task. Check EE task manager for progress.
-    # Uses the local fields GeoDataFrame directly - no EE asset upload needed.
+    # Pattern: 1) check local, 2) sync from bucket, 3) export if still missing
 
-    print("\n=== Step 4: IrrMapper Export ===")
-    # Use the fields from REM workflow (already clipped to bounds)
-    irr_fields = results["fields"]
-    dev_test_irrmapper(config=config, fields=irr_fields)
-    print(f"  Export started for {len(irr_fields)} fields - check EE task manager")
+    print("\n=== Step 4: IrrMapper Data ===")
+    irrmapper_csv = check_irrmapper_data_exists(config)
+    if irrmapper_csv:
+        print(f"  Found local: {irrmapper_csv}")
+    else:
+        print("  Not found locally, attempting bucket sync...")
+        irrmapper_csv = dev_test_sync_irrmapper(config, overwrite=False)
+        if irrmapper_csv:
+            print(f"  Synced from bucket: {irrmapper_csv}")
+        else:
+            print("  Not in bucket, starting EE export...")
+            irr_fields = results["fields"]
+            dev_test_irrmapper(config=config, fields=irr_fields)
+            print(f"  Export started for {len(irr_fields)} fields - check EE task manager")
 
     # =========================================================================
     # Step 5: Pattern Selection (requires IrrMapper CSV)
     # =========================================================================
-    # NOTE: Uncomment after IrrMapper export completes and CSV is downloaded.
 
     print("\n=== Step 5: Pattern Selection ===")
-    irrmapper_csv = cfg.get("irrmapper_csv")
     if irrmapper_csv and os.path.exists(irrmapper_csv):
         # Load and inspect IrrMapper data
         irr_stats, summary = dev_test_load_irrmapper(irrmapper_csv, config.feature_id)
@@ -161,7 +173,7 @@ def main():
         fields_with_pattern.to_file(pattern_path, driver="FlatGeobuf")
         print(f"  Pattern fields: {fields_with_pattern['pattern'].sum()} / {len(fields_with_pattern)}")
     else:
-        print("  Skipped - irrmapper_csv not found")
+        print("  Skipped - IrrMapper data not yet available (export in progress)")
 
     # =========================================================================
     # Step 6: Visualization
@@ -176,19 +188,48 @@ def main():
     print(f"  Debug map: {out_html}")
 
     # =========================================================================
-    # ET Workflow Steps (uncomment as needed)
+    # Step 7: GridMET Meteorology
     # =========================================================================
-    # print("\n=== GridMET Download ===")
-    # dev_test_met(config=config, overwrite=False)
-    #
-    # print("\n=== PT-JPL Export ===")
-    # dev_test_et(config=config)
-    #
-    # print("\n=== ET Join ===")
-    # dev_test_join(config=config)
-    #
-    # print("\n=== ET Partition ===")
-    # dev_test_partition(config=config)
+    print("\n=== Step 7: GridMET Download ===")
+    dev_test_met(config=config, overwrite=False)
+
+    # =========================================================================
+    # Step 8: PT-JPL ET Data (check local -> sync bucket -> export)
+    # =========================================================================
+    print("\n=== Step 8: PT-JPL ET Data ===")
+    ptjpl_ready = check_ptjpl_data_exists(config, min_files=1)
+    if ptjpl_ready:
+        print("  PT-JPL data found locally")
+    else:
+        print("  Not found locally, attempting bucket sync...")
+        synced_count = dev_test_sync_ptjpl(config, overwrite=False)
+        if synced_count > 0:
+            print(f"  Synced {synced_count} files from bucket")
+            ptjpl_ready = True
+        else:
+            print("  Not in bucket, starting EE export...")
+            dev_test_et(config=config)
+            print("  Export started - check EE task manager")
+
+    # =========================================================================
+    # Step 9: ET Join (requires PT-JPL + GridMET)
+    # =========================================================================
+    print("\n=== Step 9: ET Join ===")
+    if ptjpl_ready:
+        dev_test_join(config=config)
+        print("  Join complete")
+    else:
+        print("  Skipped - PT-JPL data not yet available")
+
+    # =========================================================================
+    # Step 10: ET Partition
+    # =========================================================================
+    print("\n=== Step 10: ET Partition ===")
+    if ptjpl_ready:
+        dev_test_partition(config=config)
+        print("  Partition complete")
+    else:
+        print("  Skipped - PT-JPL data not yet available")
 
     print("\n=== Done ===")
     print(f"Output directory: {config.out_dir}")

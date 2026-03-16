@@ -52,12 +52,26 @@ def partition_et(
     bounds_wsen=None,
 ):
     fields = gpd.read_file(fields_path)
+
+    # Handle FID -> FID_ rename that happens with FlatGeobuf/OGR
+    if feature_id not in fields.columns:
+        if fields.index.name == feature_id:
+            fields = fields.reset_index()
+        elif f"{feature_id}_" in fields.columns:
+            fields = fields.rename(columns={f"{feature_id}_": feature_id})
+
     fields = fields[[feature_id, strata_col, pattern_col, "geometry"]]
     if bounds_wsen is not None:
         w, s, e, n = bounds_wsen
         aoi = gpd.GeoDataFrame(geometry=[box(w, s, e, n)], crs="EPSG:4326").to_crs(fields.crs)
         minx, miny, maxx, maxy = aoi.total_bounds
         fields = fields.cx[minx:maxx, miny:maxy]
+
+    # Filter out non_partitioned fields - they shouldn't be partitioned
+    fields = fields[fields[strata_col] != "non_partitioned"]
+    if fields.empty:
+        return {"out_dir": out_parquet_dir, "n_fields": 0, "n_donors": 0, "donor_map": {}, "strata_counts": {}}
+
     fields_cent = fields.copy()
     fields_cent["geometry"] = fields_cent.geometry.centroid
     fields_cent = fields_cent.to_crs("EPSG:5071")
@@ -116,7 +130,14 @@ def partition_et(
 
         out.to_parquet(os.path.join(out_parquet_dir, f"{fid}.parquet"))
 
-    result = None
+    # Return summary of partitioning results
+    result = {
+        "out_dir": out_parquet_dir,
+        "n_fields": len(donor_map),
+        "n_donors": len(donor_etf),
+        "donor_map": donor_map,
+        "strata_counts": fields[strata_col].value_counts().to_dict(),
+    }
     return result
 
 
