@@ -41,6 +41,15 @@ class HandilyConfig:
     irrmapper_csv: str | None = None
     rem_threshold: float = 2.0
 
+    # REM workflow
+    ndwi_threshold: float = 0.15
+    flowlines_buffer_m: float | None = None  # Buffer NHD flowlines before rasterization
+
+    # QGIS integration
+    qgis_project: str | None = None  # Path to QGIS project file (.qgz)
+    qgis_layer_group: str = "handily"  # Layer group name in QGIS project
+    qgis_view_root: str | None = None  # Path prefix for viewing on different machine
+
     # Bucket / local mirror structure
     # Bucket path: gs://{bucket}/{bucket_prefix}/{project_name}/{subdir}/
     # Local path:  {local_data_root}/{bucket_prefix}/{project_name}/{subdir}/
@@ -74,6 +83,8 @@ class HandilyConfig:
             self.irrmapper_csv = os.path.expanduser(self.irrmapper_csv)
         if self.local_data_root is not None:
             self.local_data_root = os.path.expanduser(self.local_data_root)
+        if self.qgis_project is not None:
+            self.qgis_project = os.path.expanduser(self.qgis_project)
 
     def get_bucket_path(self, subdir: str, filename: str | None = None) -> str:
         """Get bucket path for EE export (without gs:// prefix).
@@ -130,14 +141,36 @@ class HandilyConfig:
             ee_fields_asset=data.get("ee_fields_asset"),
             irrmapper_csv=data.get("irrmapper_csv"),
             rem_threshold=float(data.get("rem_threshold", 2.0)),
+            ndwi_threshold=float(data.get("ndwi_threshold", 0.15)),
+            flowlines_buffer_m=data.get("flowlines_buffer_m"),
             project_name=str(data.get("project_name", "default")),
             bucket_prefix=str(data.get("bucket_prefix", "handily")),
             local_data_root=data.get("local_data_root"),
+            qgis_project=data.get("qgis_project"),
+            qgis_layer_group=str(data.get("qgis_layer_group", "handily")),
+            qgis_view_root=data.get("qgis_view_root"),
         )
         return cfg
 
     @classmethod
+    def from_toml(cls, toml_path: str) -> "HandilyConfig":
+        import tomllib
+
+        with open(os.path.expanduser(toml_path), "rb") as f:
+            data = tomllib.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"TOML config must parse to a mapping, got {type(data).__name__}")
+        return cls.from_dict(data)
+
+    @classmethod
     def from_yaml(cls, yaml_path: str) -> "HandilyConfig":
+        import warnings
+
+        warnings.warn(
+            "from_yaml is deprecated, use from_toml instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         try:
             import yaml  # type: ignore
         except Exception as exc:  # pragma: no cover
