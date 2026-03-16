@@ -23,6 +23,7 @@ def main(argv=None):
     p_bounds.add_argument("--flowlines-local-dir", required=True, help="Path to local NHD state shapefile folder")
     p_bounds.add_argument("--stac-dir", required=True, help="Path to local 3DEP STAC catalog (required)")
     p_bounds.add_argument("--ndwi-threshold", type=float, default=0.15, help="NDWI threshold for water masking (default 0.15)")
+    p_bounds.add_argument("--flowlines-buffer", type=float, default=None, help="Buffer NHD flowlines by this many meters before AND with NDWI")
     p_bounds.add_argument("--out-dir", required=True, help="Output directory for results")
 
     p_aoi = sub.add_parser("aoi", help="Build buffered-field AOI tiles and write a shapefile")
@@ -51,27 +52,43 @@ def main(argv=None):
     et_sub = p_et.add_subparsers(dest="et_cmd", required=True)
 
     p_et_export = et_sub.add_parser("export", help="Export PT-JPL capture-date zonal stats to GCS")
-    p_et_export.add_argument("--config", required=True, help="YAML config path")
+    p_et_export.add_argument("--config", required=True, help="TOML config path")
 
     p_et_join = et_sub.add_parser("join", help="Join local PT-JPL CSVs with GridMET parquet and write joined parquet")
-    p_et_join.add_argument("--config", required=True, help="YAML config path")
+    p_et_join.add_argument("--config", required=True, help="TOML config path")
 
     p_met = sub.add_parser("met", help="Meteorology workflows (GridMET)")
     met_sub = p_met.add_subparsers(dest="met_cmd", required=True)
 
     p_met_download = met_sub.add_parser("download", help="Download GridMET time series at field centroids")
-    p_met_download.add_argument("--config", required=True, help="YAML config path")
+    p_met_download.add_argument("--config", required=True, help="TOML config path")
 
     p_partition = sub.add_parser("partition", help="Partition ET into subsurface and irrigation components")
-    p_partition.add_argument("--config", required=True, help="YAML config path")
+    p_partition.add_argument("--config", required=True, help="TOML config path")
 
     # Bucket sync subcommand
     p_sync = sub.add_parser("sync", help="Sync EE exports from GCS bucket to local filesystem")
-    p_sync.add_argument("--config", required=True, help="YAML config path")
+    p_sync.add_argument("--config", required=True, help="TOML config path")
     p_sync.add_argument("--subdir", default="irrmapper", help="Subdirectory to sync (default: irrmapper)")
     p_sync.add_argument("--glob", default="*", help="Glob pattern to filter files")
     p_sync.add_argument("--overwrite", action="store_true", help="Overwrite existing local files")
     p_sync.add_argument("--dry-run", action="store_true", help="Print files without copying")
+
+    # QGIS integration subcommand
+    p_qgis = sub.add_parser("qgis", help="QGIS project integration")
+    qgis_sub = p_qgis.add_subparsers(dest="qgis_cmd", required=True)
+
+    p_qgis_update = qgis_sub.add_parser("update", help="Update QGIS project with handily output layers")
+    p_qgis_update.add_argument("--config", required=True, help="TOML config path")
+    p_qgis_update.add_argument("--project", help="Path to QGIS project (.qgz), overrides config")
+    p_qgis_update.add_argument("--group", help="Layer group name, overrides config")
+
+    p_qgis_qlr = qgis_sub.add_parser("qlr", help="Generate QLR file for manual import")
+    p_qgis_qlr.add_argument("--config", required=True, help="TOML config path")
+    p_qgis_qlr.add_argument("--output", help="Output QLR path (default: <out_dir>/handily.qlr)")
+
+    p_qgis_open = qgis_sub.add_parser("open", help="Open QGIS with the project")
+    p_qgis_open.add_argument("--project", required=True, help="Path to QGIS project (.qgz)")
 
     args = parser.parse_args(argv)
     configure_logging(args.v)
@@ -80,7 +97,6 @@ def main(argv=None):
         from handily.config import HandilyConfig
         from handily.io import aoi_from_bounds, ensure_dir
         from handily.pipeline import REMWorkflow
-        from handily.viz import write_interactive_map
 
         logger = logging.getLogger("handily.cli")
         ensure_dir(args.out_dir)
@@ -103,10 +119,9 @@ def main(argv=None):
             ndwi_threshold=float(args.ndwi_threshold),
             stats=("mean",),
             cache_flowlines=True,
+            flowlines_buffer_m=args.flowlines_buffer,
         )
 
-        out_html = os.path.join(args.out_dir, "debug_map.html")
-        write_interactive_map(results, out_html, initial_threshold=2.0)
         # Persist QA rasters
         rem_path = os.path.join(args.out_dir, "rem_bounds.tif")
         streams_path = os.path.join(args.out_dir, "streams_bounds.tif")
@@ -122,10 +137,10 @@ def main(argv=None):
         print("--- Bounds REM Summary ---")
         print(f"Fields total: {results['summary'].get('total_fields')}")
         print(f"NDWI threshold: {results['summary'].get('ndwi_threshold')}")
-        print(f"Map: {out_html}")
         print(f"REM GeoTIFF: {rem_path}")
         print(f"Streams mask GeoTIFF: {streams_path}")
         print(f"Fields FGB: {fields_fgb}")
+        print("Run 'handily qgis update --config <config.toml>' to add layers to QGIS")
         return 0
 
     if args.cmd == "aoi":
@@ -176,7 +191,7 @@ def main(argv=None):
         from handily.config import HandilyConfig
         from handily.et.gridmet import download_gridmet
 
-        config = HandilyConfig.from_yaml(args.config)
+        config = HandilyConfig.from_toml(args.config)
         bounds_wsen = None
         if config.bounds:
             bounds_wsen = tuple(config.bounds)
@@ -198,7 +213,7 @@ def main(argv=None):
     if args.cmd == "et":
         from handily.config import HandilyConfig
 
-        config = HandilyConfig.from_yaml(args.config)
+        config = HandilyConfig.from_toml(args.config)
         bounds_wsen = None
         if config.bounds:
             bounds_wsen = tuple(config.bounds)
@@ -242,7 +257,7 @@ def main(argv=None):
         from handily.config import HandilyConfig
         from handily.et.partition import partition_et
 
-        config = HandilyConfig.from_yaml(args.config)
+        config = HandilyConfig.from_toml(args.config)
         bounds_wsen = None
         if config.bounds:
             bounds_wsen = tuple(config.bounds)
@@ -261,7 +276,7 @@ def main(argv=None):
         from handily.bucket import sync_bucket_to_local
         from handily.config import HandilyConfig
 
-        config = HandilyConfig.from_yaml(args.config)
+        config = HandilyConfig.from_toml(args.config)
 
         if config.local_data_root is None:
             print("Error: local_data_root not set in config")
@@ -281,6 +296,55 @@ def main(argv=None):
 
         print(f"Sync complete: copied={result['copied']}, skipped={result['skipped']}, errors={result['errors']}")
         return 0
+
+    if args.cmd == "qgis":
+        from handily.qgis import discover_outputs, generate_qlr, open_project, update_project
+
+        if args.qgis_cmd == "update":
+            from handily.config import HandilyConfig
+
+            config = HandilyConfig.from_toml(args.config)
+            project_path = args.project or config.qgis_project
+            group_name = args.group or config.qgis_layer_group
+
+            if not project_path:
+                print("Error: No QGIS project specified. Use --project or set qgis_project in config.")
+                return 1
+
+            layers = discover_outputs(config.out_dir, view_root=config.qgis_view_root)
+            if not layers:
+                print(f"No output layers found in {config.out_dir}")
+                return 1
+
+            update_project(project_path, layers, group_name)
+            print(f"Updated QGIS project: {project_path}")
+            print(f"  Group: {group_name}")
+            print(f"  Layers: {len(layers)}")
+            for layer in layers:
+                print(f"    - {layer['name']} ({layer['type']})")
+            return 0
+
+        if args.qgis_cmd == "qlr":
+            from handily.config import HandilyConfig
+
+            config = HandilyConfig.from_toml(args.config)
+            layers = discover_outputs(config.out_dir, view_root=config.qgis_view_root)
+            if not layers:
+                print(f"No output layers found in {config.out_dir}")
+                return 1
+
+            output_path = args.output or os.path.join(config.out_dir, "handily.qlr")
+            generate_qlr(layers, output_path)
+            print(f"Generated QLR: {output_path}")
+            if config.qgis_view_root:
+                print(f"Paths remapped for: {config.qgis_view_root}")
+            print("Drag this file into QGIS to add all layers.")
+            return 0
+
+        if args.qgis_cmd == "open":
+            open_project(args.project)
+            print(f"Opened QGIS with: {args.project}")
+            return 0
 
     parser.print_help()
     return 2
