@@ -1,0 +1,77 @@
+site_name: handily
+site_description: REM, stratification, ET acquisition, and ET partition workflows for irrigated fields
+site_url: https://dgketchum.github.io/handily
+repo_url: https://github.com/dgketchum/handily
+repo_name: dgketchum/handily
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  font:
+    text: Inter
+    code: JetBrains Mono
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.instant
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - header.autohide
+
+plugins:
+  - search
+
+markdown_extensions:
+  - tables
+  - fenced_code
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - admonition
+  - pymdownx.details
+  - toc:
+      permalink: true
+
+extra_javascript:
+  - https://unpkg.com/mermaid@10/dist/mermaid.min.js
+
+nav:
+  - Home: index.md
+  - Overview: overview.md
+  - CLI Reference: cli_reference.md
+  - Configuration: configuration.md
+  - Outputs: outputs.md
+  - Workflows:
+    - REM: workflows/rem.md
+    - Stratification: workflows/stratification.md
+    - Meteorology and ET: workflows/met_et.md
+    - Partition: workflows/partition.md
+  - Operations:
+    - STAC: operations/stac.md
+    - AOI: operations/aoi.md
+    - Exports and Sync: operations/exports_sync.md
+    - QGIS: operations/qgis.md
+  - Examples:
+    - Beaverhead: examples/beaverhead.md
