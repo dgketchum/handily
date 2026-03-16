@@ -2,7 +2,7 @@ __all__ = [
     "bucket",
     "config",
     "pipeline",
-    "viz",
+    "qgis",
     "stac_3dep",
     "nhd",
     "stratify",
