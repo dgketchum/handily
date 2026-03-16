@@ -38,12 +38,36 @@ def rasterize_lines_to_grid(lines_gdf, template_da, burn_value=1):
     return stream_da.rio.write_crs(template_da.rio.crs, inplace=False)
 
 
-def build_streams_mask_from_nhd_ndwi(flowlines_gdf, dem_da, ndwi_da=None, ndwi_threshold=None):
-    """Build a streams/water mask on the DEM grid by combining NHD flowlines with NDWI."""
+def build_streams_mask_from_nhd_ndwi(
+    flowlines_gdf, dem_da, ndwi_da=None, ndwi_threshold=None, flowlines_buffer_m=None
+):
+    """Build a streams/water mask on the DEM grid by combining NHD flowlines with NDWI.
+
+    Parameters
+    ----------
+    flowlines_gdf : GeoDataFrame
+        NHD flowlines vector data.
+    dem_da : xarray.DataArray
+        DEM raster with CRS (assumed to be in meters for projected systems).
+    ndwi_da : xarray.DataArray, optional
+        NDWI raster for water detection.
+    ndwi_threshold : float, optional
+        Threshold for NDWI water mask (pixels > threshold are water).
+    flowlines_buffer_m : float, optional
+        Buffer distance in meters to apply to flowlines before rasterization.
+        This helps capture NDWI water detections when NHD flowlines are
+        misaligned with actual channel positions.
+    """
     if dem_da.rio.crs is None:
         raise ValueError("DEM must have a valid CRS.")
     if flowlines_gdf.crs is None or str(flowlines_gdf.crs) != str(dem_da.rio.crs):
         flowlines_gdf = flowlines_gdf.to_crs(dem_da.rio.crs)
+
+    # Optionally buffer flowlines to capture nearby NDWI detections
+    if flowlines_buffer_m is not None and float(flowlines_buffer_m) > 0:
+        LOGGER.info("Buffering flowlines by %.1f meters", flowlines_buffer_m)
+        flowlines_gdf = flowlines_gdf.copy()
+        flowlines_gdf["geometry"] = flowlines_gdf.geometry.buffer(float(flowlines_buffer_m))
 
     streams_mask = rasterize_lines_to_grid(flowlines_gdf, dem_da, burn_value=1)
 
