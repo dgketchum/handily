@@ -7,88 +7,236 @@ import argparse
 
 def configure_logging(verbosity: int) -> None:
     level = logging.INFO if verbosity == 0 else logging.DEBUG
-    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    logging.basicConfig(
+        level=level, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="handily", description="Handily CLI: REM/HAND pipeline and 3DEP STAC tools")
+    parser = argparse.ArgumentParser(
+        prog="handily", description="Handily CLI: REM/HAND pipeline and 3DEP STAC tools"
+    )
     parser.add_argument("-v", action="count", default=0, help="Increase verbosity")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     # bounds subcommand (bounds + NHD + NDWI quick REM)
-    p_bounds = sub.add_parser("bounds", help="Build REM within bounds using NHD flowlines + NAIP NDWI")
-    p_bounds.add_argument("--bounds", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"), help="Bounds in EPSG:4326: W S E N")
-    p_bounds.add_argument("--fields", required=True, help="Path to irrigation fields dataset (SHP/GPKG/etc.)")
-    p_bounds.add_argument("--ndwi-dir", required=True, help="Directory containing local NDWI GeoTIFFs")
-    p_bounds.add_argument("--flowlines-local-dir", required=True, help="Path to local NHD state shapefile folder")
-    p_bounds.add_argument("--stac-dir", required=True, help="Path to local 3DEP STAC catalog (required)")
-    p_bounds.add_argument("--ndwi-threshold", type=float, default=0.15, help="NDWI threshold for water masking (default 0.15)")
-    p_bounds.add_argument("--flowlines-buffer", type=float, default=None, help="Buffer NHD flowlines by this many meters before AND with NDWI")
-    p_bounds.add_argument("--out-dir", required=True, help="Output directory for results")
+    p_bounds = sub.add_parser(
+        "bounds", help="Build REM within bounds using NHD flowlines + NAIP NDWI"
+    )
+    p_bounds.add_argument(
+        "--bounds",
+        nargs=4,
+        type=float,
+        required=True,
+        metavar=("W", "S", "E", "N"),
+        help="Bounds in EPSG:4326: W S E N",
+    )
+    p_bounds.add_argument(
+        "--fields",
+        required=True,
+        help="Path to irrigation fields dataset (SHP/GPKG/etc.)",
+    )
+    p_bounds.add_argument(
+        "--ndwi-dir", required=True, help="Directory containing local NDWI GeoTIFFs"
+    )
+    p_bounds.add_argument(
+        "--flowlines-local-dir",
+        required=True,
+        help="Path to local NHD state shapefile folder",
+    )
+    p_bounds.add_argument(
+        "--stac-dir", required=True, help="Path to local 3DEP STAC catalog (required)"
+    )
+    p_bounds.add_argument(
+        "--ndwi-threshold",
+        type=float,
+        default=0.15,
+        help="NDWI threshold for water masking (default 0.15)",
+    )
+    p_bounds.add_argument(
+        "--flowlines-buffer",
+        type=float,
+        default=None,
+        help="Buffer NHD flowlines by this many meters before AND with NDWI",
+    )
+    p_bounds.add_argument(
+        "--out-dir", required=True, help="Output directory for results"
+    )
 
-    p_aoi = sub.add_parser("aoi", help="Build buffered-field AOI tiles and write a shapefile")
-    p_aoi.add_argument("--fields", required=True, help="Path to statewide irrigation dataset")
+    p_aoi = sub.add_parser(
+        "aoi", help="Build buffered-field AOI tiles and write a shapefile"
+    )
+    p_aoi.add_argument(
+        "--fields", required=True, help="Path to statewide irrigation dataset"
+    )
     p_aoi.add_argument("--out-shp", required=True, help="Output AOI shapefile path")
-    p_aoi.add_argument("--max-km2", type=float, default=625.0, help="Maximum AOI tile area in square kilometers")
-    p_aoi.add_argument("--buffer-m", type=float, default=1000.0, help="Centroid buffer radius in meters")
-    p_aoi.add_argument("--bounds", nargs=4, type=float, metavar=("W", "S", "E", "N"), help="Optional bounds in EPSG:4326 (W S E N)")
-    p_aoi.add_argument("--simplify-m", type=float, default=None, help="Optional simplify tolerance in meters")
+    p_aoi.add_argument(
+        "--max-km2",
+        type=float,
+        default=625.0,
+        help="Maximum AOI tile area in square kilometers",
+    )
+    p_aoi.add_argument(
+        "--buffer-m",
+        type=float,
+        default=1000.0,
+        help="Centroid buffer radius in meters",
+    )
+    p_aoi.add_argument(
+        "--bounds",
+        nargs=4,
+        type=float,
+        metavar=("W", "S", "E", "N"),
+        help="Optional bounds in EPSG:4326 (W S E N)",
+    )
+    p_aoi.add_argument(
+        "--simplify-m",
+        type=float,
+        default=None,
+        help="Optional simplify tolerance in meters",
+    )
 
     # stac subcommand with nested build/extend
     p_stac = sub.add_parser("stac", help="3DEP 1 m STAC tools")
     stac_sub = p_stac.add_subparsers(dest="stac_cmd", required=True)
 
-    p_build = stac_sub.add_parser("build", help="Create a new STAC catalog from TNM S3 index")
-    p_build.add_argument("--out-dir", required=True, help="Output directory for the STAC catalog")
-    p_build.add_argument("--states", nargs="*", help="State abbreviations to include (e.g., MT ID). If omitted, all projects.")
-    p_build.add_argument("--collection-id", default="usgs-3dep-1m-opr", help="Collection ID (default: usgs-3dep-1m-opr)")
+    p_build = stac_sub.add_parser(
+        "build", help="Create a new STAC catalog from TNM S3 index"
+    )
+    p_build.add_argument(
+        "--out-dir", required=True, help="Output directory for the STAC catalog"
+    )
+    p_build.add_argument(
+        "--states",
+        nargs="*",
+        help="State abbreviations to include (e.g., MT ID). If omitted, all projects.",
+    )
+    p_build.add_argument(
+        "--collection-id",
+        default="usgs-3dep-1m-opr",
+        help="Collection ID (default: usgs-3dep-1m-opr)",
+    )
 
-    p_extend = stac_sub.add_parser("extend", help="Extend an existing STAC catalog with more states")
-    p_extend.add_argument("--out-dir", required=True, help="Existing STAC catalog directory")
-    p_extend.add_argument("--states", nargs="*", required=True, help="Additional state abbreviations (e.g., WA OR)")
-    p_extend.add_argument("--collection-id", default="usgs-3dep-1m-opr", help="Collection ID (default: usgs-3dep-1m-opr)")
+    p_extend = stac_sub.add_parser(
+        "extend", help="Extend an existing STAC catalog with more states"
+    )
+    p_extend.add_argument(
+        "--out-dir", required=True, help="Existing STAC catalog directory"
+    )
+    p_extend.add_argument(
+        "--states",
+        nargs="*",
+        required=True,
+        help="Additional state abbreviations (e.g., WA OR)",
+    )
+    p_extend.add_argument(
+        "--collection-id",
+        default="usgs-3dep-1m-opr",
+        help="Collection ID (default: usgs-3dep-1m-opr)",
+    )
 
-    p_et = sub.add_parser("et", help="ET workflows (PT-JPL)")
+    p_et = sub.add_parser("et", help="ET workflows (OpenET v2.0 ensemble)")
     et_sub = p_et.add_subparsers(dest="et_cmd", required=True)
 
-    p_et_export = et_sub.add_parser("export", help="Export PT-JPL capture-date zonal stats to GCS")
+    p_et_export = et_sub.add_parser(
+        "export",
+        help="Export OpenET v2.0 ensemble ET zonal means for field polygons to GCS",
+    )
     p_et_export.add_argument("--config", required=True, help="TOML config path")
 
-    p_et_join = et_sub.add_parser("join", help="Join local PT-JPL CSVs with GridMET parquet and write joined parquet")
+    p_et_join = et_sub.add_parser(
+        "join", help="Join OpenET CSV with GridMET parquet and write joined parquet"
+    )
     p_et_join.add_argument("--config", required=True, help="TOML config path")
 
     p_met = sub.add_parser("met", help="Meteorology workflows (GridMET)")
     met_sub = p_met.add_subparsers(dest="met_cmd", required=True)
 
-    p_met_download = met_sub.add_parser("download", help="Download GridMET time series at field centroids")
+    p_met_download = met_sub.add_parser(
+        "download", help="Download GridMET time series at field centroids"
+    )
     p_met_download.add_argument("--config", required=True, help="TOML config path")
 
-    p_partition = sub.add_parser("partition", help="Partition ET into subsurface and irrigation components")
+    p_partition = sub.add_parser(
+        "partition", help="Partition ET into subsurface and irrigation components"
+    )
     p_partition.add_argument("--config", required=True, help="TOML config path")
 
+    p_points = sub.add_parser("points", help="Points workflows for donor discovery")
+    points_sub = p_points.add_subparsers(dest="points_cmd", required=True)
+
+    p_points_sample = points_sub.add_parser(
+        "sample", help="Generate AOI-scoped sample points from REM outputs"
+    )
+    p_points_sample.add_argument("--config", required=True, help="TOML config path")
+
+    p_points_export = points_sub.add_parser(
+        "export", help="Export point-based EE products from sampled points"
+    )
+    p_points_export.add_argument("--config", required=True, help="TOML config path")
+    p_points_export.add_argument(
+        "--product",
+        default="all",
+        choices=["all", "irrmapper", "ndvi", "openet_eta"],
+        help="EE product to export (default: all)",
+    )
+    p_points_export.add_argument(
+        "--year-start",
+        type=int,
+        default=None,
+        help="Optional export start year override",
+    )
+    p_points_export.add_argument(
+        "--year-end", type=int, default=None, help="Optional export end year override"
+    )
+    p_points_export.add_argument(
+        "--dest",
+        choices=["bucket", "drive"],
+        default=None,
+        help="Optional export destination override",
+    )
+
     # Bucket sync subcommand
-    p_sync = sub.add_parser("sync", help="Sync EE exports from GCS bucket to local filesystem")
+    p_sync = sub.add_parser(
+        "sync", help="Sync EE exports from GCS bucket to local filesystem"
+    )
     p_sync.add_argument("--config", required=True, help="TOML config path")
-    p_sync.add_argument("--subdir", default="irrmapper", help="Subdirectory to sync (default: irrmapper)")
+    p_sync.add_argument(
+        "--subdir",
+        default="irrmapper",
+        help="Subdirectory to sync (default: irrmapper)",
+    )
     p_sync.add_argument("--glob", default="*", help="Glob pattern to filter files")
-    p_sync.add_argument("--overwrite", action="store_true", help="Overwrite existing local files")
-    p_sync.add_argument("--dry-run", action="store_true", help="Print files without copying")
+    p_sync.add_argument(
+        "--overwrite", action="store_true", help="Overwrite existing local files"
+    )
+    p_sync.add_argument(
+        "--dry-run", action="store_true", help="Print files without copying"
+    )
 
     # QGIS integration subcommand
     p_qgis = sub.add_parser("qgis", help="QGIS project integration")
     qgis_sub = p_qgis.add_subparsers(dest="qgis_cmd", required=True)
 
-    p_qgis_update = qgis_sub.add_parser("update", help="Update QGIS project with handily output layers")
+    p_qgis_update = qgis_sub.add_parser(
+        "update", help="Update QGIS project with handily output layers"
+    )
     p_qgis_update.add_argument("--config", required=True, help="TOML config path")
-    p_qgis_update.add_argument("--project", help="Path to QGIS project (.qgz), overrides config")
+    p_qgis_update.add_argument(
+        "--project", help="Path to QGIS project (.qgz), overrides config"
+    )
     p_qgis_update.add_argument("--group", help="Layer group name, overrides config")
 
     p_qgis_qlr = qgis_sub.add_parser("qlr", help="Generate QLR file for manual import")
     p_qgis_qlr.add_argument("--config", required=True, help="TOML config path")
-    p_qgis_qlr.add_argument("--output", help="Output QLR path (default: <out_dir>/handily.qlr)")
+    p_qgis_qlr.add_argument(
+        "--output", help="Output QLR path (default: <out_dir>/handily.qlr)"
+    )
 
     p_qgis_open = qgis_sub.add_parser("open", help="Open QGIS with the project")
-    p_qgis_open.add_argument("--project", required=True, help="Path to QGIS project (.qgz)")
+    p_qgis_open.add_argument(
+        "--project", required=True, help="Path to QGIS project (.qgz)"
+    )
 
     args = parser.parse_args(argv)
     configure_logging(args.v)
@@ -178,12 +326,16 @@ def main(argv=None):
 
         if args.stac_cmd == "build":
             states = parse_states(args.states)
-            root = build_3dep_stac(args.out_dir, states=states or None, collection_id=args.collection_id)
+            root = build_3dep_stac(
+                args.out_dir, states=states or None, collection_id=args.collection_id
+            )
             print(f"STAC catalog written: {root}")
             return 0
         elif args.stac_cmd == "extend":
             states = parse_states(args.states)
-            root = extend_3dep_stac(args.out_dir, states=states, collection_id=args.collection_id)
+            root = extend_3dep_stac(
+                args.out_dir, states=states, collection_id=args.collection_id
+            )
         print(f"STAC catalog updated: {root}")
         return 0
 
@@ -219,32 +371,24 @@ def main(argv=None):
             bounds_wsen = tuple(config.bounds)
 
         if args.et_cmd == "export":
-            from handily.et.image_export import export_ptjpl_et_fraction
+            from handily.points.ee_extract import export_fields_openet_eta
 
-            export_ptjpl_et_fraction(
+            export_fields_openet_eta(
                 config.fields_path,
-                config.et_bucket,
+                config,
+                year_start=config.openet_start_yr,
+                year_end=config.openet_end_yr,
                 feature_id=config.feature_id,
-                select=None,
-                start_yr=config.ptjpl_start_yr,
-                end_yr=config.ptjpl_end_yr,
-                overwrite=False,
-                check_dir=config.ptjpl_check_dir,
-                buffer=None,
-                bounds_wsen=bounds_wsen,
-                cloud_cover_max=70,
-                landsat_collections=None,
             )
             return 0
 
         if args.et_cmd == "join":
-            from handily.et.join import join_gridmet_ptjpl
+            from handily.et.join import join_gridmet_openet_eta
 
-            join_gridmet_ptjpl(
+            join_gridmet_openet_eta(
                 config.gridmet_parquet_dir,
-                config.ptjpl_csv_dir,
+                config.openet_csv_path,
                 config.et_join_parquet_dir,
-                ptjpl_csv_template=config.ptjpl_csv_template,
                 fields_path=config.fields_path,
                 bounds_wsen=bounds_wsen,
                 feature_id=config.feature_id,
@@ -272,6 +416,38 @@ def main(argv=None):
         )
         return 0
 
+    if args.cmd == "points":
+        from handily.config import HandilyConfig
+        from handily.points.ee_extract import export_points_products_from_config
+        from handily.points.sample import sample_points_from_config
+
+        config = HandilyConfig.from_toml(args.config)
+
+        if args.points_cmd == "sample":
+            result = sample_points_from_config(config)
+            print("--- Points Sample Summary ---")
+            print(f"Points total: {result['n_points']}")
+            print(f"Output directory: {result['out_dir']}")
+            for group, count in result["group_counts"].items():
+                print(f"  {group}: {count}")
+            print(f"Points FGB: {result['paths']['fgb']}")
+            print(f"Points parquet: {result['paths']['parquet']}")
+            return 0
+
+        if args.points_cmd == "export":
+            results = export_points_products_from_config(
+                config,
+                product=args.product,
+                year_start=args.year_start,
+                year_end=args.year_end,
+                dest=args.dest,
+            )
+            print("--- Points EE Export Summary ---")
+            for result in results:
+                print(f"{result['product']}: {result['description']}")
+                print(f"  prefix: {result['prefix']}")
+            return 0
+
     if args.cmd == "sync":
         from handily.bucket import sync_bucket_to_local
         from handily.config import HandilyConfig
@@ -294,11 +470,18 @@ def main(argv=None):
             dry_run=args.dry_run,
         )
 
-        print(f"Sync complete: copied={result['copied']}, skipped={result['skipped']}, errors={result['errors']}")
+        print(
+            f"Sync complete: copied={result['copied']}, skipped={result['skipped']}, errors={result['errors']}"
+        )
         return 0
 
     if args.cmd == "qgis":
-        from handily.qgis import discover_outputs, generate_qlr, open_project, update_project
+        from handily.qgis import (
+            discover_outputs,
+            generate_qlr,
+            open_project,
+            update_project,
+        )
 
         if args.qgis_cmd == "update":
             from handily.config import HandilyConfig
@@ -308,7 +491,9 @@ def main(argv=None):
             group_name = args.group or config.qgis_layer_group
 
             if not project_path:
-                print("Error: No QGIS project specified. Use --project or set qgis_project in config.")
+                print(
+                    "Error: No QGIS project specified. Use --project or set qgis_project in config."
+                )
                 return 1
 
             layers = discover_outputs(config.out_dir, view_root=config.qgis_view_root)

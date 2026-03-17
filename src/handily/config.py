@@ -16,9 +16,10 @@ class HandilyConfig:
     bounds: list[float] | None = None
 
     et_bucket: str | None = None
-    ptjpl_start_yr: int | None = None
-    ptjpl_end_yr: int | None = None
-    ptjpl_check_dir: str | None = None
+    ee_project: str | None = None
+    openet_start_yr: int | None = None
+    openet_end_yr: int | None = None
+    openet_csv_path: str | None = None
 
     met_start: str | None = None
     met_end: str | None = None
@@ -27,8 +28,6 @@ class HandilyConfig:
     gridmet_centroid_parquet_dir: str | None = None
     gridmet_id_col: str = "GFID"
 
-    ptjpl_csv_dir: str | None = None
-    ptjpl_csv_template: str | None = None
     et_join_parquet_dir: str | None = None
 
     partition_joined_parquet_dir: str | None = None
@@ -42,8 +41,32 @@ class HandilyConfig:
     rem_threshold: float = 2.0
 
     # REM workflow
+    run_rem: bool = True
+    overwrite_outputs: bool = False
     ndwi_threshold: float = 0.15
     flowlines_buffer_m: float | None = None  # Buffer NHD flowlines before rasterization
+
+    # Points sampling
+    points_out_dir: str | None = None
+    points_seed: int = 42
+    points_candidate_spacing_m: float = 60.0
+    points_n_base: int = 50
+    points_n_low_rem: int = 100
+    points_n_riparian: int = 100
+    points_n_field_edge: int = 50
+    points_n_high_rem_control: int = 10
+    points_low_rem_threshold_m: float = 2.0
+    points_high_rem_threshold_m: float = 10.0
+    points_riparian_buffer_m: float = 250.0
+    points_field_edge_buffer_m: float = 100.0
+    points_min_spacing_m: float | None = None
+    points_ee_dest: str = "bucket"
+    points_ee_bucket: str | None = None
+    points_ee_drive_folder: str = "handily"
+    points_year_start: int | None = None
+    points_year_end: int | None = None
+    points_ndvi_start_month: int = 4
+    points_ndvi_end_month: int = 10
 
     # QGIS integration
     qgis_project: str | None = None  # Path to QGIS project file (.qgz)
@@ -55,7 +78,7 @@ class HandilyConfig:
     # Local path:  {local_data_root}/{bucket_prefix}/{project_name}/{subdir}/
     project_name: str = "default"
     bucket_prefix: str = "handily"
-    local_data_root: str | None = None  # e.g., ~/data/IrrigationGIS/handily
+    local_data_root: str | None = None  # e.g., /nas/handily
 
     def __post_init__(self) -> None:
         self.out_dir = os.path.expanduser(self.out_dir)
@@ -63,28 +86,36 @@ class HandilyConfig:
         self.ndwi_dir = os.path.expanduser(self.ndwi_dir)
         self.stac_dir = os.path.expanduser(self.stac_dir)
         self.fields_path = os.path.expanduser(self.fields_path)
-        if self.ptjpl_check_dir is not None:
-            self.ptjpl_check_dir = os.path.expanduser(self.ptjpl_check_dir)
+        if self.openet_csv_path is not None:
+            self.openet_csv_path = os.path.expanduser(self.openet_csv_path)
         if self.gridmet_parquet_dir is not None:
             self.gridmet_parquet_dir = os.path.expanduser(self.gridmet_parquet_dir)
         if self.gridmet_centroids_path is not None:
-            self.gridmet_centroids_path = os.path.expanduser(self.gridmet_centroids_path)
+            self.gridmet_centroids_path = os.path.expanduser(
+                self.gridmet_centroids_path
+            )
         if self.gridmet_centroid_parquet_dir is not None:
-            self.gridmet_centroid_parquet_dir = os.path.expanduser(self.gridmet_centroid_parquet_dir)
-        if self.ptjpl_csv_dir is not None:
-            self.ptjpl_csv_dir = os.path.expanduser(self.ptjpl_csv_dir)
+            self.gridmet_centroid_parquet_dir = os.path.expanduser(
+                self.gridmet_centroid_parquet_dir
+            )
         if self.et_join_parquet_dir is not None:
             self.et_join_parquet_dir = os.path.expanduser(self.et_join_parquet_dir)
         if self.partition_joined_parquet_dir is not None:
-            self.partition_joined_parquet_dir = os.path.expanduser(self.partition_joined_parquet_dir)
+            self.partition_joined_parquet_dir = os.path.expanduser(
+                self.partition_joined_parquet_dir
+            )
         if self.partition_out_parquet_dir is not None:
-            self.partition_out_parquet_dir = os.path.expanduser(self.partition_out_parquet_dir)
+            self.partition_out_parquet_dir = os.path.expanduser(
+                self.partition_out_parquet_dir
+            )
         if self.irrmapper_csv is not None:
             self.irrmapper_csv = os.path.expanduser(self.irrmapper_csv)
         if self.local_data_root is not None:
             self.local_data_root = os.path.expanduser(self.local_data_root)
         if self.qgis_project is not None:
             self.qgis_project = os.path.expanduser(self.qgis_project)
+        if self.points_out_dir is not None:
+            self.points_out_dir = os.path.expanduser(self.points_out_dir)
 
     def get_bucket_path(self, subdir: str, filename: str | None = None) -> str:
         """Get bucket path for EE export (without gs:// prefix).
@@ -99,11 +130,13 @@ class HandilyConfig:
     def get_local_path(self, subdir: str, filename: str | None = None) -> str:
         """Get local path mirroring bucket structure.
 
-        Example: ~/data/IrrigationGIS/handily/handily/beaverhead/irrmapper/beaverhead_irr_freq.csv
+        Example: /nas/handily/handily/beaverhead/irrmapper/beaverhead_irr_freq.csv
         """
         if self.local_data_root is None:
             raise ValueError("local_data_root not set in config")
-        base = os.path.join(self.local_data_root, self.bucket_prefix, self.project_name, subdir)
+        base = os.path.join(
+            self.local_data_root, self.bucket_prefix, self.project_name, subdir
+        )
         if filename:
             return os.path.join(base, filename)
         return base
@@ -122,17 +155,16 @@ class HandilyConfig:
             feature_id=str(data.get("feature_id", "FID")),
             bounds=data.get("bounds"),
             et_bucket=data.get("et_bucket"),
-            ptjpl_start_yr=data.get("ptjpl_start_yr"),
-            ptjpl_end_yr=data.get("ptjpl_end_yr"),
-            ptjpl_check_dir=data.get("ptjpl_check_dir"),
+            ee_project=data.get("ee_project"),
+            openet_start_yr=data.get("openet_start_yr"),
+            openet_end_yr=data.get("openet_end_yr"),
+            openet_csv_path=data.get("openet_csv_path"),
             met_start=data.get("met_start"),
             met_end=data.get("met_end"),
             gridmet_parquet_dir=data.get("gridmet_parquet_dir"),
             gridmet_centroids_path=data.get("gridmet_centroids_path"),
             gridmet_centroid_parquet_dir=data.get("gridmet_centroid_parquet_dir"),
             gridmet_id_col=str(data.get("gridmet_id_col", "GFID")),
-            ptjpl_csv_dir=data.get("ptjpl_csv_dir"),
-            ptjpl_csv_template=data.get("ptjpl_csv_template"),
             et_join_parquet_dir=data.get("et_join_parquet_dir"),
             partition_joined_parquet_dir=data.get("partition_joined_parquet_dir"),
             partition_out_parquet_dir=data.get("partition_out_parquet_dir"),
@@ -140,9 +172,39 @@ class HandilyConfig:
             partition_pattern_col=str(data.get("partition_pattern_col", "pattern")),
             ee_fields_asset=data.get("ee_fields_asset"),
             irrmapper_csv=data.get("irrmapper_csv"),
+            run_rem=bool(data.get("run_rem", True)),
+            overwrite_outputs=bool(data.get("overwrite_outputs", False)),
             rem_threshold=float(data.get("rem_threshold", 2.0)),
             ndwi_threshold=float(data.get("ndwi_threshold", 0.15)),
             flowlines_buffer_m=data.get("flowlines_buffer_m"),
+            points_out_dir=data.get("points_out_dir"),
+            points_seed=int(data.get("points_seed", 42)),
+            points_candidate_spacing_m=float(
+                data.get("points_candidate_spacing_m", 60.0)
+            ),
+            points_n_base=int(data.get("points_n_base", 50)),
+            points_n_low_rem=int(data.get("points_n_low_rem", 100)),
+            points_n_riparian=int(data.get("points_n_riparian", 100)),
+            points_n_field_edge=int(data.get("points_n_field_edge", 50)),
+            points_n_high_rem_control=int(data.get("points_n_high_rem_control", 10)),
+            points_low_rem_threshold_m=float(
+                data.get("points_low_rem_threshold_m", 2.0)
+            ),
+            points_high_rem_threshold_m=float(
+                data.get("points_high_rem_threshold_m", 10.0)
+            ),
+            points_riparian_buffer_m=float(data.get("points_riparian_buffer_m", 250.0)),
+            points_field_edge_buffer_m=float(
+                data.get("points_field_edge_buffer_m", 100.0)
+            ),
+            points_min_spacing_m=data.get("points_min_spacing_m"),
+            points_ee_dest=str(data.get("points_ee_dest", "bucket")),
+            points_ee_bucket=data.get("points_ee_bucket"),
+            points_ee_drive_folder=str(data.get("points_ee_drive_folder", "handily")),
+            points_year_start=data.get("points_year_start"),
+            points_year_end=data.get("points_year_end"),
+            points_ndvi_start_month=int(data.get("points_ndvi_start_month", 4)),
+            points_ndvi_end_month=int(data.get("points_ndvi_end_month", 10)),
             project_name=str(data.get("project_name", "default")),
             bucket_prefix=str(data.get("bucket_prefix", "handily")),
             local_data_root=data.get("local_data_root"),
@@ -159,7 +221,9 @@ class HandilyConfig:
         with open(os.path.expanduser(toml_path), "rb") as f:
             data = tomllib.load(f)
         if not isinstance(data, dict):
-            raise ValueError(f"TOML config must parse to a mapping, got {type(data).__name__}")
+            raise ValueError(
+                f"TOML config must parse to a mapping, got {type(data).__name__}"
+            )
         return cls.from_dict(data)
 
     @classmethod
@@ -174,11 +238,15 @@ class HandilyConfig:
         try:
             import yaml  # type: ignore
         except Exception as exc:  # pragma: no cover
-            raise ImportError("PyYAML is required to load config from YAML (pip install pyyaml).") from exc
+            raise ImportError(
+                "PyYAML is required to load config from YAML (pip install pyyaml)."
+            ) from exc
         with open(os.path.expanduser(yaml_path), "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         if not isinstance(data, dict):
-            raise ValueError(f"YAML config must parse to a mapping, got {type(data).__name__}")
+            raise ValueError(
+                f"YAML config must parse to a mapping, got {type(data).__name__}"
+            )
         return cls.from_dict(data)
 
     @staticmethod

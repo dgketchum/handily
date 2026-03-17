@@ -15,6 +15,7 @@ Usage:
     python examples/beaverhead.py --step partition    # Run only ET partition
     python examples/beaverhead.py --step qgis         # Run only QGIS project update
 """
+
 import argparse
 import logging
 import os
@@ -26,16 +27,15 @@ import tomllib
 import geopandas as gpd
 import rioxarray as rxr
 
-from handily.compute import compute_field_rem_stats
 from handily.config import HandilyConfig
 from handily.et.gridmet import download_gridmet
-from handily.et.image_export import export_ptjpl_et_fraction
 from handily.et.irrmapper import export_irrigation_frequency, load_irrigation_frequency
-from handily.et.join import join_gridmet_ptjpl
+from handily.et.join import join_gridmet_openet_eta
+from handily.points.ee_extract import export_fields_openet_eta
 from handily.et.partition import partition_et
 from handily.io import aoi_from_bounds, ensure_dir
-from handily.nhd import classify_flowlines, filter_flowlines_for_stratification
-from handily.pattern import assign_pattern_from_irrmapper, pattern_workflow
+from handily.nhd import classify_flowlines
+from handily.pattern import pattern_workflow
 from handily.pipeline import REMWorkflow
 from handily.qgis import discover_outputs, update_project
 from handily.stratify import stratify, stratify_from_results
@@ -59,7 +59,9 @@ def configure_logging() -> None:
 # =============================================================================
 
 
-def dev_test_bounds_rem(config: HandilyConfig, bounds_wsen, ndwi_threshold: float) -> dict:
+def dev_test_bounds_rem(
+    config: HandilyConfig, bounds_wsen, ndwi_threshold: float
+) -> dict:
     """Run REM workflow for bounds AOI.
 
     Returns dict with keys: aoi, flowlines, dem, rem, streams, ndwi, fields, fields_stats, summary
@@ -67,7 +69,9 @@ def dev_test_bounds_rem(config: HandilyConfig, bounds_wsen, ndwi_threshold: floa
     ensure_dir(config.out_dir)
     aoi = aoi_from_bounds(bounds_wsen)
     workflow = REMWorkflow(config=config, aoi=aoi)
-    result = workflow.run(ndwi_threshold=float(ndwi_threshold), stats=("mean",), cache_flowlines=True)
+    result = workflow.run(
+        ndwi_threshold=float(ndwi_threshold), stats=("mean",), cache_flowlines=True
+    )
     return result
 
 
@@ -138,7 +142,9 @@ def dev_test_classify_flowlines(
 
     classified = classify_flowlines(flowlines)
     LOGGER.info("Flowline classification complete")
-    LOGGER.info("Categories: %s", classified["stream_category"].value_counts().to_dict())
+    LOGGER.info(
+        "Categories: %s", classified["stream_category"].value_counts().to_dict()
+    )
     return classified
 
 
@@ -168,6 +174,7 @@ def dev_test_irrmapper(
     After export completes, run dev_test_sync_irrmapper() to download locally.
     """
     import ee
+
     ee.Initialize()
 
     # Determine fields source
@@ -292,7 +299,9 @@ def dev_test_pattern(
         else:
             fields_path = os.path.join(config.out_dir, "fields_bounds.fgb")
             if not os.path.exists(fields_path):
-                raise FileNotFoundError("Fields file not found. Run REM workflow first.")
+                raise FileNotFoundError(
+                    "Fields file not found. Run REM workflow first."
+                )
             fields = gpd.read_file(fields_path)
 
     if irrmapper_csv is None:
@@ -335,86 +344,25 @@ def dev_test_met(config: HandilyConfig, overwrite: bool = False) -> None:
 
 
 def dev_test_et(config: HandilyConfig) -> None:
-    """Export PT-JPL ET fraction via Earth Engine.
+    """Export OpenET v2.0 ensemble ET zonal means for field polygons via Earth Engine.
 
-    Exports to: gs://{bucket}/ptjpl_tables/etf_zonal/{fid}/{desc}.csv
-    After export completes, run dev_test_sync_ptjpl() to download locally.
+    Exports to: gs://{bucket}/handily/{project}/openet_eta/{desc}.csv
+    After export completes, sync with: handily sync --config ... --subdir openet_eta
     """
-    export_ptjpl_et_fraction(
+    export_fields_openet_eta(
         config.fields_path,
-        config.et_bucket,
+        config,
+        year_start=config.openet_start_yr,
+        year_end=config.openet_end_yr,
         feature_id=config.feature_id,
-        select=None,
-        start_yr=config.ptjpl_start_yr,
-        end_yr=config.ptjpl_end_yr,
-        overwrite=False,
-        check_dir=config.ptjpl_check_dir,
-        buffer=None,
-        bounds_wsen=tuple(config.bounds) if config.bounds else None,
-        cloud_cover_max=70,
-        landsat_collections=None,
     )
 
 
-def dev_test_sync_ptjpl(
-    config: HandilyConfig,
-    overwrite: bool = False,
-    dry_run: bool = False,
-) -> int:
-    """Sync PT-JPL exports from bucket to local filesystem.
-
-    PT-JPL exports go to: gs://{bucket}/ptjpl_tables/etf_zonal/{fid}/...
-    Syncs to: {ptjpl_csv_dir}/ (e.g., .../ptjpl_tables/etf_zonal/)
-
-    Returns number of files synced.
-    """
-    from handily.bucket import sync_bucket_to_local
-
-    if config.ptjpl_csv_dir is None:
-        raise ValueError("ptjpl_csv_dir not set in config")
-
-    # PT-JPL uses bucket path: ptjpl_tables/etf_zonal/
-    # ptjpl_csv_dir should already point to the target: .../ptjpl_tables/etf_zonal/
-    # We need local_root to be 2 levels up, then bucket_prefix/subdir adds them back
-    csv_dir = os.path.expanduser(config.ptjpl_csv_dir).rstrip("/")
-    # Go up 2 levels: etf_zonal -> ptjpl_tables -> parent
-    local_root = os.path.dirname(os.path.dirname(csv_dir))
-
-    result = sync_bucket_to_local(
-        bucket=config.et_bucket,
-        bucket_prefix="ptjpl_tables",
-        local_root=local_root,
-        subdir="etf_zonal",
-        glob_pattern="*.csv",
-        overwrite=overwrite,
-        dry_run=dry_run,
-    )
-
-    return result["copied"] + result["skipped"]
-
-
-def check_ptjpl_data_exists(config: HandilyConfig, min_files: int = 1) -> bool:
-    """Check if PT-JPL CSV data exists locally.
-
-    Returns True if at least min_files CSV files exist.
-    PT-JPL exports go to: ptjpl_csv_dir/{fid}/ptjpl_etf_zonal_{fid}_YYYY_YYYY.csv
-    """
-    if config.ptjpl_csv_dir is None:
+def check_openet_data_exists(config: HandilyConfig) -> bool:
+    """Check if OpenET CSV data exists locally."""
+    if config.openet_csv_path is None:
         return False
-
-    csv_dir = os.path.expanduser(config.ptjpl_csv_dir)
-
-    if not os.path.exists(csv_dir):
-        return False
-
-    # Check recursively for CSV files (PT-JPL uses subdirectories per FID)
-    csv_count = 0
-    for root, dirs, files in os.walk(csv_dir):
-        csv_count += sum(1 for f in files if f.endswith(".csv"))
-        if csv_count >= min_files:
-            return True
-
-    return csv_count >= min_files
+    return os.path.exists(os.path.expanduser(config.openet_csv_path))
 
 
 def check_irrmapper_data_exists(config: HandilyConfig) -> str | None:
@@ -423,14 +371,20 @@ def check_irrmapper_data_exists(config: HandilyConfig) -> str | None:
     Returns path to CSV if found, None otherwise.
     """
     # Check explicit config path first
-    if config.irrmapper_csv and os.path.exists(os.path.expanduser(config.irrmapper_csv)):
+    if config.irrmapper_csv and os.path.exists(
+        os.path.expanduser(config.irrmapper_csv)
+    ):
         return os.path.expanduser(config.irrmapper_csv)
 
     # Check expected location based on project structure
     if config.local_data_root:
         local_dir = config.get_local_path("irrmapper")
         if os.path.exists(local_dir):
-            csvs = [f for f in os.listdir(local_dir) if f.endswith(".csv") and "irr_freq" in f]
+            csvs = [
+                f
+                for f in os.listdir(local_dir)
+                if f.endswith(".csv") and "irr_freq" in f
+            ]
             if csvs:
                 return os.path.join(local_dir, csvs[0])
 
@@ -438,12 +392,11 @@ def check_irrmapper_data_exists(config: HandilyConfig) -> str | None:
 
 
 def dev_test_join(config: HandilyConfig) -> None:
-    """Join GridMET with PT-JPL ET fraction."""
-    join_gridmet_ptjpl(
+    """Join GridMET with OpenET monthly ET."""
+    join_gridmet_openet_eta(
         config.gridmet_parquet_dir,
-        config.ptjpl_csv_dir,
+        config.openet_csv_path,
         config.et_join_parquet_dir,
-        ptjpl_csv_template=config.ptjpl_csv_template,
         fields_path=config.fields_path,
         bounds_wsen=tuple(config.bounds) if config.bounds else None,
         feature_id=config.feature_id,
@@ -599,15 +552,31 @@ def main(argv=None) -> int:
 
     parser = argparse.ArgumentParser(description="Beaverhead development workflow")
     parser.add_argument("config", nargs="?", default=None, help="Config TOML path")
-    parser.add_argument("--step", choices=[
-        "rem", "stratify", "irrmapper", "pattern",
-        "met", "et", "join", "partition", "qgis", "all"
-    ], help="Run specific step only")
+    parser.add_argument(
+        "--step",
+        choices=[
+            "rem",
+            "stratify",
+            "irrmapper",
+            "pattern",
+            "met",
+            "et",
+            "join",
+            "partition",
+            "qgis",
+            "all",
+        ],
+        help="Run specific step only",
+    )
 
     argv = sys.argv[1:] if argv is None else argv
     args = parser.parse_args(argv)
 
-    config_path = Path(args.config) if args.config else Path(__file__).with_name("beaverhead_config.toml")
+    config_path = (
+        Path(args.config)
+        if args.config
+        else Path(__file__).with_name("beaverhead_config.toml")
+    )
 
     with open(config_path, "rb") as f:
         cfg = tomllib.load(f)
@@ -674,7 +643,9 @@ def main(argv=None) -> int:
         fields_fgb = os.path.join(config.out_dir, "fields_bounds.fgb")
         if os.path.exists(fields_fgb):
             irr_fields = gpd.read_file(fields_fgb)
-            LOGGER.info("Using local fields: %s (%d features)", fields_fgb, len(irr_fields))
+            LOGGER.info(
+                "Using local fields: %s (%d features)", fields_fgb, len(irr_fields)
+            )
         dev_test_irrmapper(config=config, fields=irr_fields)
 
     # Step 4: Pattern selection

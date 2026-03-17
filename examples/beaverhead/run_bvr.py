@@ -6,6 +6,7 @@ from a main execution block for development and testing.
 Usage:
     python scripts/run_bvr.py
 """
+
 import os
 import sys
 from pathlib import Path
@@ -32,14 +33,13 @@ from beaverhead import (
     dev_test_pattern,
     dev_test_met,
     dev_test_et,
-    dev_test_sync_ptjpl,
     dev_test_join,
     dev_test_partition,
     dev_test_viz,
     save_outputs,
     save_stratified_fields,
     check_irrmapper_data_exists,
-    check_ptjpl_data_exists,
+    check_openet_data_exists,
 )
 
 
@@ -68,7 +68,9 @@ def main():
     rem_path = os.path.join(config.out_dir, "rem_bounds.tif")
     fields_path = os.path.join(config.out_dir, "fields_bounds.fgb")
     flowlines_path = os.path.join(config.out_dir, "flowlines_bounds.fgb")
-    cached_exists = all(os.path.exists(p) for p in [rem_path, fields_path, flowlines_path])
+    cached_exists = all(
+        os.path.exists(p) for p in [rem_path, fields_path, flowlines_path]
+    )
 
     if cached_exists and not overwrite:
         print("  Loading cached outputs (set overwrite=True to rerun)")
@@ -88,7 +90,10 @@ def main():
             "summary": {"ndwi_threshold": ndwi_threshold},
         }
         # Load optional rasters if they exist
-        for key, fname in [("dem", "dem_bounds_1m.tif"), ("streams", "streams_bounds.tif")]:
+        for key, fname in [
+            ("dem", "dem_bounds_1m.tif"),
+            ("streams", "streams_bounds.tif"),
+        ]:
             path = os.path.join(config.out_dir, fname)
             if os.path.exists(path):
                 da = rxr.open_rasterio(path)
@@ -96,7 +101,11 @@ def main():
                     da = da.squeeze("band", drop=True)
                 results[key] = da
     else:
-        print("  Running REM workflow..." if not cached_exists else "  Overwriting cached outputs...")
+        print(
+            "  Running REM workflow..."
+            if not cached_exists
+            else "  Overwriting cached outputs..."
+        )
         results = dev_test_bounds_rem(
             config=config,
             bounds_wsen=bounds_wsen,
@@ -117,7 +126,9 @@ def main():
         config=config,
         flowlines=results["flowlines"],
     )
-    print(f"  Stream categories: {flowlines_classified['stream_category'].value_counts().to_dict()}")
+    print(
+        f"  Stream categories: {flowlines_classified['stream_category'].value_counts().to_dict()}"
+    )
 
     # =========================================================================
     # Step 3: Stratification
@@ -131,8 +142,12 @@ def main():
     save_stratified_fields(config, fields_stratified)
 
     # Inspect stratification
-    print(f"  Strata distribution: {fields_stratified['strata'].value_counts().to_dict()}")
-    print(f"  Partitioned: {fields_stratified['partitioned'].sum()} / {len(fields_stratified)}")
+    print(
+        f"  Strata distribution: {fields_stratified['strata'].value_counts().to_dict()}"
+    )
+    print(
+        f"  Partitioned: {fields_stratified['partitioned'].sum()} / {len(fields_stratified)}"
+    )
 
     # =========================================================================
     # Step 4: IrrMapper Data (check local -> sync bucket -> export)
@@ -152,7 +167,9 @@ def main():
             print("  Not in bucket, starting EE export...")
             irr_fields = results["fields"]
             dev_test_irrmapper(config=config, fields=irr_fields)
-            print(f"  Export started for {len(irr_fields)} fields - check EE task manager")
+            print(
+                f"  Export started for {len(irr_fields)} fields - check EE task manager"
+            )
 
     # =========================================================================
     # Step 5: Pattern Selection (requires IrrMapper CSV)
@@ -172,7 +189,9 @@ def main():
         )
         pattern_path = os.path.join(config.out_dir, "fields_pattern.fgb")
         fields_with_pattern.to_file(pattern_path, driver="FlatGeobuf")
-        print(f"  Pattern fields: {fields_with_pattern['pattern'].sum()} / {len(fields_with_pattern)}")
+        print(
+            f"  Pattern fields: {fields_with_pattern['pattern'].sum()} / {len(fields_with_pattern)}"
+        )
     else:
         print("  Skipped - IrrMapper data not yet available (export in progress)")
 
@@ -195,42 +214,36 @@ def main():
     dev_test_met(config=config, overwrite=False)
 
     # =========================================================================
-    # Step 8: PT-JPL ET Data (check local -> sync bucket -> export)
+    # Step 8: OpenET ET Data (check local -> export if missing)
     # =========================================================================
-    print("\n=== Step 8: PT-JPL ET Data ===")
-    ptjpl_ready = check_ptjpl_data_exists(config, min_files=1)
-    if ptjpl_ready:
-        print("  PT-JPL data found locally")
+    print("\n=== Step 8: OpenET ET Data ===")
+    openet_ready = check_openet_data_exists(config)
+    if openet_ready:
+        print("  OpenET CSV found locally")
     else:
-        print("  Not found locally, attempting bucket sync...")
-        synced_count = dev_test_sync_ptjpl(config, overwrite=False)
-        if synced_count > 0:
-            print(f"  Synced {synced_count} files from bucket")
-            ptjpl_ready = True
-        else:
-            print("  Not in bucket, starting EE export...")
-            dev_test_et(config=config)
-            print("  Export started - check EE task manager")
+        print("  Not found locally, starting EE export...")
+        dev_test_et(config=config)
+        print("  Export started - check EE task manager, then sync --subdir openet_eta")
 
     # =========================================================================
-    # Step 9: ET Join (requires PT-JPL + GridMET)
+    # Step 9: ET Join (requires OpenET CSV + GridMET)
     # =========================================================================
     print("\n=== Step 9: ET Join ===")
-    if ptjpl_ready:
+    if openet_ready:
         dev_test_join(config=config)
         print("  Join complete")
     else:
-        print("  Skipped - PT-JPL data not yet available")
+        print("  Skipped - OpenET data not yet available")
 
     # =========================================================================
     # Step 10: ET Partition
     # =========================================================================
     print("\n=== Step 10: ET Partition ===")
-    if ptjpl_ready:
+    if openet_ready:
         dev_test_partition(config=config)
         print("  Partition complete")
     else:
-        print("  Skipped - PT-JPL data not yet available")
+        print("  Skipped - OpenET data not yet available")
 
     print("\n=== Done ===")
     print(f"Output directory: {config.out_dir}")

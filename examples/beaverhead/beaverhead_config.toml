@@ -1,24 +1,25 @@
 # Beaverhead example configuration
 # Bucket structure mirrors local filesystem:
 #   gs://wudr/handily/beaverhead/irrmapper/...
-#   ~/data/IrrigationGIS/handily/handily/beaverhead/irrmapper/...
+#   /nas/handily/handily/beaverhead/irrmapper/...
 
 # Project identification
 project_name = "beaverhead"
 bucket_prefix = "handily"
-local_data_root = "~/data/IrrigationGIS/handily"
+local_data_root = "/nas/handily"
+ee_project = "ee-dgketchum"
 
 # Input data
-fields_path = "~/data/IrrigationGIS/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp"
-flowlines_local_dir = "~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape"
-ndwi_dir = "~/data/IrrigationGIS/handily/ndwi/beaverhead/"
-stac_dir = "~/data/IrrigationGIS/handily/stac/3dep_1m/"
+fields_path = "/nas/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp"
+flowlines_local_dir = "/nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape"
+ndwi_dir = "/nas/handily/ndwi/beaverhead/"
+stac_dir = "/nas/handily/stac/3dep_1m/"
 
 # AOI bounds [W, S, E, N] in EPSG:4326
 bounds = [-112.418, 45.445, -112.353, 45.49]
 
 # Output directory (for REM, fields, etc.)
-out_dir = "~/data/IrrigationGIS/handily/handily/beaverhead/outputs/"
+out_dir = "/nas/handily/handily/beaverhead/outputs/"
 
 # Feature ID column
 feature_id = "FID"
@@ -38,8 +39,8 @@ rem_threshold = 2.0
 # IrrMapper (bucket export -> local sync)
 run_irrmapper = false
 et_bucket = "wudr"
-# After sync: ~/data/IrrigationGIS/handily/handily/beaverhead/irrmapper/beaverhead_FID_irr_freq.csv
-irrmapper_csv = "~/data/IrrigationGIS/handily/handily/beaverhead/irrmapper/beaverhead_FID_irr_freq.csv"
+# After sync: /nas/handily/handily/beaverhead/irrmapper/beaverhead_FID_irr_freq.csv
+irrmapper_csv = "/nas/handily/handily/beaverhead/irrmapper/beaverhead_FID_irr_freq.csv"
 
 # Pattern selection
 run_pattern = false
@@ -48,34 +49,40 @@ run_pattern = false
 run_met = false
 met_start = "2017-01-01"
 met_end = "2021-12-31"
-gridmet_parquet_dir = "~/data/IrrigationGIS/handily/handily/beaverhead/et/gridmet_parquet/"
-gridmet_centroids_path = "~/data/IrrigationGIS/handily/gridmet/gis/gridmet_centroids.shp"
-gridmet_centroid_parquet_dir = "~/data/IrrigationGIS/handily/handily/beaverhead/et/gridmet_centroid_parquet/"
+gridmet_parquet_dir = "/nas/handily/handily/beaverhead/et/gridmet_parquet/"
+gridmet_centroids_path = "/nas/handily/gridmet/gis/gridmet_centroids.shp"
+gridmet_centroid_parquet_dir = "/nas/handily/handily/beaverhead/et/gridmet_centroid_parquet/"
 gridmet_id_col = "GFID"
 
-# PT-JPL ET (bucket export -> local sync)
+# OpenET v2.0 ensemble ET (bucket export -> local sync)
 run_et = false
-ptjpl_start_yr = 2017
-ptjpl_end_yr = 2021
-ptjpl_check_dir = "~/data/IrrigationGIS/handily/handily/beaverhead/ptjpl/checks/"
+openet_start_yr = 1984
+openet_end_yr = 2024
+openet_csv_path = "/nas/handily/handily/beaverhead/openet_eta/beaverhead_openet_eta.csv"
 
 # ET Join
 run_join = false
-ptjpl_csv_dir = "~/data/IrrigationGIS/handily/handily/beaverhead/ptjpl_tables/etf_zonal/"
-ptjpl_csv_template = "~/data/IrrigationGIS/handily/handily/beaverhead/ptjpl_tables/etf_zonal/{fid}/ptjpl_etf_zonal_{fid}_2017_2021.csv"
-et_join_parquet_dir = "~/data/IrrigationGIS/handily/handily/beaverhead/et/joined_parquet/"
+et_join_parquet_dir = "/nas/handily/handily/beaverhead/et/joined_parquet/"
+
+# Points Earth Engine exports
+points_ee_dest = "bucket"
+points_ee_bucket = "wudr"
+points_ee_drive_folder = "handily"
+points_year_start = 2017
+points_year_end = 2021
+points_ndvi_start_month = 4
+points_ndvi_end_month = 10
 
 # ET Partition
 run_partition = false
-partition_joined_parquet_dir = "~/data/IrrigationGIS/handily/handily/beaverhead/et/joined_parquet/"
-partition_out_parquet_dir = "~/data/IrrigationGIS/handily/handily/beaverhead/et/partitioned_parquet/"
+partition_joined_parquet_dir = "/nas/handily/handily/beaverhead/et/joined_parquet/"
+partition_out_parquet_dir = "/nas/handily/handily/beaverhead/et/partitioned_parquet/"
 partition_strata_col = "strata"
 partition_pattern_col = "pattern"
 
 # QGIS integration
 run_qgis = false
-qgis_project = "~/data/IrrigationGIS/handily_debug.qgs"
+qgis_project = "/nas/handily_debug.qgs"
 qgis_layer_group = "beaverhead"
 # Path prefix for viewing QLR/QGIS on different machine (e.g., Mac mount point)
 qgis_view_root = "/Volumes/david.ketchum"
-
