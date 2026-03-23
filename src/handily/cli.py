@@ -165,6 +165,11 @@ def main(argv=None):
         action="store_true",
         help="Recompute AOIs that already have rem_bounds.tif",
     )
+    p_rem_batch.add_argument(
+        "--coverage-col",
+        default=None,
+        help="Shapefile column to filter on; only rows where column == 1 are processed (e.g. stac_1m)",
+    )
 
     p_nhd = sub.add_parser("nhd", help="NHD flowline preprocessing")
     nhd_sub = p_nhd.add_subparsers(dest="nhd_cmd", required=True)
@@ -426,6 +431,10 @@ def main(argv=None):
 
         config = HandilyConfig.from_toml(args.config)
         aoi_gdf = gpd.read_file(os.path.expanduser(args.aoi_shp))
+        if args.coverage_col and args.coverage_col in aoi_gdf.columns:
+            n_before = len(aoi_gdf)
+            aoi_gdf = aoi_gdf[aoi_gdf[args.coverage_col] == 1].reset_index(drop=True)
+            print(f"Filtered to {args.coverage_col}==1: {len(aoi_gdf)}/{n_before} AOIs")
         results = batch_run_rem(
             aoi_gdf=aoi_gdf,
             config=config,
