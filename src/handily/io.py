@@ -55,15 +55,21 @@ def _ensure_shapefile_spatial_index(shp_path: str) -> None:
         )
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip()
-        LOGGER.warning("ogrinfo failed to build spatial index (exit %s): %s", exc.returncode, detail or "(no output)")
+        LOGGER.warning(
+            "ogrinfo failed to build spatial index (exit %s): %s",
+            exc.returncode,
+            detail or "(no output)",
+        )
 
 
-def get_huc10_boundary(huc10: str, wbd_local_dir: str | None = None) -> gpd.GeoDataFrame:
+def get_huc10_boundary(
+    huc10: str, wbd_local_dir: str | None = None
+) -> gpd.GeoDataFrame:
     """Get HUC-10 boundary, preferring a local WBD HU10 shapefile."""
     if wbd_local_dir is None:
         raise ValueError(
             "wbd_local_dir is required to load WBDHU10 locally; e.g., "
-            "~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape"
+            "/nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape"
         )
 
     path = os.path.expanduser(wbd_local_dir)
@@ -103,7 +109,9 @@ def get_huc10_boundary(huc10: str, wbd_local_dir: str | None = None) -> gpd.GeoD
 
     gdf = hu10[hu10[col].astype(str) == str(huc10)].copy()
     if gdf.empty:
-        raise ValueError(f"HUC10 {huc10} not found in local WBDHU10 shapefile: {shp_path}")
+        raise ValueError(
+            f"HUC10 {huc10} not found in local WBDHU10 shapefile: {shp_path}"
+        )
     if col != "huc10":
         gdf = gdf.rename(columns={col: "huc10"})
     return gdf.reset_index(drop=True)
@@ -112,9 +120,39 @@ def get_huc10_boundary(huc10: str, wbd_local_dir: str | None = None) -> gpd.GeoD
 def get_flowlines_within_aoi(
     aoi_gdf: gpd.GeoDataFrame, local_flowlines_dir: str | None = None
 ) -> gpd.GeoDataFrame:
-    """Get NHD flowlines intersecting the AOI, preferring local shapefiles when provided."""
+    """Get NHD flowlines intersecting the AOI, preferring local shapefiles when provided.
+
+    If a pre-built ``NHDFlowline_filtered.fgb`` exists in the directory (produced by
+    ``build_state_flowlines``), it is used directly — a single spatial-indexed FlatGeobuf
+    is faster than opening multiple shapefiles for every AOI in a batch run.
+    """
     if local_flowlines_dir:
         path = os.path.expanduser(local_flowlines_dir)
+
+        # Prefer pre-built filtered FlatGeobuf when present
+        fgb_candidates = [os.path.join(path, "NHDFlowline_filtered.fgb")]
+        if os.path.isdir(path) and os.path.basename(path).lower() != "shape":
+            fgb_candidates.append(
+                os.path.join(path, "Shape", "NHDFlowline_filtered.fgb")
+            )
+        for fgb_path in fgb_candidates:
+            if os.path.exists(fgb_path):
+                LOGGER.info("Loading pre-built flowlines FGB: %s", fgb_path)
+                with fiona.open(fgb_path) as src:
+                    src_crs = src.crs_wkt if src.crs_wkt else src.crs
+                aoi_bbox = tuple(aoi_gdf.to_crs(src_crs).total_bounds.tolist())
+                flow = gpd.read_file(fgb_path, bbox=aoi_bbox)
+                try:
+                    flow = gpd.clip(flow, aoi_gdf.to_crs(flow.crs))
+                except Exception:
+                    flow = gpd.overlay(
+                        flow, aoi_gdf.to_crs(flow.crs), how="intersection"
+                    )
+                flow = flow.reset_index(drop=True)
+                LOGGER.info("FGB flowlines selected: %d", len(flow))
+                return flow
+
+        # Fall back to multi-shapefile logic
         search_roots = [path]
         if os.path.isdir(path) and os.path.basename(path).lower() != "shape":
             shape_dir = os.path.join(path, "Shape")
@@ -125,7 +163,9 @@ def get_flowlines_within_aoi(
         for root in search_roots:
             shp_paths.extend(glob.glob(os.path.join(root, "NHDFlowline*.shp")))
         if not shp_paths:
-            shp_paths = glob.glob(os.path.join(path, "**", "NHDFlowline*.shp"), recursive=True)
+            shp_paths = glob.glob(
+                os.path.join(path, "**", "NHDFlowline*.shp"), recursive=True
+            )
 
         if not shp_paths:
             raise FileNotFoundError(
@@ -148,7 +188,9 @@ def get_flowlines_within_aoi(
                 if not gdf.empty:
                     parts.append(gdf)
         if not parts:
-            raise ValueError("No flowline features found in local shapefiles for the AOI extent.")
+            raise ValueError(
+                "No flowline features found in local shapefiles for the AOI extent."
+            )
 
         flow = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=parts[0].crs)
         try:
@@ -168,7 +210,79 @@ def get_flowlines_within_aoi(
     return fl
 
 
-def _filter_flowlines_nhd(fl: gpd.GeoDataFrame, natural_perennial: bool = False, exclude_artificial: bool = False):
+def build_state_flowlines(nhd_dir: str, out_path: str | None = None) -> str:
+    """Merge all NHDFlowline shapefiles in a state directory, filter to relevant FCODEs,
+    and write a single spatial-indexed FlatGeobuf.
+
+    Drops coastlines (55800) and pipelines (42xxx) — only keeps features that map to a
+    non-None category in ``nhd.FCODE_CATEGORIES`` (perennial, intermittent, managed).
+
+    Parameters
+    ----------
+    nhd_dir : str
+        Directory containing ``NHDFlowline*.shp`` files (e.g. the NHD state ``Shape/`` folder).
+    out_path : str, optional
+        Output ``.fgb`` path. Default: ``<nhd_dir>/NHDFlowline_filtered.fgb``.
+
+    Returns
+    -------
+    str
+        Absolute path to the written FlatGeobuf file.
+    """
+    from .nhd import FCODE_CATEGORIES
+
+    path = os.path.expanduser(nhd_dir)
+    shp_paths = sorted(glob.glob(os.path.join(path, "NHDFlowline*.shp")))
+    if not shp_paths:
+        shp_paths = sorted(
+            glob.glob(os.path.join(path, "**", "NHDFlowline*.shp"), recursive=True)
+        )
+    if not shp_paths:
+        raise FileNotFoundError(f"No NHDFlowline shapefiles found under {path}")
+
+    keep_fcodes = {fc for fc, cat in FCODE_CATEGORIES.items() if cat is not None}
+    LOGGER.info(
+        "Reading %d NHDFlowline shapefiles, keeping FCODEs: %s",
+        len(shp_paths),
+        sorted(keep_fcodes),
+    )
+
+    parts = []
+    for shp in shp_paths:
+        gdf = gpd.read_file(shp)
+        fcode_col = next((c for c in gdf.columns if c.lower() == "fcode"), None)
+        if fcode_col is None:
+            LOGGER.warning("No fcode column in %s — skipping", shp)
+            continue
+        filtered = gdf[gdf[fcode_col].isin(keep_fcodes)].copy()
+        LOGGER.info(
+            "  %s: %d -> %d rows after FCODE filter",
+            os.path.basename(shp),
+            len(gdf),
+            len(filtered),
+        )
+        if not filtered.empty:
+            parts.append(filtered)
+
+    if not parts:
+        raise ValueError("No flowlines matched the FCODE filter across all input files")
+
+    result = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=parts[0].crs)
+    LOGGER.info("Total filtered flowlines: %d", len(result))
+
+    if out_path is None:
+        out_path = os.path.join(path, "NHDFlowline_filtered.fgb")
+
+    result.to_file(out_path, driver="FlatGeobuf")
+    LOGGER.info("Written: %s", out_path)
+    return out_path
+
+
+def _filter_flowlines_nhd(
+    fl: gpd.GeoDataFrame,
+    natural_perennial: bool = False,
+    exclude_artificial: bool = False,
+):
     if len(fl) == 0:
         return fl
     df = fl.copy()
@@ -207,7 +321,9 @@ def ndwi_files_for_bounds(ndwi_dir: str, bounds_wsen):
 
     candidates = sorted(glob.glob(os.path.join(ndwi_dir, "*.tif")))
     if not candidates:
-        candidates = sorted(glob.glob(os.path.join(ndwi_dir, "**", "*.tif"), recursive=True))
+        candidates = sorted(
+            glob.glob(os.path.join(ndwi_dir, "**", "*.tif"), recursive=True)
+        )
 
     hits: list[str] = []
     for path in candidates:
@@ -215,7 +331,9 @@ def ndwi_files_for_bounds(ndwi_dir: str, bounds_wsen):
             with rasterio.open(path) as ds:
                 if ds.crs is None:
                     continue
-                bw, bs, be, bn = transform_bounds(ds.crs, "EPSG:4326", *ds.bounds, densify_pts=21)
+                bw, bs, be, bn = transform_bounds(
+                    ds.crs, "EPSG:4326", *ds.bounds, densify_pts=21
+                )
             if box(bw, bs, be, bn).intersects(target):
                 hits.append(path)
         except Exception:
