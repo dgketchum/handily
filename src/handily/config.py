@@ -45,6 +45,7 @@ class HandilyConfig:
     overwrite_outputs: bool = False
     ndwi_threshold: float = 0.15
     flowlines_buffer_m: float | None = None  # Buffer NHD flowlines before rasterization
+    delete_stac_cache: bool = False  # Delete raw STAC tile downloads after mosaicking
 
     # Points sampling
     points_out_dir: str | None = None
@@ -177,6 +178,7 @@ class HandilyConfig:
             rem_threshold=float(data.get("rem_threshold", 2.0)),
             ndwi_threshold=float(data.get("ndwi_threshold", 0.15)),
             flowlines_buffer_m=data.get("flowlines_buffer_m"),
+            delete_stac_cache=bool(data.get("delete_stac_cache", False)),
             points_out_dir=data.get("points_out_dir"),
             points_seed=int(data.get("points_seed", 42)),
             points_candidate_spacing_m=float(

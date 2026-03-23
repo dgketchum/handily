@@ -84,6 +84,7 @@ class REMWorkflow:
             overwrite=overwrite,
             stac_download_cache_dir=os.path.join(self.config.out_dir, "stac_cache"),
             stac_collection_id=stac_collection_id,
+            delete_stac_cache=self.config.delete_stac_cache,
         )
 
     def compute_rem(

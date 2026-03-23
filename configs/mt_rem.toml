@@ -5,8 +5,9 @@
 #   1. AOI shapefile:  /data/ssd2/handily/aois/mt_aois.shp  (857 total, 694 with stac_1m=1)
 #   2. STAC:           /nas/handily/stac/3dep_1m/            (3,381 items, rebuilt 2026-03-23)
 #   3. NHD flowlines:  flowlines_local_dir below              (NHDFlowline_filtered.fgb, 1,005,544 features)
-#   4. NDWI:           ndwi_dir below — sync from GCS after EE exports complete:
+#   4. NDWI:           sync from GCS after EE exports complete:
 #                        handily sync --config configs/mt_rem.toml --subdir ndwi
+#                        -> lands at /data/ssd2/handily/handily/mt/ndwi/
 #   5. Batch REM:      handily rem batch --aoi-shp /data/ssd2/handily/aois/mt_aois.shp \
 #                        --config configs/mt_rem.toml \
 #                        --out-root /data/ssd2/handily/rem/mt \
@@ -14,14 +15,14 @@
 
 project_name = "mt"
 bucket_prefix = "handily"
-local_data_root = "/nas/handily"
+local_data_root = "/data/ssd2/handily"
 ee_project = "ee-dgketchum"
 et_bucket = "wudr"
 
 # Input data
 fields_path = "/nas/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp"
 flowlines_local_dir = "/nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape"
-ndwi_dir = "/nas/handily/handily/mt/ndwi/"
+ndwi_dir = "/data/ssd2/handily/handily/mt/ndwi/"
 stac_dir = "/nas/handily/stac/3dep_1m/"
 
 # Output directory (used for single-AOI runs; batch REM uses --out-root)
@@ -33,3 +34,7 @@ feature_id = "FID"
 ndwi_threshold = 0.15
 flowlines_buffer_m = 10.0
 rem_threshold = 2.0
+
+# Delete raw 3DEP tile downloads after mosaicking each DEM — keeps disk use bounded
+# during batch runs (saves ~1 TB for 694 MT AOIs)
+delete_stac_cache = true

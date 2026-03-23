@@ -669,6 +669,7 @@ def mosaic_from_stac(
     cache_dir: str,
     collection_id: str = "usgs-3dep-1m-opr",
     target_crs_epsg: int = 5070,
+    delete_tiles: bool = False,
 ) -> xr.DataArray:
     """
     Select tiles overlapping the AOI from a local 3DEP STAC and mosaic into a DEM DataArray.
@@ -712,6 +713,14 @@ def mosaic_from_stac(
             ds.close()
         except Exception:
             pass
+
+    if delete_tiles:
+        for p in tifs_local:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        LOGGER.info("Deleted %d cached STAC tiles from %s", len(tifs_local), cache_dir)
 
     dem = xr.DataArray(mosaic[0].astype("float32"), dims=("y", "x"), name="elevation")
     dem = dem.rio.write_crs(crs, inplace=False)
