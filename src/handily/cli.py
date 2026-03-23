@@ -166,6 +166,55 @@ def main(argv=None):
         help="Recompute AOIs that already have rem_bounds.tif",
     )
 
+    p_nhd = sub.add_parser("nhd", help="NHD flowline preprocessing")
+    nhd_sub = p_nhd.add_subparsers(dest="nhd_cmd", required=True)
+
+    p_nhd_build = nhd_sub.add_parser(
+        "build-state",
+        help="Merge and filter state NHDFlowline shapefiles into a single FlatGeobuf",
+    )
+    p_nhd_build.add_argument(
+        "--nhd-dir",
+        required=True,
+        help="NHD state Shape directory containing NHDFlowline*.shp files",
+    )
+    p_nhd_build.add_argument(
+        "--out",
+        default=None,
+        help="Output .fgb path (default: <nhd-dir>/NHDFlowline_filtered.fgb)",
+    )
+
+    p_ndwi = sub.add_parser("ndwi", help="NAIP NDWI Earth Engine export")
+    ndwi_sub = p_ndwi.add_subparsers(dest="ndwi_cmd", required=True)
+
+    p_ndwi_export = ndwi_sub.add_parser(
+        "export", help="Batch-submit NAIP NDWI export tasks to Earth Engine"
+    )
+    p_ndwi_export.add_argument(
+        "--aoi-shp", required=True, help="AOI shapefile produced by 'handily aoi'"
+    )
+    p_ndwi_export.add_argument("--bucket", required=True, help="GCS bucket name")
+    p_ndwi_export.add_argument(
+        "--prefix",
+        required=True,
+        help="GCS path prefix for exported files (e.g. handily/mt/ndwi/naip_ndwi_aoi)",
+    )
+    p_ndwi_export.add_argument(
+        "--ee-project", required=True, help="Earth Engine project ID (e.g. ee-username)"
+    )
+    p_ndwi_export.add_argument("--start-date", default="2010-01-01")
+    p_ndwi_export.add_argument("--end-date", default="2024-12-31")
+    p_ndwi_export.add_argument(
+        "--skip-dir",
+        default=None,
+        help="Local NDWI directory; AOIs with existing .tif are skipped",
+    )
+    p_ndwi_export.add_argument(
+        "--coverage-col",
+        default=None,
+        help="Shapefile column to filter on (exports only rows where column == 1)",
+    )
+
     p_et = sub.add_parser("et", help="ET workflows (OpenET v2.0 ensemble)")
     et_sub = p_et.add_subparsers(dest="et_cmd", required=True)
 
@@ -392,6 +441,36 @@ def main(argv=None):
         for r in results:
             if r["status"] == "error":
                 print(f"  ERROR aoi_{r['aoi_id']:04d}: {r.get('error')}")
+        return 0
+
+    if args.cmd == "nhd":
+        from handily.io import build_state_flowlines
+
+        if args.nhd_cmd == "build-state":
+            out = build_state_flowlines(
+                os.path.expanduser(args.nhd_dir),
+                out_path=os.path.expanduser(args.out) if args.out else None,
+            )
+            print(f"Flowlines FGB written: {out}")
+            return 0
+
+    if args.cmd == "ndwi":
+        import ee
+        from handily.ndwi_export import export_ndwi_for_polygons
+
+        ee.Initialize(project=args.ee_project)
+        tasks = export_ndwi_for_polygons(
+            aoi_shapefile=os.path.expanduser(args.aoi_shp),
+            bucket=args.bucket,
+            prefix=args.prefix,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            skip_if_present_dir=os.path.expanduser(args.skip_dir)
+            if args.skip_dir
+            else None,
+            coverage_col=args.coverage_col,
+        )
+        print(f"Submitted {len(tasks)} EE export tasks")
         return 0
 
     if args.cmd == "met":
