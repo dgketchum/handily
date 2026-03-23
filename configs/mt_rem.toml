@@ -1,0 +1,35 @@
+# Montana batch REM configuration
+# Processes irrigated valley bottom AOIs with 3DEP 1m coverage (stac_1m == 1).
+#
+# Sequence:
+#   1. AOI shapefile:  /data/ssd2/handily/aois/mt_aois.shp  (857 total, 694 with stac_1m=1)
+#   2. STAC:           /nas/handily/stac/3dep_1m/            (3,381 items, rebuilt 2026-03-23)
+#   3. NHD flowlines:  flowlines_local_dir below              (NHDFlowline_filtered.fgb, 1,005,544 features)
+#   4. NDWI:           ndwi_dir below — sync from GCS after EE exports complete:
+#                        handily sync --config configs/mt_rem.toml --subdir ndwi
+#   5. Batch REM:      handily rem batch --aoi-shp /data/ssd2/handily/aois/mt_aois.shp \
+#                        --config configs/mt_rem.toml \
+#                        --out-root /data/ssd2/handily/rem/mt \
+#                        --coverage-col stac_1m
+
+project_name = "mt"
+bucket_prefix = "handily"
+local_data_root = "/nas/handily"
+ee_project = "ee-dgketchum"
+et_bucket = "wudr"
+
+# Input data
+fields_path = "/nas/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp"
+flowlines_local_dir = "/nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape"
+ndwi_dir = "/nas/handily/handily/mt/ndwi/"
+stac_dir = "/nas/handily/stac/3dep_1m/"
+
+# Output directory (used for single-AOI runs; batch REM uses --out-root)
+out_dir = "/data/ssd2/handily/rem/mt/"
+
+feature_id = "FID"
+
+# REM workflow
+ndwi_threshold = 0.15
+flowlines_buffer_m = 10.0
+rem_threshold = 2.0
