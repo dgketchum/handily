@@ -135,6 +135,37 @@ def main(argv=None):
         help="Collection ID (default: usgs-3dep-1m-opr)",
     )
 
+    p_rem = sub.add_parser("rem", help="REM batch workflows")
+    rem_sub = p_rem.add_subparsers(dest="rem_cmd", required=True)
+
+    p_rem_batch = rem_sub.add_parser(
+        "batch", help="Run REM pipeline for every AOI in a shapefile"
+    )
+    p_rem_batch.add_argument(
+        "--aoi-shp", required=True, help="AOI shapefile produced by 'handily aoi'"
+    )
+    p_rem_batch.add_argument("--config", required=True, help="TOML config path")
+    p_rem_batch.add_argument(
+        "--out-root", required=True, help="Root directory for per-AOI outputs"
+    )
+    p_rem_batch.add_argument(
+        "--ndwi-threshold",
+        type=float,
+        default=0.15,
+        help="NDWI threshold for water masking (default 0.15)",
+    )
+    p_rem_batch.add_argument(
+        "--flowlines-buffer",
+        type=float,
+        default=None,
+        help="Buffer NHD flowlines by this many meters before AND with NDWI",
+    )
+    p_rem_batch.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Recompute AOIs that already have rem_bounds.tif",
+    )
+
     p_et = sub.add_parser("et", help="ET workflows (OpenET v2.0 ensemble)")
     et_sub = p_et.add_subparsers(dest="et_cmd", required=True)
 
@@ -336,7 +367,31 @@ def main(argv=None):
             root = extend_3dep_stac(
                 args.out_dir, states=states, collection_id=args.collection_id
             )
-        print(f"STAC catalog updated: {root}")
+            print(f"STAC catalog updated: {root}")
+            return 0
+
+    if args.cmd == "rem":
+        import geopandas as gpd
+        from handily.config import HandilyConfig
+        from handily.pipeline import batch_run_rem
+
+        config = HandilyConfig.from_toml(args.config)
+        aoi_gdf = gpd.read_file(os.path.expanduser(args.aoi_shp))
+        results = batch_run_rem(
+            aoi_gdf=aoi_gdf,
+            config=config,
+            out_root=os.path.expanduser(args.out_root),
+            ndwi_threshold=float(args.ndwi_threshold),
+            flowlines_buffer_m=args.flowlines_buffer,
+            overwrite=args.overwrite,
+        )
+        done = sum(1 for r in results if r["status"] == "done")
+        skipped = sum(1 for r in results if r["status"] == "skipped")
+        errors = sum(1 for r in results if r["status"] == "error")
+        print(f"Batch complete: done={done} skipped={skipped} errors={errors}")
+        for r in results:
+            if r["status"] == "error":
+                print(f"  ERROR aoi_{r['aoi_id']:04d}: {r.get('error')}")
         return 0
 
     if args.cmd == "met":

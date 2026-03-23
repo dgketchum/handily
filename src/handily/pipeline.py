@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import logging
 from dataclasses import dataclass
@@ -44,7 +45,11 @@ class REMWorkflow:
     ) -> None:
         io.ensure_dir(self.config.out_dir)
         flowlines_cache_path = os.path.join(self.config.out_dir, flowlines_cache_name)
-        if cache_flowlines and (not overwrite_flowlines_cache) and os.path.exists(flowlines_cache_path):
+        if (
+            cache_flowlines
+            and (not overwrite_flowlines_cache)
+            and os.path.exists(flowlines_cache_path)
+        ):
             io.LOGGER.info("Loading cached flowlines: %s", flowlines_cache_path)
             self.flowlines = gpd.read_file(flowlines_cache_path)
         else:
@@ -102,7 +107,9 @@ class REMWorkflow:
             flowlines_buffer_m=flowlines_buffer_m,
         )
         self.rem = compute.compute_rem_quick(self.dem, self.streams)
-        self.fields = io.load_and_clip_fields(self.config.fields_path, self.aoi_gdf, dem_crs)
+        self.fields = io.load_and_clip_fields(
+            self.config.fields_path, self.aoi_gdf, dem_crs
+        )
         self.stats = compute.compute_field_rem_stats(self.fields, self.rem, stats=stats)
 
     def results(self, ndwi_threshold: float | None = None) -> dict[str, Any]:
@@ -117,7 +124,9 @@ class REMWorkflow:
             "fields_stats": self.stats,
             "summary": {
                 "total_fields": None if self.stats is None else len(self.stats),
-                "ndwi_threshold": None if ndwi_threshold is None else float(ndwi_threshold),
+                "ndwi_threshold": None
+                if ndwi_threshold is None
+                else float(ndwi_threshold),
             },
         }
 
@@ -129,9 +138,84 @@ class REMWorkflow:
         overwrite_flowlines_cache: bool = False,
         flowlines_buffer_m: float | None = None,
     ) -> dict[str, Any]:
-        self.fetch_vectors(cache_flowlines=cache_flowlines, overwrite_flowlines_cache=overwrite_flowlines_cache)
+        self.fetch_vectors(
+            cache_flowlines=cache_flowlines,
+            overwrite_flowlines_cache=overwrite_flowlines_cache,
+        )
         self.fetch_dem()
         self.compute_rem(
-            ndwi_threshold=ndwi_threshold, stats=stats, flowlines_buffer_m=flowlines_buffer_m
+            ndwi_threshold=ndwi_threshold,
+            stats=stats,
+            flowlines_buffer_m=flowlines_buffer_m,
         )
         return self.results(ndwi_threshold=ndwi_threshold)
+
+
+def batch_run_rem(
+    aoi_gdf: gpd.GeoDataFrame,
+    config: HandilyConfig,
+    out_root: str,
+    ndwi_threshold: float = 0.15,
+    flowlines_buffer_m: float | None = None,
+    overwrite: bool = False,
+) -> list[dict]:
+    """Run REMWorkflow for each AOI in aoi_gdf, writing outputs to per-AOI subdirectories.
+
+    Per-AOI directory: {out_root}/aoi_{aoi_id:04d}/
+    Skip logic: if rem_bounds.tif already exists and overwrite=False, skip that AOI.
+    Returns list of dicts with keys: aoi_id, status ('done'|'skipped'|'error'), out_dir.
+    """
+    n = len(aoi_gdf)
+    results = []
+
+    for pos, (_, row) in enumerate(aoi_gdf.iterrows(), start=1):
+        aoi_id = int(row["aoi_id"]) if "aoi_id" in row.index else pos - 1
+        aoi_out_dir = os.path.join(out_root, f"aoi_{aoi_id:04d}")
+        rem_path = os.path.join(aoi_out_dir, "rem_bounds.tif")
+
+        if os.path.exists(rem_path) and not overwrite:
+            LOGGER.info(
+                "Skipping AOI %04d (%d/%d): rem_bounds.tif exists", aoi_id, pos, n
+            )
+            results.append(
+                {"aoi_id": aoi_id, "status": "skipped", "out_dir": aoi_out_dir}
+            )
+            continue
+
+        aoi_config = dataclasses.replace(config, out_dir=aoi_out_dir)
+
+        try:
+            workflow = REMWorkflow(config=aoi_config, aoi=row.geometry)
+            result = workflow.run(
+                ndwi_threshold=ndwi_threshold,
+                cache_flowlines=True,
+                flowlines_buffer_m=flowlines_buffer_m,
+            )
+            result["rem"].rio.to_raster(rem_path)
+            result["streams"].rio.to_raster(
+                os.path.join(aoi_out_dir, "streams_bounds.tif")
+            )
+            fields = result.get("fields_stats") or result["fields"]
+            if "FID" in fields.columns:
+                fields = fields.rename(columns={"FID": "FID_"})
+            fields.to_file(
+                os.path.join(aoi_out_dir, "fields_bounds.fgb"), driver="FlatGeobuf"
+            )
+            LOGGER.info("Completed AOI %04d (%d/%d)", aoi_id, pos, n)
+            results.append({"aoi_id": aoi_id, "status": "done", "out_dir": aoi_out_dir})
+        except Exception as exc:
+            LOGGER.error("Failed AOI %04d (%d/%d): %s", aoi_id, pos, n, exc)
+            results.append(
+                {
+                    "aoi_id": aoi_id,
+                    "status": "error",
+                    "error": str(exc),
+                    "out_dir": aoi_out_dir,
+                }
+            )
+
+    done = sum(1 for r in results if r["status"] == "done")
+    skipped = sum(1 for r in results if r["status"] == "skipped")
+    errors = sum(1 for r in results if r["status"] == "error")
+    LOGGER.info("Batch complete: done=%d skipped=%d errors=%d", done, skipped, errors)
+    return results
