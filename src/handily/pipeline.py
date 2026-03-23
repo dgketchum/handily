@@ -152,6 +152,61 @@ class REMWorkflow:
         return self.results(ndwi_threshold=ndwi_threshold)
 
 
+def batch_fetch_dem(
+    aoi_gdf: gpd.GeoDataFrame,
+    config: HandilyConfig,
+    out_root: str,
+    overwrite: bool = False,
+) -> list[dict]:
+    """Download and cache DEMs for each AOI without computing REM.
+
+    Per-AOI directory: {out_root}/aoi_{aoi_id:04d}/
+    Skip logic: if dem_bounds_1m.tif already exists and overwrite=False, skip.
+    Returns list of dicts with keys: aoi_id, status ('done'|'skipped'|'error'), out_dir.
+    """
+    n = len(aoi_gdf)
+    results = []
+
+    for pos, (_, row) in enumerate(aoi_gdf.iterrows(), start=1):
+        aoi_id = int(row["aoi_id"]) if "aoi_id" in row.index else pos - 1
+        aoi_out_dir = os.path.join(out_root, f"aoi_{aoi_id:04d}")
+        dem_path = os.path.join(aoi_out_dir, "dem_bounds_1m.tif")
+
+        if os.path.exists(dem_path) and not overwrite:
+            LOGGER.info(
+                "Skipping AOI %04d (%d/%d): dem_bounds_1m.tif exists", aoi_id, pos, n
+            )
+            results.append(
+                {"aoi_id": aoi_id, "status": "skipped", "out_dir": aoi_out_dir}
+            )
+            continue
+
+        aoi_config = dataclasses.replace(config, out_dir=aoi_out_dir)
+        try:
+            workflow = REMWorkflow(config=aoi_config, aoi=row.geometry)
+            workflow.fetch_dem()
+            LOGGER.info("DEM saved AOI %04d (%d/%d)", aoi_id, pos, n)
+            results.append({"aoi_id": aoi_id, "status": "done", "out_dir": aoi_out_dir})
+        except Exception as exc:
+            LOGGER.error("Failed AOI %04d (%d/%d): %s", aoi_id, pos, n, exc)
+            results.append(
+                {
+                    "aoi_id": aoi_id,
+                    "status": "error",
+                    "error": str(exc),
+                    "out_dir": aoi_out_dir,
+                }
+            )
+
+    done = sum(1 for r in results if r["status"] == "done")
+    skipped = sum(1 for r in results if r["status"] == "skipped")
+    errors = sum(1 for r in results if r["status"] == "error")
+    LOGGER.info(
+        "Batch DEM fetch complete: done=%d skipped=%d errors=%d", done, skipped, errors
+    )
+    return results
+
+
 def batch_run_rem(
     aoi_gdf: gpd.GeoDataFrame,
     config: HandilyConfig,
