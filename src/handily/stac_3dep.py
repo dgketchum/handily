@@ -12,11 +12,9 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 import xarray as xr
-import rioxarray as rxr
 from rasterio.merge import merge as rio_merge
 from shapely.geometry import box as shapely_box
 from shapely.strtree import STRtree
-import shapely
 import pystac
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
@@ -24,8 +22,10 @@ from urllib.parse import quote
 try:
     from tqdm import tqdm
 except Exception:  # pragma: no cover - optional at runtime
+
     def tqdm(x, **kwargs):
         return x
+
 
 LOGGER = logging.getLogger("handily.stac_3dep")
 
@@ -44,7 +44,9 @@ def _http_get(url: str, timeout: float = 30.0) -> str:
     return r.text
 
 
-def _http_get_with_retry(url: str, timeout: float = 30.0, retries: int = 3, backoff: float = 0.5) -> str:
+def _http_get_with_retry(
+    url: str, timeout: float = 30.0, retries: int = 3, backoff: float = 0.5
+) -> str:
     attempt = 0
     while True:
         try:
@@ -157,13 +159,20 @@ def _fetch_item_meta(proj: str, name: str):
 def _parse_fgdc_xml(xml_text: str) -> dict:
     # Lightweight FGDC CSDGM extraction using regexes against known tags
     def _find(tag: str) -> Optional[str]:
-        m = re.search(fr"<{tag}>(.*?)</{tag}>", xml_text, flags=re.IGNORECASE | re.DOTALL)
+        m = re.search(
+            rf"<{tag}>(.*?)</{tag}>", xml_text, flags=re.IGNORECASE | re.DOTALL
+        )
         if m:
             return m.group(1).strip()
         return None
 
     def _findall(tag: str) -> List[str]:
-        return [m.strip() for m in re.findall(fr"<{tag}>(.*?)</{tag}>", xml_text, flags=re.IGNORECASE | re.DOTALL)]
+        return [
+            m.strip()
+            for m in re.findall(
+                rf"<{tag}>(.*?)</{tag}>", xml_text, flags=re.IGNORECASE | re.DOTALL
+            )
+        ]
 
     title = _find("title")
     pubdate = _find("pubdate")
@@ -228,13 +237,15 @@ def _bbox_to_geojson_polygon(bbox: Tuple[float, float, float, float]) -> dict:
     }
 
 
-def build_3dep_stac(out_dir: str,
-                    states: Optional[Iterable[str]] = None,
-                    collection_id: str = "usgs-3dep-1m-opr",
-                    project_head: Optional[str] = None,
-                    search_string: Optional[str] = None,
-                    num_workers: int = 12,
-                    items_shapefile: Optional[str] = None) -> str:
+def build_3dep_stac(
+    out_dir: str,
+    states: Optional[Iterable[str]] = None,
+    collection_id: str = "usgs-3dep-1m-opr",
+    project_head: Optional[str] = None,
+    search_string: Optional[str] = None,
+    num_workers: int = 12,
+    items_shapefile: Optional[str] = None,
+) -> str:
     """
     Build a STAC Collection of 3DEP 1 m DEM tiles.
 
@@ -246,7 +257,9 @@ def build_3dep_stac(out_dir: str,
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    catalog = pystac.Catalog(id=f"{collection_id}-catalog", description="USGS 3DEP 1 m DEM tiles")
+    catalog = pystac.Catalog(
+        id=f"{collection_id}-catalog", description="USGS 3DEP 1 m DEM tiles"
+    )
     collection = pystac.Collection(
         id=collection_id,
         description="USGS 3DEP 1 m DEM tiles (LiDAR-derived)",
@@ -258,8 +271,10 @@ def build_3dep_stac(out_dir: str,
         title="USGS 3DEP 1 m DEM",
         keywords=["USGS", "3DEP", "LiDAR", "DEM", "1m"],
         providers=[
-            pystac.Provider(name="U.S. Geological Survey",
-                            roles=[pystac.ProviderRole.PRODUCER, pystac.ProviderRole.LICENSOR]),
+            pystac.Provider(
+                name="U.S. Geological Survey",
+                roles=[pystac.ProviderRole.PRODUCER, pystac.ProviderRole.LICENSOR],
+            ),
         ],
     )
     catalog.add_child(collection)
@@ -268,8 +283,13 @@ def build_3dep_stac(out_dir: str,
         projects = [project_head.rstrip("/") + "/"]
     else:
         projects = _list_projects(states)
-    LOGGER.info("Projects to build: %d (states=%s, project_head=%s, subfilter=%s)",
-                len(projects), list(states) if states else None, project_head, search_string)
+    LOGGER.info(
+        "Projects to build: %d (states=%s, project_head=%s, subfilter=%s)",
+        len(projects),
+        list(states) if states else None,
+        project_head,
+        search_string,
+    )
     total_items = 0
     for proj in tqdm(projects, desc="Projects", unit="proj"):
         # List XMLs directly under <project>/metadata/
@@ -282,7 +302,13 @@ def build_3dep_stac(out_dir: str,
         if not xml_names:
             continue
 
-        bar = tqdm(total=len(xml_names), desc=f"{proj}metadata/", position=1, unit="xml", leave=False)
+        bar = tqdm(
+            total=len(xml_names),
+            desc=f"{proj}metadata/",
+            position=1,
+            unit="xml",
+            leave=False,
+        )
         workers = max(1, int(num_workers))
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [ex.submit(_fetch_item_meta, proj, name) for name in xml_names]
@@ -305,22 +331,41 @@ def build_3dep_stac(out_dir: str,
                     properties={},
                 )
                 if d.get("iso_beg"):
-                    item.properties["start_datetime"] = pystac.utils.str_to_datetime(d["iso_beg"]).isoformat()
+                    item.properties["start_datetime"] = pystac.utils.str_to_datetime(
+                        d["iso_beg"]
+                    ).isoformat()
                 if d.get("iso_end"):
-                    item.properties["end_datetime"] = pystac.utils.str_to_datetime(d["iso_end"]).isoformat()
+                    item.properties["end_datetime"] = pystac.utils.str_to_datetime(
+                        d["iso_end"]
+                    ).isoformat()
                 item.properties["gsd"] = 1.0
                 item.add_asset(
                     "data",
-                    pystac.Asset(href=d["tif_href"], media_type="image/tiff", roles=["data"], title="DEM 1m (GeoTIFF)"),
+                    pystac.Asset(
+                        href=d["tif_href"],
+                        media_type="image/tiff",
+                        roles=["data"],
+                        title="DEM 1m (GeoTIFF)",
+                    ),
                 )
                 item.add_asset(
                     "metadata",
-                    pystac.Asset(href=d["xml_url"], media_type="application/xml", roles=["metadata"], title="FGDC metadata"),
+                    pystac.Asset(
+                        href=d["xml_url"],
+                        media_type="application/xml",
+                        roles=["metadata"],
+                        title="FGDC metadata",
+                    ),
                 )
                 if d.get("jpg_href"):
                     item.add_asset(
                         "thumbnail",
-                        pystac.Asset(href=d["jpg_href"], media_type="image/jpeg", roles=["thumbnail"], title="Thumbnail"),
+                        pystac.Asset(
+                            href=d["jpg_href"],
+                            media_type="image/jpeg",
+                            roles=["thumbnail"],
+                            title="Thumbnail",
+                        ),
                     )
                 collection.add_item(item)
                 total_items += 1
@@ -333,7 +378,9 @@ def build_3dep_stac(out_dir: str,
     catalog.normalize_hrefs(out_dir)
     catalog.make_all_asset_hrefs_absolute()
     catalog.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
-    LOGGER.info("Wrote STAC: %s (items=%d)", os.path.join(out_dir, "catalog.json"), total_items)
+    LOGGER.info(
+        "Wrote STAC: %s (items=%d)", os.path.join(out_dir, "catalog.json"), total_items
+    )
     # Persist spatial index for fast AOI queries
     try:
         _write_bbox_index(out_dir, collection_id)
@@ -346,7 +393,14 @@ def build_3dep_stac(out_dir: str,
             os.makedirs(shp_dir)
         root = os.path.join(out_dir, "catalog.json")
         cat = pystac.read_file(root)
-        coll = next((c for c in cat.get_children() if isinstance(c, pystac.Collection) and c.id == collection_id), None)
+        coll = next(
+            (
+                c
+                for c in cat.get_children()
+                if isinstance(c, pystac.Collection) and c.id == collection_id
+            ),
+            None,
+        )
         if coll is None:
             raise ValueError(f"Collection {collection_id} not found in catalog.")
         ids, geoms = [], []
@@ -356,12 +410,15 @@ def build_3dep_stac(out_dir: str,
                 geoms.append(shapely_box(*it.bbox))
         gdf = gpd.GeoDataFrame({"id": ids}, geometry=geoms, crs="EPSG:4326")
         gdf.to_file(shp_path)
-        print(f'wrote stac shapefiles to {shp_path}')
+        print(f"wrote stac shapefiles to {shp_path}")
     return os.path.join(out_dir, "catalog.json")
 
 
-def tiles_for_aoi(stac_dir: str, aoi_bbox_4326: Tuple[float, float, float, float],
-                  collection_id: str = "usgs-3dep-1m-opr") -> list[pystac.Item]:
+def tiles_for_aoi(
+    stac_dir: str,
+    aoi_bbox_4326: Tuple[float, float, float, float],
+    collection_id: str = "usgs-3dep-1m-opr",
+) -> list[pystac.Item]:
     """
     Return a list of STAC Items whose bbox intersects the given AOI bbox (EPSG:4326).
 
@@ -369,7 +426,14 @@ def tiles_for_aoi(stac_dir: str, aoi_bbox_4326: Tuple[float, float, float, float
     """
     root = os.path.join(stac_dir, "catalog.json")
     cat = pystac.read_file(root)
-    coll = next((c for c in cat.get_children() if isinstance(c, pystac.Collection) and c.id == collection_id), None)
+    coll = next(
+        (
+            c
+            for c in cat.get_children()
+            if isinstance(c, pystac.Collection) and c.id == collection_id
+        ),
+        None,
+    )
     if coll is None:
         raise ValueError(f"Collection {collection_id} not found in catalog.")
 
@@ -402,6 +466,7 @@ def tiles_for_aoi(stac_dir: str, aoi_bbox_4326: Tuple[float, float, float, float
     try:
         # numpy array of indices path
         import numpy as _np  # local import to avoid top-level constraints
+
         if hasattr(matches, "dtype") and _np.issubdtype(matches.dtype, _np.integer):
             idxs = [int(i) for i in matches.tolist()]
         else:
@@ -440,7 +505,14 @@ def _index_path(stac_dir: str, collection_id: str) -> str:
 def _write_bbox_index(stac_dir: str, collection_id: str) -> str:
     root = os.path.join(stac_dir, "catalog.json")
     cat = pystac.read_file(root)
-    coll = next((c for c in cat.get_children() if isinstance(c, pystac.Collection) and c.id == collection_id), None)
+    coll = next(
+        (
+            c
+            for c in cat.get_children()
+            if isinstance(c, pystac.Collection) and c.id == collection_id
+        ),
+        None,
+    )
     if coll is None:
         raise ValueError(f"Collection {collection_id} not found in catalog.")
     ids = []
@@ -470,11 +542,134 @@ def _load_bbox_index(stac_dir: str, collection_id: str):
     return geoms, ids
 
 
-def mosaic_from_stac(stac_dir: str,
-                     aoi_gdf,
-                     cache_dir: str,
-                     collection_id: str = "usgs-3dep-1m-opr",
-                     target_crs_epsg: int = 5070) -> xr.DataArray:
+def extend_3dep_stac(
+    out_dir: str,
+    states: Iterable[str],
+    collection_id: str = "usgs-3dep-1m-opr",
+    num_workers: int = 12,
+) -> str:
+    """Add new state projects to an existing STAC catalog, skipping items already present.
+
+    Returns the path to the root catalog.json.
+    """
+    root = os.path.join(out_dir, "catalog.json")
+    cat = pystac.read_file(root)
+    coll = next(
+        (
+            c
+            for c in cat.get_children()
+            if isinstance(c, pystac.Collection) and c.id == collection_id
+        ),
+        None,
+    )
+    if coll is None:
+        raise ValueError(f"Collection {collection_id} not found in {root}")
+
+    existing_ids = {it.id for it in coll.get_items()}
+    projects = _list_projects(states)
+    LOGGER.info(
+        "Extending STAC with %d projects (states=%s)", len(projects), list(states)
+    )
+    new_items = 0
+
+    for proj in tqdm(projects, desc="Projects", unit="proj"):
+        try:
+            xml_names = _list_metadata_xmls(proj)
+        except Exception:
+            xml_names = []
+        if not xml_names:
+            continue
+        bar = tqdm(
+            total=len(xml_names),
+            desc=f"{proj}metadata/",
+            position=1,
+            unit="xml",
+            leave=False,
+        )
+        workers = max(1, int(num_workers))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_fetch_item_meta, proj, name) for name in xml_names]
+            for fut in as_completed(futures):
+                try:
+                    d = fut.result()
+                finally:
+                    try:
+                        bar.update(1)
+                    except Exception:
+                        pass
+                if not d or d["item_id"] in existing_ids:
+                    continue
+                geom = _bbox_to_geojson_polygon(d["bbox"])
+                item = pystac.Item(
+                    id=d["item_id"],
+                    geometry=geom,
+                    bbox=d["bbox"],
+                    datetime=pystac.utils.str_to_datetime(d["dt"]) if d["dt"] else None,
+                    properties={},
+                )
+                if d.get("iso_beg"):
+                    item.properties["start_datetime"] = pystac.utils.str_to_datetime(
+                        d["iso_beg"]
+                    ).isoformat()
+                if d.get("iso_end"):
+                    item.properties["end_datetime"] = pystac.utils.str_to_datetime(
+                        d["iso_end"]
+                    ).isoformat()
+                item.properties["gsd"] = 1.0
+                item.add_asset(
+                    "data",
+                    pystac.Asset(
+                        href=d["tif_href"],
+                        media_type="image/tiff",
+                        roles=["data"],
+                        title="DEM 1m (GeoTIFF)",
+                    ),
+                )
+                item.add_asset(
+                    "metadata",
+                    pystac.Asset(
+                        href=d["xml_url"],
+                        media_type="application/xml",
+                        roles=["metadata"],
+                        title="FGDC metadata",
+                    ),
+                )
+                if d.get("jpg_href"):
+                    item.add_asset(
+                        "thumbnail",
+                        pystac.Asset(
+                            href=d["jpg_href"],
+                            media_type="image/jpeg",
+                            roles=["thumbnail"],
+                            title="Thumbnail",
+                        ),
+                    )
+                coll.add_item(item)
+                existing_ids.add(d["item_id"])
+                new_items += 1
+        try:
+            bar.close()
+        except Exception:
+            pass
+
+    cat.normalize_hrefs(out_dir)
+    cat.make_all_asset_hrefs_absolute()
+    cat.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
+    LOGGER.info("Extended STAC: %s (new_items=%d)", root, new_items)
+    try:
+        _write_bbox_index(out_dir, collection_id)
+    except Exception:
+        pass
+    return root
+
+
+def mosaic_from_stac(
+    stac_dir: str,
+    aoi_gdf,
+    cache_dir: str,
+    collection_id: str = "usgs-3dep-1m-opr",
+    target_crs_epsg: int = 5070,
+) -> xr.DataArray:
     """
     Select tiles overlapping the AOI from a local 3DEP STAC and mosaic into a DEM DataArray.
 
@@ -489,7 +684,7 @@ def mosaic_from_stac(stac_dir: str,
         raise ValueError("No STAC tiles intersect AOI.")
 
     tifs_local: list[str] = []
-    for it in tqdm(items, total=len(items), desc='Mosaic from STAC'):
+    for it in tqdm(items, total=len(items), desc="Mosaic from STAC"):
         asset = it.assets.get("data")
         if asset is None:
             continue
@@ -525,7 +720,9 @@ def mosaic_from_stac(stac_dir: str,
     if (epsg is None) or (int(epsg) != int(target_crs_epsg)):
         dem = dem.rio.reproject(f"EPSG:{int(target_crs_epsg)}")
 
-    dem = dem.rio.clip(aoi_gdf.to_crs(dem.rio.crs).geometry, aoi_gdf.to_crs(dem.rio.crs).crs)
+    dem = dem.rio.clip(
+        aoi_gdf.to_crs(dem.rio.crs).geometry, aoi_gdf.to_crs(dem.rio.crs).crs
+    )
     # Replace nodata with NaN consistently
     nd = dem.rio.nodata
     if nd is not None and np.isfinite(nd):
