@@ -138,6 +138,30 @@ def main(argv=None):
     p_rem = sub.add_parser("rem", help="REM batch workflows")
     rem_sub = p_rem.add_subparsers(dest="rem_cmd", required=True)
 
+    p_rem_fetch = rem_sub.add_parser(
+        "fetch-dem", help="Download and cache DEMs for every AOI without computing REM"
+    )
+    p_rem_fetch.add_argument(
+        "--aoi-shp", required=True, help="AOI shapefile produced by 'handily aoi'"
+    )
+    p_rem_fetch.add_argument("--config", required=True, help="TOML config path")
+    p_rem_fetch.add_argument(
+        "--out-root", required=True, help="Root directory for per-AOI outputs"
+    )
+    p_rem_fetch.add_argument(
+        "--overwrite", action="store_true", help="Re-download existing DEMs"
+    )
+    p_rem_fetch.add_argument(
+        "--coverage-col",
+        default=None,
+        help="Shapefile column to filter on; only rows where column == 1 are processed",
+    )
+    p_rem_fetch.add_argument(
+        "--sort-col",
+        default=None,
+        help="Sort AOIs descending by this column before processing (e.g. n_fields)",
+    )
+
     p_rem_batch = rem_sub.add_parser(
         "batch", help="Run REM pipeline for every AOI in a shapefile"
     )
@@ -169,6 +193,11 @@ def main(argv=None):
         "--coverage-col",
         default=None,
         help="Shapefile column to filter on; only rows where column == 1 are processed (e.g. stac_1m)",
+    )
+    p_rem_batch.add_argument(
+        "--sort-col",
+        default=None,
+        help="Sort AOIs descending by this column before processing (e.g. n_fields)",
     )
 
     p_nhd = sub.add_parser("nhd", help="NHD flowline preprocessing")
@@ -427,7 +456,7 @@ def main(argv=None):
     if args.cmd == "rem":
         import geopandas as gpd
         from handily.config import HandilyConfig
-        from handily.pipeline import batch_run_rem
+        from handily.pipeline import batch_fetch_dem, batch_run_rem
 
         config = HandilyConfig.from_toml(args.config)
         aoi_gdf = gpd.read_file(os.path.expanduser(args.aoi_shp))
@@ -435,6 +464,28 @@ def main(argv=None):
             n_before = len(aoi_gdf)
             aoi_gdf = aoi_gdf[aoi_gdf[args.coverage_col] == 1].reset_index(drop=True)
             print(f"Filtered to {args.coverage_col}==1: {len(aoi_gdf)}/{n_before} AOIs")
+        if args.sort_col and args.sort_col in aoi_gdf.columns:
+            aoi_gdf = aoi_gdf.sort_values(args.sort_col, ascending=False).reset_index(
+                drop=True
+            )
+            print(f"Sorted by {args.sort_col} descending")
+
+        if args.rem_cmd == "fetch-dem":
+            results = batch_fetch_dem(
+                aoi_gdf=aoi_gdf,
+                config=config,
+                out_root=os.path.expanduser(args.out_root),
+                overwrite=args.overwrite,
+            )
+            done = sum(1 for r in results if r["status"] == "done")
+            skipped = sum(1 for r in results if r["status"] == "skipped")
+            errors = sum(1 for r in results if r["status"] == "error")
+            print(f"Batch DEM fetch: done={done} skipped={skipped} errors={errors}")
+            for r in results:
+                if r["status"] == "error":
+                    print(f"  ERROR aoi_{r['aoi_id']:04d}: {r.get('error')}")
+            return 0
+
         results = batch_run_rem(
             aoi_gdf=aoi_gdf,
             config=config,
