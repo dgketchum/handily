@@ -161,6 +161,13 @@ def main(argv=None):
         default=None,
         help="Sort AOIs descending by this column before processing (e.g. n_fields)",
     )
+    p_rem_fetch.add_argument(
+        "--aoi-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Only process these aoi_id values (e.g. --aoi-ids 7 8 9 10)",
+    )
 
     p_rem_batch = rem_sub.add_parser(
         "batch", help="Run REM pipeline for every AOI in a shapefile"
@@ -198,6 +205,13 @@ def main(argv=None):
         "--sort-col",
         default=None,
         help="Sort AOIs descending by this column before processing (e.g. n_fields)",
+    )
+    p_rem_batch.add_argument(
+        "--aoi-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Only process these aoi_id values (e.g. --aoi-ids 7 8 9 10)",
     )
 
     p_nhd = sub.add_parser("nhd", help="NHD flowline preprocessing")
@@ -464,6 +478,12 @@ def main(argv=None):
             n_before = len(aoi_gdf)
             aoi_gdf = aoi_gdf[aoi_gdf[args.coverage_col] == 1].reset_index(drop=True)
             print(f"Filtered to {args.coverage_col}==1: {len(aoi_gdf)}/{n_before} AOIs")
+        if args.aoi_ids and "aoi_id" in aoi_gdf.columns:
+            n_before = len(aoi_gdf)
+            aoi_gdf = aoi_gdf[aoi_gdf["aoi_id"].isin(args.aoi_ids)].reset_index(
+                drop=True
+            )
+            print(f"Filtered to {len(aoi_gdf)}/{n_before} AOIs by aoi_id")
         if args.sort_col and args.sort_col in aoi_gdf.columns:
             aoi_gdf = aoi_gdf.sort_values(args.sort_col, ascending=False).reset_index(
                 drop=True
