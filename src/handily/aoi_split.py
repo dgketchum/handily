@@ -70,11 +70,9 @@ def _split_polygon_to_max(poly, max_area_m2):
     return out
 
 
-def build_centroid_buffer_aois(fields_path,
-                               max_km2,
-                               buffer_m=1000,
-                               bounds_wsen=None,
-                               simplify_tolerance_m=None):
+def build_centroid_buffer_aois(
+    fields_path, max_km2, buffer_m=1000, bounds_wsen=None, simplify_tolerance_m=None
+):
     if bounds_wsen is not None:
         w, s, e, n = bounds_wsen
         fields = gpd.read_file(fields_path, bbox=(w, s, e, n))
@@ -89,7 +87,9 @@ def build_centroid_buffer_aois(fields_path,
     if dissolved.is_empty:
         raise ValueError("Buffered centroids produced an empty geometry")
     if simplify_tolerance_m is not None and float(simplify_tolerance_m) > 0:
-        dissolved = dissolved.simplify(float(simplify_tolerance_m), preserve_topology=True)
+        dissolved = dissolved.simplify(
+            float(simplify_tolerance_m), preserve_topology=True
+        )
     aoi_ll_geom = gpd.GeoSeries([dissolved], crs="EPSG:5070").to_crs(4326).iloc[0]
 
     max_area_m2 = float(max_km2) * 1_000_000.0
@@ -137,11 +137,9 @@ def build_centroid_buffer_aois(fields_path,
     return aoi_tiles
 
 
-def build_envelope_aois(fields_path,
-                        max_km2,
-                        buffer_m=0,
-                        bounds_wsen=None,
-                        simplify_tolerance_m=None):
+def build_envelope_aois(
+    fields_path, max_km2, buffer_m=0, bounds_wsen=None, simplify_tolerance_m=None
+):
     if bounds_wsen is not None:
         w, s, e, n = bounds_wsen
         fields = gpd.read_file(fields_path, bbox=(w, s, e, n))
@@ -158,19 +156,23 @@ def build_envelope_aois(fields_path,
         env = env.simplify(float(simplify_tolerance_m), preserve_topology=True)
 
     parts = _fishnet_chunks(env, max_km2)
-    aoi_ll = gpd.GeoDataFrame(geometry=gpd.GeoSeries(parts, crs="EPSG:5070").to_crs(4326))
+    aoi_ll = gpd.GeoDataFrame(
+        geometry=gpd.GeoSeries(parts, crs="EPSG:5070").to_crs(4326)
+    )
     aoi_ll = aoi_ll.reset_index(drop=True)
     aoi_ll["aoi_id"] = aoi_ll.index.astype(int)
     return aoi_ll
 
 
-def build_field_water_aois(fields_path,
-                           flowlines_local_dir,
-                           max_km2,
-                           buffer_m=100,
-                           bounds_wsen=None,
-                           simplify_tolerance_m=None,
-                           min_intersection_area_m2=1000):
+def build_field_water_aois(
+    fields_path,
+    flowlines_local_dir,
+    max_km2,
+    buffer_m=100,
+    bounds_wsen=None,
+    simplify_tolerance_m=None,
+    min_intersection_area_m2=1000,
+):
     if bounds_wsen is not None:
         w, s, e, n = bounds_wsen
         fields = gpd.read_file(fields_path, bbox=(w, s, e, n))
@@ -183,7 +185,11 @@ def build_field_water_aois(fields_path,
         hull = fields.to_crs(4326).geometry.unary_union.envelope
         aoi_ll = gpd.GeoDataFrame([{}], geometry=[hull], crs="EPSG:4326")
     else:
-        aoi_ll = gpd.GeoDataFrame([{}], geometry=[shapely_box(*bounds_wsen)], crs="EPSG:4326")
+        aoi_ll = gpd.GeoDataFrame(
+            [{}], geometry=[shapely_box(*bounds_wsen)], crs="EPSG:4326"
+        )
+
+    from handily.io import get_flowlines_within_aoi
 
     flow = get_flowlines_within_aoi(aoi_ll, local_flowlines_dir=flowlines_local_dir)
     flow_aea = flow.to_crs("EPSG:5070")
@@ -208,10 +214,15 @@ def build_field_water_aois(fields_path,
             aoi_parts.extend(_fishnet_chunks(g, max_km2))
 
     if simplify_tolerance_m is not None:
-        aoi_parts = [g.simplify(float(simplify_tolerance_m), preserve_topology=True) for g in aoi_parts]
+        aoi_parts = [
+            g.simplify(float(simplify_tolerance_m), preserve_topology=True)
+            for g in aoi_parts
+        ]
         aoi_parts = [g for g in aoi_parts if not g.is_empty]
 
-    aoi_ll = gpd.GeoDataFrame(geometry=gpd.GeoSeries(aoi_parts, crs="EPSG:5070").to_crs(4326))
+    aoi_ll = gpd.GeoDataFrame(
+        geometry=gpd.GeoSeries(aoi_parts, crs="EPSG:5070").to_crs(4326)
+    )
     aoi_ll = aoi_ll.reset_index(drop=True)
     aoi_ll["aoi_id"] = aoi_ll.index.astype(int)
     return aoi_ll
@@ -222,23 +233,23 @@ def write_aois_shapefile(aoi_gdf, shp_path):
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir)
     aoi_gdf.to_file(shp_path)
-    print(f'wrote {shp_path}')
+    print(f"wrote {shp_path}")
     return shp_path
 
 
 if __name__ == "__main__":
-    fields_path = "~/data/IrrigationGIS/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp"
+    fields_path = "/nas/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp"
     max_km2 = 300
     buffer_m = 1000
     simplify_tolerance_m = None
-    shp_out_dir = "/home/dgketchum/data/IrrigationGIS/handily/outputs/testing"
+    shp_out_dir = "/nas/handily/outputs/testing"
     shp_out_path = os.path.join(shp_out_dir, "ndwi_aois.shp")
 
     aoi_gdf = build_centroid_buffer_aois(
         fields_path=fields_path,
         max_km2=max_km2,
         buffer_m=buffer_m,
-        bounds_wsen= (-113.8, 45., -112.27, 46.),
+        bounds_wsen=(-113.8, 45.0, -112.27, 46.0),
         simplify_tolerance_m=simplify_tolerance_m,
     )
     write_aois_shapefile(aoi_gdf, shp_out_path)

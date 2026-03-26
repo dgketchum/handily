@@ -32,8 +32,9 @@ feature_id = "FID"
 
 # REM workflow
 ndwi_threshold = 0.15
-flowlines_buffer_m = 10.0
+flowlines_buffer_m = 1.0
 rem_threshold = 2.0
+rem_propagate_mask = true
 
 # Delete raw 3DEP tile downloads after mosaicking each DEM — keeps disk use bounded
 # during batch runs (saves ~1 TB for 694 MT AOIs)

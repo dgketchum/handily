@@ -1,0 +1,28 @@
+# Nevada batch REM configuration
+# Pilot AOIs: 773-780, 805, 806 (Elko area, NE Nevada)
+
+project_name = "nv"
+bucket_prefix = "handily"
+local_data_root = "/data/ssd2/handily"
+ee_project = "ee-dgketchum"
+et_bucket = "wudr"
+
+# Input data
+fields_path = "/nas/Nevada/dri_field_pts/fields_gis/Nevada_Agricultural_Field_Boundaries_20250214/Nevada_Agricultural_Field_Boundaries_20250214_5071_GFID.shp"
+flowlines_local_dir = "/nas/boundaries/wbd/NHD_H_Nevada_State_Shape/Shape"
+ndwi_dir = "/data/ssd2/handily/handily/nv/ndwi/"
+stac_dir = "/nas/handily/stac/3dep_1m/"
+
+# Output directory (used for single-AOI runs; batch REM uses --out-root)
+out_dir = "/data/ssd2/handily/rem/nv/"
+
+feature_id = "GFID"
+
+# REM workflow
+ndwi_threshold = 0.15
+flowlines_buffer_m = 1.0
+rem_threshold = 2.0
+rem_propagate_mask = true
+
+# Delete raw 3DEP tile downloads after mosaicking each DEM
+delete_stac_cache = true
