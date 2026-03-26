@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import logging
+import re
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import geopandas as gpd
+import numpy as np
+import rioxarray  # noqa: F401 — registers .rio accessor
 
-from . import compute, dem, io
+from . import compute, dem, io, nhd as nhd_mod
 from .config import HandilyConfig
 
 LOGGER = logging.getLogger("handily.pipeline")
@@ -100,14 +106,26 @@ class REMWorkflow:
 
         dem_crs = self.dem.rio.crs
         flowlines_dem = self.flowlines.to_crs(dem_crs)
+        # Exclude hillside canal FCODEs from the stream mask to prevent false
+        # near-zero REM patches on hillside pixels below canals.
+        fcode_col = nhd_mod.get_fcode_column(flowlines_dem)
+        if fcode_col and nhd_mod.REM_EXCLUDED_FCODES:
+            flowlines_for_mask = flowlines_dem[
+                ~flowlines_dem[fcode_col].isin(nhd_mod.REM_EXCLUDED_FCODES)
+            ].copy()
+        else:
+            flowlines_for_mask = flowlines_dem
+        flowlines_for_mask = compute.filter_disconnected_flowlines(flowlines_for_mask)
         self.streams = compute.build_streams_mask_from_nhd_ndwi(
-            flowlines_dem,
+            flowlines_for_mask,
             self.dem,
             ndwi_da=self.ndwi,
             ndwi_threshold=float(ndwi_threshold),
             flowlines_buffer_m=flowlines_buffer_m,
         )
-        self.rem = compute.compute_rem_quick(self.dem, self.streams)
+        self.rem = compute.compute_rem_edt_smooth(
+            self.dem, self.streams, sigma=self.config.rem_smooth_sigma
+        )
         self.fields = io.load_and_clip_fields(
             self.config.fields_path, self.aoi_gdf, dem_crs
         )
@@ -183,7 +201,15 @@ def batch_fetch_dem(
 
         aoi_config = dataclasses.replace(config, out_dir=aoi_out_dir)
         try:
-            workflow = REMWorkflow(config=aoi_config, aoi=row.geometry)
+            aoi_geom = row.geometry
+            if config.rem_aoi_buffer_m > 0:
+                aoi_proj = gpd.GeoSeries([aoi_geom], crs="EPSG:4326").to_crs(
+                    "EPSG:5070"
+                )
+                aoi_geom = (
+                    aoi_proj.buffer(config.rem_aoi_buffer_m).to_crs("EPSG:4326").iloc[0]
+                )
+            workflow = REMWorkflow(config=aoi_config, aoi=aoi_geom)
             workflow.fetch_dem()
             LOGGER.info("DEM saved AOI %04d (%d/%d)", aoi_id, pos, n)
             results.append({"aoi_id": aoi_id, "status": "done", "out_dir": aoi_out_dir})
@@ -241,7 +267,17 @@ def batch_run_rem(
         aoi_config = dataclasses.replace(config, out_dir=aoi_out_dir)
 
         try:
-            workflow = REMWorkflow(config=aoi_config, aoi=row.geometry)
+            t0 = time.monotonic()
+            # Buffer the AOI so the REM extends beyond the tile edge
+            aoi_geom = row.geometry
+            if config.rem_aoi_buffer_m > 0:
+                aoi_proj = gpd.GeoSeries([aoi_geom], crs="EPSG:4326").to_crs(
+                    "EPSG:5070"
+                )
+                aoi_geom = (
+                    aoi_proj.buffer(config.rem_aoi_buffer_m).to_crs("EPSG:4326").iloc[0]
+                )
+            workflow = REMWorkflow(config=aoi_config, aoi=aoi_geom)
             result = workflow.run(
                 ndwi_threshold=ndwi_threshold,
                 cache_flowlines=True,
@@ -251,13 +287,16 @@ def batch_run_rem(
             result["streams"].rio.to_raster(
                 os.path.join(aoi_out_dir, "streams_bounds.tif")
             )
-            fields = result.get("fields_stats") or result["fields"]
+            fields = result.get("fields_stats")
+            if fields is None:
+                fields = result["fields"]
             if "FID" in fields.columns:
                 fields = fields.rename(columns={"FID": "FID_"})
             fields.to_file(
                 os.path.join(aoi_out_dir, "fields_bounds.fgb"), driver="FlatGeobuf"
             )
-            LOGGER.info("Completed AOI %04d (%d/%d)", aoi_id, pos, n)
+            elapsed = time.monotonic() - t0
+            LOGGER.info("Completed AOI %04d (%d/%d) in %.1fs", aoi_id, pos, n, elapsed)
             results.append({"aoi_id": aoi_id, "status": "done", "out_dir": aoi_out_dir})
         except Exception as exc:
             LOGGER.error("Failed AOI %04d (%d/%d): %s", aoi_id, pos, n, exc)
@@ -275,3 +314,181 @@ def batch_run_rem(
     errors = sum(1 for r in results if r["status"] == "error")
     LOGGER.info("Batch complete: done=%d skipped=%d errors=%d", done, skipped, errors)
     return results
+
+
+def run_experiment(
+    experiment_dir: str,
+    config: HandilyConfig,
+    notes: str,
+    experiment_id: str | None = None,
+) -> dict:
+    """Run a single REM experiment, saving outputs to an auto-incremented subdirectory.
+
+    Loads shared DEM and flowlines from *experiment_dir*, computes stream mask + REM
+    with parameters from *config*, and writes outputs + run.json to E{n}/.
+    """
+    import rioxarray  # noqa: F811
+
+    # --- resolve experiment ID ---
+    if experiment_id is None:
+        existing = [
+            int(m.group(1))
+            for d in os.listdir(experiment_dir)
+            if (m := re.match(r"^E(\d+)$", d))
+            and os.path.isdir(os.path.join(experiment_dir, d))
+        ]
+        next_n = max(existing) + 1 if existing else 0
+        experiment_id = f"E{next_n}"
+
+    run_dir = os.path.join(experiment_dir, experiment_id)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Set up per-experiment log file
+    run_log = logging.FileHandler(os.path.join(run_dir, "experiment.log"))
+    run_log.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    )
+    logging.getLogger().addHandler(run_log)
+
+    LOGGER.info("Experiment %s → %s", experiment_id, run_dir)
+
+    # --- load shared data ---
+    dem_path = os.path.join(experiment_dir, "dem_bounds_1m.tif")
+    flow_path = os.path.join(experiment_dir, "flowlines_bounds.fgb")
+    dem_da = rioxarray.open_rasterio(dem_path).squeeze("band", drop=True)
+    flowlines = gpd.read_file(flow_path)
+
+    # derive AOI bounds from DEM for NDWI lookup and field clipping
+    from pyproj import Transformer
+
+    dem_crs = dem_da.rio.crs
+    xmin, ymin, xmax, ymax = dem_da.rio.bounds()
+    transformer = Transformer.from_crs(dem_crs, "EPSG:4326", always_xy=True)
+    lon_min, lat_min = transformer.transform(xmin, ymin)
+    lon_max, lat_max = transformer.transform(xmax, ymax)
+    bounds_wsen = (lon_min, lat_min, lon_max, lat_max)
+
+    from shapely.geometry import box
+
+    aoi_geom_4326 = box(lon_min, lat_min, lon_max, lat_max)
+    aoi_gdf = gpd.GeoDataFrame([{}], geometry=[aoi_geom_4326], crs="EPSG:4326")
+
+    ndwi_paths = io.ndwi_files_for_bounds(config.ndwi_dir, bounds_wsen)
+    if not ndwi_paths:
+        raise ValueError("No NDWI rasters found for experiment bounds")
+    ndwi_da = io.open_ndwi_mosaic_from_paths(ndwi_paths, bounds_wsen)
+
+    # --- resolve excluded FCODEs ---
+    if config.rem_excluded_fcodes is not None:
+        excluded = frozenset(config.rem_excluded_fcodes)
+    else:
+        excluded = nhd_mod.REM_EXCLUDED_FCODES
+
+    # --- filter flowlines ---
+    flowlines_dem = flowlines.to_crs(dem_crs)
+    fcode_col = nhd_mod.get_fcode_column(flowlines_dem)
+    if fcode_col and excluded:
+        flowlines_for_mask = flowlines_dem[
+            ~flowlines_dem[fcode_col].isin(excluded)
+        ].copy()
+    else:
+        flowlines_for_mask = flowlines_dem
+
+    # Drop isolated pond/lake-crossing 55800 segments (keep main river chains)
+    flowlines_for_mask = compute.filter_disconnected_flowlines(flowlines_for_mask)
+
+    # --- compute ---
+    t0 = time.monotonic()
+
+    if config.rem_propagate_mask:
+        streams = compute.build_network_propagated_mask(
+            flowlines_for_mask,
+            dem_da,
+            ndwi_da=ndwi_da,
+            ndwi_threshold=config.ndwi_threshold,
+            flowlines_buffer_m=config.flowlines_buffer_m,
+            max_hops=config.rem_propagate_hops,
+        )
+    else:
+        streams = compute.build_streams_mask_from_nhd_ndwi(
+            flowlines_for_mask,
+            dem_da,
+            ndwi_da=ndwi_da,
+            ndwi_threshold=config.ndwi_threshold,
+            flowlines_buffer_m=config.flowlines_buffer_m,
+        )
+    rem_da = compute.compute_rem_edt_smooth(
+        dem_da, streams, sigma=config.rem_smooth_sigma
+    )
+    fields = io.load_and_clip_fields(config.fields_path, aoi_gdf, dem_crs)
+    fields_stats = compute.compute_field_rem_stats(fields, rem_da, stats=("mean",))
+
+    elapsed = time.monotonic() - t0
+
+    # --- write outputs ---
+    rem_da.rio.to_raster(os.path.join(run_dir, "rem_bounds.tif"))
+    streams.rio.to_raster(os.path.join(run_dir, "streams_bounds.tif"))
+    if "FID" in fields_stats.columns:
+        fields_stats = fields_stats.rename(columns={"FID": "FID_"})
+    fields_stats.to_file(
+        os.path.join(run_dir, "fields_bounds.fgb"), driver="FlatGeobuf"
+    )
+
+    # --- write run.json ---
+    rem_means = fields_stats["rem_mean"].dropna()
+    summary = {
+        "n_stream_cells": int(np.asarray(streams.data).astype(bool).sum()),
+        "n_fields": len(fields_stats),
+        "rem_mean_stats": {
+            "min": round(float(rem_means.min()), 2) if len(rem_means) else None,
+            "mean": round(float(rem_means.mean()), 2) if len(rem_means) else None,
+            "median": round(float(rem_means.median()), 2) if len(rem_means) else None,
+            "max": round(float(rem_means.max()), 2) if len(rem_means) else None,
+        },
+    }
+    if config.rem_propagate_mask:
+        summary["n_seed_features"] = streams.attrs.get("propagation_n_seeds")
+        summary["n_confirmed_features"] = streams.attrs.get("propagation_n_confirmed")
+        summary["n_propagated_features"] = streams.attrs.get("propagation_n_propagated")
+
+    import subprocess
+
+    try:
+        git_hash = (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
+    except Exception:
+        git_hash = None
+
+    run_meta = {
+        "experiment_id": experiment_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "git_commit": git_hash,
+        "notes": notes,
+        "parameters": {
+            "ndwi_threshold": config.ndwi_threshold,
+            "flowlines_buffer_m": config.flowlines_buffer_m,
+            "rem_smooth_sigma": config.rem_smooth_sigma,
+            "rem_excluded_fcodes": sorted(excluded),
+            "rem_propagate_mask": config.rem_propagate_mask,
+            "rem_propagate_hops": config.rem_propagate_hops,
+        },
+        "timing_s": round(elapsed, 1),
+        "summary": summary,
+    }
+    with open(os.path.join(run_dir, "run.json"), "w") as f:
+        json.dump(run_meta, f, indent=2)
+
+    LOGGER.info("Experiment %s complete (%.1fs)", experiment_id, elapsed)
+    logging.getLogger().removeHandler(run_log)
+    run_log.close()
+    return {
+        "experiment_id": experiment_id,
+        "run_dir": run_dir,
+        "timing_s": round(elapsed, 1),
+        "summary": summary,
+    }

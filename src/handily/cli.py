@@ -57,7 +57,7 @@ def main(argv=None):
         "--flowlines-buffer",
         type=float,
         default=None,
-        help="Buffer NHD flowlines by this many meters before AND with NDWI",
+        help="Buffer NHD flowlines by this many meters before AND with NDWI (default: from config)",
     )
     p_bounds.add_argument(
         "--out-dir", required=True, help="Output directory for results"
@@ -189,7 +189,7 @@ def main(argv=None):
         "--flowlines-buffer",
         type=float,
         default=None,
-        help="Buffer NHD flowlines by this many meters before AND with NDWI",
+        help="Buffer NHD flowlines by this many meters before AND with NDWI (default: from config)",
     )
     p_rem_batch.add_argument(
         "--overwrite",
@@ -212,6 +212,55 @@ def main(argv=None):
         type=int,
         default=None,
         help="Only process these aoi_id values (e.g. --aoi-ids 7 8 9 10)",
+    )
+
+    p_rem_exp = rem_sub.add_parser(
+        "experiment", help="Run a single REM parameter experiment"
+    )
+    p_rem_exp.add_argument(
+        "--experiment-dir",
+        required=True,
+        help="Experiment root directory containing dem_bounds_1m.tif and flowlines_bounds.fgb",
+    )
+    p_rem_exp.add_argument("--config", required=True, help="TOML config path")
+    p_rem_exp.add_argument(
+        "--notes", required=True, help="Description of this experiment run"
+    )
+    p_rem_exp.add_argument(
+        "--id",
+        default=None,
+        help="Experiment ID (e.g. E5); auto-incremented if omitted",
+    )
+    p_rem_exp.add_argument(
+        "--ndwi-threshold", type=float, default=None, help="Override ndwi_threshold"
+    )
+    p_rem_exp.add_argument(
+        "--flowlines-buffer",
+        type=float,
+        default=None,
+        help="Override flowlines_buffer_m",
+    )
+    p_rem_exp.add_argument(
+        "--rem-smooth-sigma", type=float, default=None, help="Override rem_smooth_sigma"
+    )
+    p_rem_exp.add_argument(
+        "--rem-excluded-fcodes",
+        nargs="*",
+        type=int,
+        default=None,
+        help="Override excluded FCODEs (e.g. --rem-excluded-fcodes 33601 46003)",
+    )
+    p_rem_exp.add_argument(
+        "--propagate-mask",
+        action="store_true",
+        default=None,
+        help="Use network-propagated stream mask (BFS from NDWI-confirmed NHD segments)",
+    )
+    p_rem_exp.add_argument(
+        "--propagate-hops",
+        type=int,
+        default=None,
+        help="Max BFS hops from NDWI seeds (default: unlimited)",
     )
 
     p_nhd = sub.add_parser("nhd", help="NHD flowline preprocessing")
@@ -390,12 +439,17 @@ def main(argv=None):
         )
 
         aoi = aoi_from_bounds(tuple(args.bounds))
+        buf = (
+            args.flowlines_buffer
+            if args.flowlines_buffer is not None
+            else config.flowlines_buffer_m
+        )
         workflow = REMWorkflow(config=config, aoi=aoi)
         results = workflow.run(
             ndwi_threshold=float(args.ndwi_threshold),
             stats=("mean",),
             cache_flowlines=True,
-            flowlines_buffer_m=args.flowlines_buffer,
+            flowlines_buffer_m=buf,
         )
 
         # Persist QA rasters
@@ -405,7 +459,9 @@ def main(argv=None):
         results["streams"].rio.to_raster(streams_path)
         # Persist QA vectors
         fields_fgb = os.path.join(args.out_dir, "fields_bounds.fgb")
-        fields = results.get("fields_stats") or results["fields"]
+        fields = results.get("fields_stats")
+        if fields is None:
+            fields = results["fields"]
         if "FID" in fields.columns:
             fields = fields.rename(columns={"FID": "FID_"})
         fields.to_file(fields_fgb, driver="FlatGeobuf")
@@ -470,6 +526,47 @@ def main(argv=None):
     if args.cmd == "rem":
         import geopandas as gpd
         from handily.config import HandilyConfig
+
+        if args.rem_cmd == "experiment":
+            import dataclasses as _dc
+            from handily.pipeline import run_experiment
+
+            config = HandilyConfig.from_toml(args.config)
+            overrides = {}
+            if args.ndwi_threshold is not None:
+                overrides["ndwi_threshold"] = args.ndwi_threshold
+            if args.flowlines_buffer is not None:
+                overrides["flowlines_buffer_m"] = args.flowlines_buffer
+            if args.rem_smooth_sigma is not None:
+                overrides["rem_smooth_sigma"] = args.rem_smooth_sigma
+            if args.rem_excluded_fcodes is not None:
+                overrides["rem_excluded_fcodes"] = args.rem_excluded_fcodes
+            if args.propagate_mask is not None:
+                overrides["rem_propagate_mask"] = args.propagate_mask
+            if args.propagate_hops is not None:
+                overrides["rem_propagate_hops"] = args.propagate_hops
+            if overrides:
+                config = _dc.replace(config, **overrides)
+
+            result = run_experiment(
+                experiment_dir=os.path.expanduser(args.experiment_dir),
+                config=config,
+                notes=args.notes,
+                experiment_id=args.id,
+            )
+            print(f"--- Experiment {result['experiment_id']} ---")
+            print(f"Directory: {result['run_dir']}")
+            print(f"Time: {result['timing_s']:.1f}s")
+            s = result["summary"]
+            print(f"Stream cells: {s['n_stream_cells']}")
+            print(f"Fields: {s['n_fields']}")
+            r = s["rem_mean_stats"]
+            print(
+                f"REM mean: min={r['min']:.2f} mean={r['mean']:.2f}"
+                f" median={r['median']:.2f} max={r['max']:.2f}"
+            )
+            return 0
+
         from handily.pipeline import batch_fetch_dem, batch_run_rem
 
         config = HandilyConfig.from_toml(args.config)
@@ -506,12 +603,17 @@ def main(argv=None):
                     print(f"  ERROR aoi_{r['aoi_id']:04d}: {r.get('error')}")
             return 0
 
+        buf = (
+            args.flowlines_buffer
+            if args.flowlines_buffer is not None
+            else config.flowlines_buffer_m
+        )
         results = batch_run_rem(
             aoi_gdf=aoi_gdf,
             config=config,
             out_root=os.path.expanduser(args.out_root),
             ndwi_threshold=float(args.ndwi_threshold),
-            flowlines_buffer_m=args.flowlines_buffer,
+            flowlines_buffer_m=buf,
             overwrite=args.overwrite,
         )
         done = sum(1 for r in results if r["status"] == "done")
