@@ -214,7 +214,7 @@ def build_state_flowlines(nhd_dir: str, out_path: str | None = None) -> str:
     """Merge all NHDFlowline shapefiles in a state directory, filter to relevant FCODEs,
     and write a single spatial-indexed FlatGeobuf.
 
-    Drops coastlines (55800) and pipelines (42xxx) — only keeps features that map to a
+    Drops pipelines (42xxx) and other unmapped FCODEs — only keeps features that map to a
     non-None category in ``nhd.FCODE_CATEGORIES`` (perennial, intermittent, managed).
 
     Parameters
