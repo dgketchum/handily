@@ -5,6 +5,7 @@ Maps NHD FCODE values to stream categories for stratification:
 - intermittent: intermittent or ephemeral streams
 - managed: canals, ditches, artificial paths
 """
+
 import logging
 from typing import Literal
 
@@ -25,16 +26,17 @@ FCODE_CATEGORIES = {
     46007: "intermittent",
     # Stream/River - Unknown (treat as intermittent to be conservative)
     46000: "intermittent",
-    # Canal/Ditch variants
+    # Large river centerline (NHD artificial path through NHDArea polygons)
+    55800: "perennial",
+    # Canal/Ditch variants — kept in FGB and stratification but excluded from
+    # REM stream mask (see REM_EXCLUDED_FCODES) to prevent hillside artifacts
     33400: "managed",  # Connector
     33600: "managed",  # Canal/Ditch
-    33601: "managed",  # Canal/Ditch (aqueduct)
+    33601: "managed",  # Canal/Ditch (aqueduct) — hillside canals cause false low-REM
     33602: "managed",  # Canal/Ditch (stormwater)
     33603: "managed",  # Canal/Ditch (irrigation)
     # Artificial Path (through lakes/reservoirs)
     46800: "managed",
-    # Coastline - exclude from stream classification
-    55800: None,
     # Pipeline variants - exclude
     42000: None,
     42001: None,
@@ -51,6 +53,12 @@ FCODE_CATEGORIES = {
     42813: None,
     42816: None,
 }
+
+# FCODEs to exclude from the REM stream mask only (still kept in FGB and stratification).
+# Hillside canals (33601) traverse slope contours and cause false near-zero REM patches
+# on adjacent hillside pixels. They are retained for DTW modeling via the FGB.
+# Intermittent streams (46003) are kept and filtered by network connectivity instead.
+REM_EXCLUDED_FCODES: frozenset[int] = frozenset({33601})
 
 StreamCategory = Literal["perennial", "intermittent", "managed"]
 
@@ -89,8 +97,10 @@ def classify_flowlines(
     if fcode_col is None:
         fcode_col = get_fcode_column(flowlines)
         if fcode_col is None:
-            raise ValueError("FCODE column not found in flowlines. Available columns: "
-                           f"{list(flowlines.columns)}")
+            raise ValueError(
+                "FCODE column not found in flowlines. Available columns: "
+                f"{list(flowlines.columns)}"
+            )
 
     df = flowlines.copy()
 
@@ -98,9 +108,13 @@ def classify_flowlines(
     df["stream_category"] = df[fcode_col].map(FCODE_CATEGORIES)
 
     # Log unmapped codes
-    unmapped = df[df["stream_category"].isna() & df[fcode_col].notna()][fcode_col].unique()
+    unmapped = df[df["stream_category"].isna() & df[fcode_col].notna()][
+        fcode_col
+    ].unique()
     if len(unmapped) > 0:
-        LOGGER.warning("Unmapped FCODE values (will be excluded): %s", unmapped.tolist())
+        LOGGER.warning(
+            "Unmapped FCODE values (will be excluded): %s", unmapped.tolist()
+        )
 
     counts = df["stream_category"].value_counts(dropna=False)
     LOGGER.info("Flowline classification: %s", counts.to_dict())
@@ -135,8 +149,12 @@ def filter_flowlines_for_stratification(
     mask = flowlines["stream_category"].isin(include_categories)
     filtered = flowlines[mask].copy()
 
-    LOGGER.info("Filtered flowlines: %d -> %d (categories: %s)",
-                len(flowlines), len(filtered), include_categories)
+    LOGGER.info(
+        "Filtered flowlines: %d -> %d (categories: %s)",
+        len(flowlines),
+        len(filtered),
+        include_categories,
+    )
 
     return filtered.reset_index(drop=True)
 
