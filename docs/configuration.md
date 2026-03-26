@@ -87,13 +87,13 @@ Required keys:
 ```toml
 project_name = "beaverhead"
 bucket_prefix = "handily"
-local_data_root = "~/data/IrrigationGIS/handily"
+local_data_root = "/nas/handily"
 
-fields_path = "~/data/IrrigationGIS/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp"
-flowlines_local_dir = "~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape"
-ndwi_dir = "~/data/IrrigationGIS/handily/ndwi/beaverhead/"
-stac_dir = "~/data/IrrigationGIS/handily/stac/3dep_1m/"
-out_dir = "~/data/IrrigationGIS/handily/handily/beaverhead/outputs/"
+fields_path = "/nas/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp"
+flowlines_local_dir = "/nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape"
+ndwi_dir = "/nas/handily/ndwi/beaverhead/"
+stac_dir = "/nas/handily/stac/3dep_1m/"
+out_dir = "/nas/handily/handily/beaverhead/outputs/"
 bounds = [-112.418, 45.445, -112.353, 45.49]
 feature_id = "FID"
 ```

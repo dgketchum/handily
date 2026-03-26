@@ -33,14 +33,14 @@ includes STAC build tooling, AOI tiling, bucket mirroring, and QGIS integration.
 ## Canonical Sequence
 
 ```bash
-handily stac build --out-dir ~/data/IrrigationGIS/handily/stac/3dep_1m --states MT
+handily stac build --out-dir /nas/handily/stac/3dep_1m --states MT
 handily bounds \
   --bounds -112.418 45.445 -112.353 45.49 \
-  --fields ~/data/IrrigationGIS/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp \
-  --ndwi-dir ~/data/IrrigationGIS/handily/ndwi/beaverhead \
-  --flowlines-local-dir ~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape \
-  --stac-dir ~/data/IrrigationGIS/handily/stac/3dep_1m \
-  --out-dir ~/data/IrrigationGIS/handily/handily/beaverhead/outputs
+  --fields /nas/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp \
+  --ndwi-dir /nas/handily/ndwi/beaverhead \
+  --flowlines-local-dir /nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape \
+  --stac-dir /nas/handily/stac/3dep_1m \
+  --out-dir /nas/handily/handily/beaverhead/outputs
 
 handily met download --config examples/beaverhead/beaverhead_config.toml
 handily et export --config examples/beaverhead/beaverhead_config.toml

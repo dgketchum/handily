@@ -6,23 +6,27 @@ Assigns strata to fields based on:
 
 Output: fields GeoDataFrame with 'partitioned' (bool) and 'strata' (str) columns.
 """
+
 import logging
 from typing import Literal
 
 import geopandas as gpd
-import numpy as np
 import xarray as xr
 
 from handily.compute import compute_field_rem_stats, stratify_fields_by_rem
-from handily.nhd import assign_nearest_stream_type, classify_flowlines, filter_flowlines_for_stratification
+from handily.nhd import (
+    assign_nearest_stream_type,
+    classify_flowlines,
+    filter_flowlines_for_stratification,
+)
 
 LOGGER = logging.getLogger("handily.stratify")
 
 StrataType = Literal[
-    "perennial",      # partitioned, nearest stream is perennial
-    "intermittent",   # partitioned, nearest stream is intermittent
-    "managed",        # partitioned, nearest stream is managed (canal/ditch)
-    "non_partitioned", # REM >= threshold, outside shallow GW area
+    "perennial",  # partitioned, nearest stream is perennial
+    "intermittent",  # partitioned, nearest stream is intermittent
+    "managed",  # partitioned, nearest stream is managed (canal/ditch)
+    "non_partitioned",  # REM >= threshold, outside shallow GW area
 ]
 
 
@@ -48,9 +52,13 @@ def assign_strata(
         Fields with added 'strata' column.
     """
     if partitioned_col not in fields.columns:
-        raise ValueError(f"'{partitioned_col}' column not found. Run REM stratification first.")
+        raise ValueError(
+            f"'{partitioned_col}' column not found. Run REM stratification first."
+        )
     if stream_type_col not in fields.columns:
-        raise ValueError(f"'{stream_type_col}' column not found. Run stream type assignment first.")
+        raise ValueError(
+            f"'{stream_type_col}' column not found. Run stream type assignment first."
+        )
 
     df = fields.copy()
 
@@ -122,8 +130,11 @@ def stratify(
         - strata (str): final strata assignment
     """
     LOGGER.info("Starting stratification workflow")
-    LOGGER.info("REM threshold: %.1f m, max_stream_distance: %s",
-                rem_threshold, max_stream_distance)
+    LOGGER.info(
+        "REM threshold: %.1f m, max_stream_distance: %s",
+        rem_threshold,
+        max_stream_distance,
+    )
 
     # Step 1: Compute REM statistics (skip if already present)
     if "rem_mean" in fields.columns:
@@ -138,9 +149,14 @@ def stratify(
     LOGGER.info("Step 2: Applying REM threshold (%.1f m)", rem_threshold)
     fields_partitioned = stratify_fields_by_rem(fields_stats, threshold_m=rem_threshold)
     n_partitioned = fields_partitioned["partitioned"].sum()
-    LOGGER.info("Partitioned: %d / %d (%.1f%%)",
-                n_partitioned, len(fields_partitioned),
-                100 * n_partitioned / len(fields_partitioned) if len(fields_partitioned) > 0 else 0)
+    LOGGER.info(
+        "Partitioned: %d / %d (%.1f%%)",
+        n_partitioned,
+        len(fields_partitioned),
+        100 * n_partitioned / len(fields_partitioned)
+        if len(fields_partitioned) > 0
+        else 0,
+    )
 
     # Step 3: Classify flowlines
     LOGGER.info("Step 3: Classifying flowlines by stream category")

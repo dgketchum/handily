@@ -2,7 +2,7 @@
 
 ## Summary
 
-Create 5 Jupyter notebooks that introduce new users to irrigation water balance estimation using the handily framework. Move existing beaverhead example into `examples/beaverhead/` subdirectory to make space for notebooks and future examples.
+Create 6 Jupyter notebooks that introduce new users to irrigation water balance estimation using the handily framework. Move existing beaverhead example into `examples/beaverhead/` subdirectory to make space for notebooks and future examples.
 
 ## Directory Structure
 
@@ -23,9 +23,10 @@ examples/
 └── notebooks/
     ├── 01_introduction.ipynb          # Overview and setup
     ├── 02_terrain_analysis.ipynb      # REM workflow
-    ├── 03_field_classification.ipynb  # Stratification + IrrMapper + Pattern
-    ├── 04_climate_and_et.ipynb        # GridMET + PT-JPL
-    └── 05_et_partitioning.ipynb       # Final partitioning
+    ├── 03_points_samplling.ipynb      # AOI point sampling
+    ├── 04_field_classification.ipynb  # Stratification + IrrMapper + Pattern
+    ├── 05_climate_and_et.ipynb        # GridMET + PT-JPL
+    └── 06_et_partitioning.ipynb       # Final partitioning
 ```
 
 ## Files to Modify/Create
@@ -39,9 +40,10 @@ examples/
 | `examples/README.md` | **Modify** - Update paths, add notebook descriptions |
 | `examples/notebooks/01_introduction.ipynb` | **Create** |
 | `examples/notebooks/02_terrain_analysis.ipynb` | **Create** |
-| `examples/notebooks/03_field_classification.ipynb` | **Create** |
-| `examples/notebooks/04_climate_and_et.ipynb` | **Create** |
-| `examples/notebooks/05_et_partitioning.ipynb` | **Create** |
+| `examples/notebooks/03_points_samplling.ipynb` | **Create** |
+| `examples/notebooks/04_field_classification.ipynb` | **Create** |
+| `examples/notebooks/05_climate_and_et.ipynb` | **Create** |
+| `examples/notebooks/06_et_partitioning.ipynb` | **Create** |
 
 ---
 

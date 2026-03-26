@@ -5,15 +5,13 @@ handily output layers without requiring PyQGIS.
 
 Approach: Manipulate .qgz files directly using zipfile + xml.etree.ElementTree.
 """
+
 from __future__ import annotations
 
 import logging
 import os
 import shutil
-import tempfile
 import uuid
-import zipfile
-from pathlib import Path
 from xml.etree import ElementTree as ET
 
 LOGGER = logging.getLogger("handily.qgis")
@@ -60,19 +58,23 @@ def discover_outputs(out_dir: str, view_root: str | None = None) -> list[dict]:
             abs_path = _remap_path_for_view(abs_path, view_root)
 
         if ext in RASTER_EXTENSIONS:
-            layers.append({
-                "name": name,
-                "path": abs_path,
-                "type": "raster",
-                "category": "Rasters",
-            })
+            layers.append(
+                {
+                    "name": name,
+                    "path": abs_path,
+                    "type": "raster",
+                    "category": "Rasters",
+                }
+            )
         elif ext in VECTOR_EXTENSIONS:
-            layers.append({
-                "name": name,
-                "path": abs_path,
-                "type": "vector",
-                "category": "Vectors",
-            })
+            layers.append(
+                {
+                    "name": name,
+                    "path": abs_path,
+                    "type": "vector",
+                    "category": "Vectors",
+                }
+            )
 
     # Sort by category then name
     layers.sort(key=lambda x: (x["category"], x["name"]))
@@ -89,7 +91,7 @@ def _remap_path_for_view(path: str, view_root: str) -> str:
     home = os.path.expanduser("~")
     if path.startswith(home):
         # Replace home with view_root
-        relative = path[len(home):]
+        relative = path[len(home) :]
         if relative.startswith("/"):
             relative = relative[1:]
         return os.path.join(view_root, relative)
@@ -129,7 +131,9 @@ def update_project(project_path: str, layers: list[dict], group_name: str) -> No
     LOGGER.info("Updated project: %s (backup: %s)", project_path, backup_path)
 
 
-def _update_project_layers(root: ET.Element, layers: list[dict], group_name: str) -> None:
+def _update_project_layers(
+    root: ET.Element, layers: list[dict], group_name: str
+) -> None:
     """Update QGIS project XML with new layers."""
     # Get or create projectlayers element
     projectlayers = root.find("projectlayers")
@@ -204,7 +208,9 @@ def _update_project_layers(root: ET.Element, layers: list[dict], group_name: str
             layer_tree_elem.set("checked", "Qt::Checked")
             layer_tree_elem.set("expanded", "0")
             layer_tree_elem.set("source", layer["path"])
-            layer_tree_elem.set("providerKey", "gdal" if layer["type"] == "raster" else "ogr")
+            layer_tree_elem.set(
+                "providerKey", "gdal" if layer["type"] == "raster" else "ogr"
+            )
 
 
 def _add_or_update_layer(projectlayers: ET.Element, layer: dict) -> str:
@@ -293,8 +299,9 @@ def _configure_vector_layer(maplayer: ET.Element, layer: dict, layer_id: str) ->
         _add_simple_line_renderer(maplayer, color="0,100,200,255")
 
 
-def _add_raster_pseudocolor(maplayer: ET.Element, vmin: float, vmax: float,
-                            colormap: str = "Spectral") -> None:
+def _add_raster_pseudocolor(
+    maplayer: ET.Element, vmin: float, vmax: float, colormap: str = "Spectral"
+) -> None:
     """Add a pseudocolor raster renderer."""
     pipe = ET.SubElement(maplayer, "pipe")
     renderer = ET.SubElement(pipe, "rasterrenderer")
@@ -454,7 +461,9 @@ def open_project(project_path: str) -> None:
                 return
             except FileNotFoundError:
                 continue
-        raise FileNotFoundError("QGIS executable not found. Install QGIS or add it to PATH.")
+        raise FileNotFoundError(
+            "QGIS executable not found. Install QGIS or add it to PATH."
+        )
 
     elif system == "Darwin":
         # macOS
@@ -464,9 +473,9 @@ def open_project(project_path: str) -> None:
     elif system == "Windows":
         # Windows - try to find QGIS
         import winreg
+
         try:
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                                 r"SOFTWARE\QGIS 3")
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\QGIS 3")
             qgis_path, _ = winreg.QueryValueEx(key, "InstallPath")
             qgis_exe = os.path.join(qgis_path, "bin", "qgis-ltr-bin.exe")
             if not os.path.exists(qgis_exe):

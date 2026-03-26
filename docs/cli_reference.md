@@ -151,7 +151,7 @@ Discover outputs in `out_dir` and add them into an existing `.qgs` project.
 ```bash
 handily qgis update \
   --config examples/beaverhead/beaverhead_config.toml \
-  --project ~/data/IrrigationGIS/handily_debug.qgs
+  --project /nas/handily_debug.qgs
 ```
 
 Notes:
@@ -174,20 +174,20 @@ Writes:
 Open QGIS with a project path.
 
 ```bash
-handily qgis open --project ~/data/IrrigationGIS/handily_debug.qgz
+handily qgis open --project /nas/handily_debug.qgz
 ```
 
 ## Beaverhead Sequence
 
 ```bash
-handily stac build --out-dir ~/data/IrrigationGIS/handily/stac/3dep_1m --states MT
+handily stac build --out-dir /nas/handily/stac/3dep_1m --states MT
 handily bounds \
   --bounds -112.418 45.445 -112.353 45.49 \
-  --fields ~/data/IrrigationGIS/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp \
-  --ndwi-dir ~/data/IrrigationGIS/handily/ndwi/beaverhead \
-  --flowlines-local-dir ~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape \
-  --stac-dir ~/data/IrrigationGIS/handily/stac/3dep_1m \
-  --out-dir ~/data/IrrigationGIS/handily/handily/beaverhead/outputs
+  --fields /nas/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp \
+  --ndwi-dir /nas/handily/ndwi/beaverhead \
+  --flowlines-local-dir /nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape \
+  --stac-dir /nas/handily/stac/3dep_1m \
+  --out-dir /nas/handily/handily/beaverhead/outputs
 
 python examples/beaverhead/beaverhead.py --step stratify examples/beaverhead/beaverhead_config.toml
 python examples/beaverhead/beaverhead.py --step pattern examples/beaverhead/beaverhead_config.toml

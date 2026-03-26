@@ -92,7 +92,7 @@ The intended mirrored layout is:
 Example:
 
 ```text
-~/data/IrrigationGIS/handily/handily/beaverhead/irrmapper/
+/nas/handily/handily/beaverhead/irrmapper/
 ```
 
 PT-JPL export tables are an exception. They are written by Earth Engine under:

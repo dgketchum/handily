@@ -3,10 +3,11 @@
 The local filesystem mirrors the bucket structure:
     gs://wudr/handily/beaverhead/irrmapper/...
     ->
-    ~/data/IrrigationGIS/handily/handily/beaverhead/irrmapper/...
+    /nas/handily/handily/beaverhead/irrmapper/...
 
 This allows consistent paths between bucket exports and local processing.
 """
+
 import fnmatch
 import logging
 import os
@@ -16,7 +17,7 @@ LOGGER = logging.getLogger("handily.bucket")
 
 # Default bucket and local root
 DEFAULT_BUCKET = "wudr"
-DEFAULT_LOCAL_ROOT = "~/data/IrrigationGIS/handily"
+DEFAULT_LOCAL_ROOT = "/nas/handily"
 DEFAULT_BUCKET_PREFIX = "handily"
 
 
@@ -25,7 +26,6 @@ def get_gsutil_path() -> str:
     # Try common locations
     candidates = [
         "gsutil",
-        "/home/dgketchum/google-cloud-sdk/bin/gsutil",
         os.path.expanduser("~/google-cloud-sdk/bin/gsutil"),
     ]
     for cmd in candidates:
@@ -166,21 +166,31 @@ def sync_bucket_to_local(
             rel = remote_path
             if remote_path.startswith(bucket_path):
                 rel = remote_path[len(bucket_path) :]
-            if fnmatch.fnmatch(os.path.basename(rel), glob_pattern) or fnmatch.fnmatch(rel, glob_pattern):
+            if fnmatch.fnmatch(os.path.basename(rel), glob_pattern) or fnmatch.fnmatch(
+                rel, glob_pattern
+            ):
                 filtered.append(remote_path)
         files = filtered
 
     if dry_run:
         LOGGER.info("Dry run - would copy %d files:", len(files))
         for f in files:
-            rel = f[len(bucket_path) :] if f.startswith(bucket_path) else os.path.basename(f)
+            rel = (
+                f[len(bucket_path) :]
+                if f.startswith(bucket_path)
+                else os.path.basename(f)
+            )
             print(f"  {f} -> {os.path.join(local_dir, rel)}")
         return {"copied": 0, "skipped": 0, "errors": 0, "files": files}
 
     copied, skipped, errors = 0, 0, 0
     local_files: list[str] = []
     for file_path in files:
-        rel = file_path[len(bucket_path) :] if file_path.startswith(bucket_path) else os.path.basename(file_path)
+        rel = (
+            file_path[len(bucket_path) :]
+            if file_path.startswith(bucket_path)
+            else os.path.basename(file_path)
+        )
         local_path = os.path.join(local_dir, rel)
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
@@ -200,8 +210,15 @@ def sync_bucket_to_local(
             errors += 1
             LOGGER.warning("Failed to copy %s: %s", file_path, result.stderr.strip())
 
-    LOGGER.info("Sync complete: copied=%d, skipped=%d, errors=%d", copied, skipped, errors)
-    return {"copied": copied, "skipped": skipped, "errors": errors, "files": local_files}
+    LOGGER.info(
+        "Sync complete: copied=%d, skipped=%d, errors=%d", copied, skipped, errors
+    )
+    return {
+        "copied": copied,
+        "skipped": skipped,
+        "errors": errors,
+        "files": local_files,
+    }
 
 
 def build_bucket_path(

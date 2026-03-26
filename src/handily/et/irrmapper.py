@@ -3,9 +3,9 @@
 Exports per-field annual irrigation fraction using the IrrMapper dataset.
 Based on swim-rs/src/swimrs/data_extraction/ee/ee_props.py pattern.
 """
+
 import logging
 import os
-from pathlib import Path
 
 import ee
 import geopandas as gpd
@@ -119,8 +119,12 @@ def as_ee_feature_collection(
 
     # GeoDataFrame - convert directly
     if isinstance(fields, gpd.GeoDataFrame):
-        LOGGER.info("Converting GeoDataFrame (%d features) to EE FeatureCollection", len(fields))
-        return gdf_to_ee_feature_collection(fields, feature_id=feature_id, keep_props=keep_props)
+        LOGGER.info(
+            "Converting GeoDataFrame (%d features) to EE FeatureCollection", len(fields)
+        )
+        return gdf_to_ee_feature_collection(
+            fields, feature_id=feature_id, keep_props=keep_props
+        )
 
     # String input
     if isinstance(fields, str):
@@ -133,7 +137,9 @@ def as_ee_feature_collection(
         if os.path.exists(fields):
             LOGGER.info("Loading local file: %s", fields)
             gdf = gpd.read_file(fields)
-            return gdf_to_ee_feature_collection(gdf, feature_id=feature_id, keep_props=keep_props)
+            return gdf_to_ee_feature_collection(
+                gdf, feature_id=feature_id, keep_props=keep_props
+            )
 
         # Assume it's an EE asset path that doesn't start with projects/users
         return ee.FeatureCollection(fields)
