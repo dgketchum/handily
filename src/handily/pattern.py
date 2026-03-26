@@ -10,12 +10,11 @@ Workflow:
 3. Identify pattern candidates based on low irrigation frequency
 4. Assign 'pattern' column to fields
 """
+
 import logging
 import os
-from pathlib import Path
 
 import geopandas as gpd
-import pandas as pd
 
 from handily.et.irrmapper import (
     export_irrigation_frequency,
@@ -82,14 +81,22 @@ def assign_pattern_from_irrmapper(
             # FlatGeobuf renames FID to FID_ to avoid OGR reserved column
             fields = fields.rename(columns={f"{feature_id}_": feature_id})
         else:
-            raise KeyError(f"Feature ID column '{feature_id}' not found in fields. Available: {list(fields.columns)}")
+            raise KeyError(
+                f"Feature ID column '{feature_id}' not found in fields. Available: {list(fields.columns)}"
+            )
 
     # Ensure feature_id types match
     fields[feature_id] = fields[feature_id].astype(str)
     irr_with_patterns[feature_id] = irr_with_patterns[feature_id].astype(str)
 
     # Select columns to join
-    join_cols = [feature_id, "irr_mean", "irr_freq", "pattern_candidate", "pattern_evidence"]
+    join_cols = [
+        feature_id,
+        "irr_mean",
+        "irr_freq",
+        "pattern_candidate",
+        "pattern_evidence",
+    ]
     join_df = irr_with_patterns[join_cols]
 
     # Merge
@@ -144,7 +151,9 @@ def assign_pattern_by_strata(
     if pattern_col not in fields.columns:
         raise ValueError(f"'{pattern_col}' column not found")
     if "irr_freq" not in fields.columns:
-        LOGGER.warning("'irr_freq' column not found; cannot promote additional patterns")
+        LOGGER.warning(
+            "'irr_freq' column not found; cannot promote additional patterns"
+        )
         return fields
 
     df = fields.copy()
@@ -259,7 +268,9 @@ def pattern_workflow(
 
     elif ee_asset:
         LOGGER.info("Starting IrrMapper export from EE asset: %s", ee_asset)
-        LOGGER.warning("Export is async. Re-run with irrmapper_csv path after export completes.")
+        LOGGER.warning(
+            "Export is async. Re-run with irrmapper_csv path after export completes."
+        )
 
         export_irrigation_frequency(
             fields=ee_asset,

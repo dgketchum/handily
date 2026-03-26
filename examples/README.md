@@ -12,9 +12,10 @@ examples/
 │   ├── beaverhead_config.toml         # Configuration file
 │   ├── 01_introduction.ipynb          # Overview and setup
 │   ├── 02_terrain_analysis.ipynb      # REM workflow
-│   ├── 03_field_classification.ipynb  # Stratification + IrrMapper + Pattern
-│   ├── 04_climate_and_et.ipynb        # GridMET + PT-JPL
-│   └── 05_et_partitioning.ipynb       # Final partitioning
+│   ├── 03_points_samplling.ipynb      # AOI point sampling for donor discovery
+│   ├── 04_field_classification.ipynb  # Stratification + IrrMapper + Pattern
+│   ├── 05_climate_and_et.ipynb        # GridMET + PT-JPL
+│   └── 06_et_partitioning.ipynb       # Final partitioning
 └── data/                              # Sample data for notebooks
     └── (bundled sample datasets)
 ```
@@ -42,7 +43,15 @@ Explains how terrain data identifies fields influenced by shallow groundwater:
 - Computing the REM
 - Field statistics and visualization
 
-### 03 - Field Classification: Stratification and Pattern Selection
+### 03 - Points Sampling: AOI Donor Discovery
+
+Introduces the new point-based discovery unit used for donor screening:
+- AOI-scoped point sampling
+- Riparian and low-REM oversampling
+- High-REM control points
+- Initial point outputs for later modeling
+
+### 04 - Field Classification: Stratification and Pattern Selection
 
 Covers how fields are classified for ET modeling:
 - Why stratify fields by water source
@@ -51,7 +60,7 @@ Covers how fields are classified for ET modeling:
 - IrrMapper irrigation history
 - Pattern field selection criteria
 
-### 04 - Climate and ET Data: GridMET and PT-JPL
+### 05 - Climate and ET Data: GridMET and PT-JPL
 
 Demonstrates how climate and remote sensing data are combined:
 - Reference ET concepts
@@ -60,7 +69,7 @@ Demonstrates how climate and remote sensing data are combined:
 - Understanding ET fraction
 - Joining climate + ET data
 
-### 05 - ET Partitioning: Separating Irrigation from Groundwater
+### 06 - ET Partitioning: Separating Irrigation from Groundwater
 
 Explains the final step of separating applied irrigation from natural water sources:
 - The partitioning problem
@@ -105,12 +114,12 @@ Build a local 3DEP 1m STAC catalog for efficient DEM access:
 ```bash
 # Build new catalog for specific states
 handily stac build \
-    --out-dir ~/data/IrrigationGIS/handily/stac/3dep_1m/ \
+    --out-dir /nas/handily/stac/3dep_1m/ \
     --states MT ID WY
 
 # Extend existing catalog with more states
 handily stac extend \
-    --out-dir ~/data/IrrigationGIS/handily/stac/3dep_1m/ \
+    --out-dir /nas/handily/stac/3dep_1m/ \
     --states WA OR
 ```
 
@@ -120,8 +129,8 @@ Generate processing tiles from field boundaries:
 
 ```bash
 handily aoi \
-    --fields ~/data/IrrigationGIS/Montana/statewide_irrigation_dataset.shp \
-    --out-shp ~/data/IrrigationGIS/handily/aoi_tiles.shp \
+    --fields /nas/Montana/statewide_irrigation_dataset.shp \
+    --out-shp /nas/handily/aoi_tiles.shp \
     --max-km2 625 \
     --buffer-m 1000 \
     --bounds -112.5 45.0 -112.0 45.5
@@ -134,12 +143,12 @@ Build Relative Elevation Model for a bounding box:
 ```bash
 handily bounds \
     --bounds -112.418 45.445 -112.353 45.49 \
-    --fields ~/data/IrrigationGIS/Montana/statewide_irrigation_dataset.shp \
-    --ndwi-dir ~/data/IrrigationGIS/handily/ndwi/beaverhead/ \
-    --flowlines-local-dir ~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape \
-    --stac-dir ~/data/IrrigationGIS/handily/stac/3dep_1m/ \
+    --fields /nas/Montana/statewide_irrigation_dataset.shp \
+    --ndwi-dir /nas/handily/ndwi/beaverhead/ \
+    --flowlines-local-dir /nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape \
+    --stac-dir /nas/handily/stac/3dep_1m/ \
     --ndwi-threshold 0.45 \
-    --out-dir ~/data/IrrigationGIS/handily/outputs/
+    --out-dir /nas/handily/outputs/
 ```
 
 ### 4. Meteorology (GridMET)
@@ -199,14 +208,14 @@ Update QGIS project with output layers:
 # Update existing project with layers from config
 handily qgis update \
     --config examples/beaverhead/beaverhead_config.toml \
-    --project ~/data/IrrigationGIS/handily_debug.qgz \
+    --project /nas/handily_debug.qgz \
     --group beaverhead
 
 # Generate QLR file for drag-and-drop import
 handily qgis qlr --config examples/beaverhead/beaverhead_config.toml
 
 # Open QGIS with project
-handily qgis open --project ~/data/IrrigationGIS/handily_debug.qgz
+handily qgis open --project /nas/handily_debug.qgz
 ```
 
 ---

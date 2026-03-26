@@ -6,7 +6,7 @@ TNM directly at run time.
 ## Build
 
 ```bash
-handily stac build --out-dir ~/data/IrrigationGIS/handily/stac/3dep_1m --states MT
+handily stac build --out-dir /nas/handily/stac/3dep_1m --states MT
 ```
 
 This scans TNM project metadata, creates a STAC collection, and writes a bbox index for faster AOI

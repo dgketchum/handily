@@ -21,7 +21,7 @@ Vectors:
 ```bash
 handily qgis update \
   --config examples/beaverhead/beaverhead_config.toml \
-  --project ~/data/IrrigationGIS/handily_debug.qgs
+  --project /nas/handily_debug.qgs
 ```
 
 Behavior:

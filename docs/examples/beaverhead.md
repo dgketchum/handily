@@ -11,22 +11,23 @@ where the notebooks are organized, and where the example config is maintained.
 | `examples/beaverhead/beaverhead_config.toml` | Reference config |
 | `examples/beaverhead/01_introduction.ipynb` | Intro and scope |
 | `examples/beaverhead/02_terrain_analysis.ipynb` | REM and terrain workflow |
-| `examples/beaverhead/03_field_classification.ipynb` | Stratification and pattern context |
-| `examples/beaverhead/04_climate_and_et.ipynb` | GridMET and PT-JPL join |
-| `examples/beaverhead/05_et_partitioning.ipynb` | Partition outputs |
+| `examples/beaverhead/03_points_samplling.ipynb` | AOI donor-discovery point sampling |
+| `examples/beaverhead/04_field_classification.ipynb` | Stratification and pattern context |
+| `examples/beaverhead/05_climate_and_et.ipynb` | GridMET and PT-JPL join |
+| `examples/beaverhead/06_et_partitioning.ipynb` | Partition outputs |
 
 ## Reference Sequence
 
 ```bash
-handily stac build --out-dir ~/data/IrrigationGIS/handily/stac/3dep_1m --states MT
+handily stac build --out-dir /nas/handily/stac/3dep_1m --states MT
 
 handily bounds \
   --bounds -112.418 45.445 -112.353 45.49 \
-  --fields ~/data/IrrigationGIS/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp \
-  --ndwi-dir ~/data/IrrigationGIS/handily/ndwi/beaverhead \
-  --flowlines-local-dir ~/data/IrrigationGIS/boundaries/wbd/NHD_H_Montana_State_Shape/Shape \
-  --stac-dir ~/data/IrrigationGIS/handily/stac/3dep_1m \
-  --out-dir ~/data/IrrigationGIS/handily/handily/beaverhead/outputs
+  --fields /nas/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp \
+  --ndwi-dir /nas/handily/ndwi/beaverhead \
+  --flowlines-local-dir /nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape \
+  --stac-dir /nas/handily/stac/3dep_1m \
+  --out-dir /nas/handily/handily/beaverhead/outputs
 
 python examples/beaverhead/beaverhead.py --step stratify examples/beaverhead/beaverhead_config.toml
 python examples/beaverhead/beaverhead.py --step irrmapper examples/beaverhead/beaverhead_config.toml

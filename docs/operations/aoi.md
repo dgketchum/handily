@@ -7,8 +7,8 @@ that can be processed independently.
 
 ```bash
 handily aoi \
-  --fields ~/data/IrrigationGIS/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp \
-  --out-shp ~/data/IrrigationGIS/handily/aois/beaverhead_tiles.shp \
+  --fields /nas/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp \
+  --out-shp /nas/handily/aois/beaverhead_tiles.shp \
   --max-km2 625 \
   --buffer-m 1000 \
   --bounds -112.418 45.445 -112.353 45.49
