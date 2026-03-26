@@ -39,13 +39,28 @@ class HandilyConfig:
     ee_fields_asset: str | None = None
     irrmapper_csv: str | None = None
     rem_threshold: float = 2.0
+    rem_smooth_sigma: float = (
+        50.0  # Gaussian sigma (meters) for EDT water surface smoothing
+    )
 
     # REM workflow
     run_rem: bool = True
     overwrite_outputs: bool = False
     ndwi_threshold: float = 0.15
-    flowlines_buffer_m: float | None = None  # Buffer NHD flowlines before rasterization
+    flowlines_buffer_m: float = (
+        10.0  # Buffer NHD flowlines before rasterization (meters)
+    )
+    rem_aoi_buffer_m: float = (
+        500.0  # Buffer AOI geometry before DEM fetch/REM compute (meters)
+    )
     delete_stac_cache: bool = False  # Delete raw STAC tile downloads after mosaicking
+    rem_excluded_fcodes: list[int] | None = (
+        None  # FCODEs excluded from REM stream mask; None = use nhd default
+    )
+    rem_propagate_mask: bool = (
+        False  # Use network-propagated stream mask (BFS from NDWI seeds)
+    )
+    rem_propagate_hops: int | None = None  # Max BFS hops from seeds; None = unlimited
 
     # Points sampling
     points_out_dir: str | None = None
@@ -173,11 +188,18 @@ class HandilyConfig:
             partition_pattern_col=str(data.get("partition_pattern_col", "pattern")),
             ee_fields_asset=data.get("ee_fields_asset"),
             irrmapper_csv=data.get("irrmapper_csv"),
+            rem_smooth_sigma=float(data.get("rem_smooth_sigma", 50.0)),
+            rem_aoi_buffer_m=float(data.get("rem_aoi_buffer_m", 500.0)),
+            rem_excluded_fcodes=data.get("rem_excluded_fcodes"),
+            rem_propagate_mask=bool(data.get("rem_propagate_mask", False)),
+            rem_propagate_hops=int(data.get("rem_propagate_hops"))
+            if data.get("rem_propagate_hops") is not None
+            else None,
             run_rem=bool(data.get("run_rem", True)),
             overwrite_outputs=bool(data.get("overwrite_outputs", False)),
             rem_threshold=float(data.get("rem_threshold", 2.0)),
             ndwi_threshold=float(data.get("ndwi_threshold", 0.15)),
-            flowlines_buffer_m=data.get("flowlines_buffer_m"),
+            flowlines_buffer_m=float(data.get("flowlines_buffer_m", 10.0)),
             delete_stac_cache=bool(data.get("delete_stac_cache", False)),
             points_out_dir=data.get("points_out_dir"),
             points_seed=int(data.get("points_seed", 42)),
