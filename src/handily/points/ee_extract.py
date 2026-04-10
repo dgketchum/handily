@@ -25,6 +25,10 @@ OPENET_ETA_PRE2000 = (
 OPENET_ETA_SPLIT_YEAR = 1999
 OPENET_ETA_BAND = "et_ensemble_mad"
 
+GRIDMET_COLLECTION = "IDAHO_EPSCOR/GRIDMET"
+GRIDMET_ETO_BAND = "eto"
+GRIDMET_PR_BAND = "pr"
+
 LANDSAT_COLLECTIONS = [
     ("LANDSAT/LT04/C02/T1_L2", "SR_B3", "SR_B4"),
     ("LANDSAT/LT05/C02/T1_L2", "SR_B3", "SR_B4"),
@@ -284,13 +288,15 @@ def _landsat_ndvi_collection(
             .filterBounds(geometry)
             .map(_mask_landsat_sr)
             .map(
-                lambda img, red=red_band, nir=nir_band: img.select([red, nir])
-                .multiply(0.0000275)
-                .add(-0.2)
-                .rename(["red", "nir"])
-                .normalizedDifference(["nir", "red"])
-                .rename("ndvi")
-                .copyProperties(img, ["system:time_start"])
+                lambda img, red=red_band, nir=nir_band: (
+                    img.select([red, nir])
+                    .multiply(0.0000275)
+                    .add(-0.2)
+                    .rename(["red", "nir"])
+                    .normalizedDifference(["nir", "red"])
+                    .rename("ndvi")
+                    .copyProperties(img, ["system:time_start"])
+                )
             )
         )
         collections.append(coll)
@@ -441,6 +447,8 @@ def export_points_openet_eta(
     stacked = ee.Image(monthly_images[0])
     for image in monthly_images[1:]:
         stacked = stacked.addBands(image)
+    # Unmask so sampleRegions returns all points (NoData → 0 instead of dropped)
+    stacked = stacked.unmask(0)
 
     samples = _sample_points_image(stacked, points_fc, selectors=selectors)
     prefix, description = build_points_export_prefix(
@@ -456,6 +464,89 @@ def export_points_openet_eta(
         drive_folder=resolved_drive_folder,
     )
     return {"product": "openet_eta", "description": description, "prefix": prefix}
+
+
+def export_points_gridmet(
+    points: str | gpd.GeoDataFrame | None,
+    config: HandilyConfig,
+    aoi_id: str | None = None,
+    year_start: int | None = None,
+    year_end: int | None = None,
+    dest: str | None = None,
+    bucket: str | None = None,
+    drive_folder: str | None = None,
+    ee_project: str | None = None,
+) -> dict[str, str]:
+    """Export annual and growing-season ETo and precipitation from GridMET."""
+    initialize_ee(ee_project or config.ee_project)
+    points_gdf, points_fc = points_to_ee_feature_collection(points, config)
+    selectors = [prop for prop in POINT_EXPORT_PROPS if prop in points_gdf.columns]
+    aoi_name = _resolve_aoi_id(points_gdf, config, aoi_id=aoi_id)
+    start_year, end_year = _resolve_year_range(config, year_start, year_end, 1984, 2024)
+    resolved_dest, resolved_bucket, resolved_drive_folder = _resolve_export_dest(
+        config,
+        dest,
+        bucket,
+        drive_folder,
+    )
+
+    geometry = points_fc.geometry()
+    gs_start = config.points_ndvi_start_month  # default 4 (April)
+    gs_end = config.points_ndvi_end_month  # default 10 (October)
+
+    images: list[ee.Image] = []
+    band_names: list[str] = []
+
+    for year in range(start_year, end_year + 1):
+        col = (
+            ee.ImageCollection(GRIDMET_COLLECTION)
+            .filterDate(f"{year}-01-01", f"{year + 1}-01-01")
+            .filterBounds(geometry)
+        )
+        # Annual sums
+        eto_annual = col.select(GRIDMET_ETO_BAND).sum().rename(f"eto_{year}")
+        pr_annual = col.select(GRIDMET_PR_BAND).sum().rename(f"pr_{year}")
+
+        # Growing-season sums
+        gs_col = col.filterDate(
+            ee.Date.fromYMD(year, gs_start, 1),
+            ee.Date.fromYMD(year, gs_end + 1, 1),
+        )
+        eto_gs = gs_col.select(GRIDMET_ETO_BAND).sum().rename(f"eto_gs_{year}")
+        pr_gs = gs_col.select(GRIDMET_PR_BAND).sum().rename(f"pr_gs_{year}")
+
+        images.extend([eto_annual, pr_annual, eto_gs, pr_gs])
+        band_names.extend(
+            [
+                f"eto_{year}",
+                f"pr_{year}",
+                f"eto_gs_{year}",
+                f"pr_gs_{year}",
+            ]
+        )
+
+    stacked = ee.Image(images[0])
+    for image in images[1:]:
+        stacked = stacked.addBands(image)
+
+    samples = _sample_points_image(stacked, points_fc, selectors=selectors, scale=4000)
+    prefix, description = build_points_export_prefix(
+        config,
+        "gridmet",
+        aoi_name,
+        start_year,
+        end_year,
+    )
+    export_table(
+        samples,
+        desc=description,
+        dest=resolved_dest,
+        selectors=selectors + band_names,
+        bucket=resolved_bucket,
+        file_prefix=prefix if resolved_dest == "bucket" else os.path.basename(prefix),
+        drive_folder=resolved_drive_folder,
+    )
+    return {"product": "gridmet", "description": description, "prefix": prefix}
 
 
 def export_fields_openet_eta(
@@ -537,12 +628,15 @@ def export_points_products_from_config(
 ) -> list[dict[str, str]]:
     requested = product.lower()
     products = (
-        ["irrmapper", "ndvi", "openet_eta"] if requested == "all" else [requested]
+        ["irrmapper", "ndvi", "openet_eta", "gridmet"]
+        if requested == "all"
+        else [requested]
     )
     actions = {
         "irrmapper": export_points_irrmapper,
         "ndvi": export_points_ndvi,
         "openet_eta": export_points_openet_eta,
+        "gridmet": export_points_gridmet,
     }
 
     results: list[dict[str, str]] = []
