@@ -66,10 +66,15 @@ class REMWorkflow:
                 io.LOGGER.info("Caching flowlines to: %s", flowlines_cache_path)
                 self.flowlines.to_file(flowlines_cache_path, driver="FlatGeobuf")
 
-        ndwi_paths = io.ndwi_files_for_bounds(self.config.ndwi_dir, self.bounds_wsen)
+        # Look for NDWI in the per-AOI out_dir first, fall back to ndwi_dir
+        ndwi_paths = io.ndwi_files_for_bounds(self.config.out_dir, self.bounds_wsen)
+        if not ndwi_paths:
+            ndwi_paths = io.ndwi_files_for_bounds(
+                self.config.ndwi_dir, self.bounds_wsen
+            )
         if not ndwi_paths:
             raise ValueError(
-                "No NDWI rasters found intersecting bounds; place NDWI GeoTIFFs covering the AOI in ndwi_dir."
+                "No NDWI rasters found intersecting bounds; place NDWI GeoTIFFs covering the AOI in out_dir or ndwi_dir."
             )
         self.ndwi = io.open_ndwi_mosaic_from_paths(ndwi_paths, self.bounds_wsen)
 
@@ -373,7 +378,9 @@ def run_experiment(
     aoi_geom_4326 = box(lon_min, lat_min, lon_max, lat_max)
     aoi_gdf = gpd.GeoDataFrame([{}], geometry=[aoi_geom_4326], crs="EPSG:4326")
 
-    ndwi_paths = io.ndwi_files_for_bounds(config.ndwi_dir, bounds_wsen)
+    ndwi_paths = io.ndwi_files_for_bounds(experiment_dir, bounds_wsen)
+    if not ndwi_paths:
+        ndwi_paths = io.ndwi_files_for_bounds(config.ndwi_dir, bounds_wsen)
     if not ndwi_paths:
         raise ValueError("No NDWI rasters found for experiment bounds")
     ndwi_da = io.open_ndwi_mosaic_from_paths(ndwi_paths, bounds_wsen)
