@@ -10,11 +10,11 @@ et_bucket = "wudr"
 # Input data
 fields_path = "/nas/Nevada/dri_field_pts/fields_gis/Nevada_Agricultural_Field_Boundaries_20250214/Nevada_Agricultural_Field_Boundaries_20250214_5071_GFID.shp"
 flowlines_local_dir = "/nas/boundaries/wbd/NHD_H_Nevada_State_Shape/Shape"
-ndwi_dir = "/data/ssd2/handily/handily/nv/ndwi/"
+ndwi_dir = "/data/ssd2/handily/nv/ndwi/"
 stac_dir = "/nas/handily/stac/3dep_1m/"
 
 # Output directory (used for single-AOI runs; batch REM uses --out-root)
-out_dir = "/data/ssd2/handily/rem/nv/"
+out_dir = "/data/ssd2/handily/nv/"
 
 feature_id = "GFID"
 

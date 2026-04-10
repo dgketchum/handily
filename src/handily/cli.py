@@ -312,6 +312,40 @@ def main(argv=None):
         help="Shapefile column to filter on (exports only rows where column == 1)",
     )
 
+    p_naip = sub.add_parser("naip", help="NAIP imagery download and NDWI computation")
+    naip_sub = p_naip.add_subparsers(dest="naip_cmd", required=True)
+
+    p_naip_ndwi = naip_sub.add_parser(
+        "ndwi", help="Download NAIP from USDA Box, compute NDWI per AOI"
+    )
+    p_naip_ndwi.add_argument(
+        "--aoi-shp", required=True, help="AOI shapefile produced by 'handily aoi'"
+    )
+    p_naip_ndwi.add_argument(
+        "--state", required=True, help="Two-letter state abbreviation"
+    )
+    p_naip_ndwi.add_argument("--year", required=True, help="NAIP year (e.g. 2022)")
+    p_naip_ndwi.add_argument(
+        "--out-root", required=True, help="Root output directory with aoi_XXXX dirs"
+    )
+    p_naip_ndwi.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Cache directory for downloaded ZIPs (default: /tmp/naip_cache)",
+    )
+    p_naip_ndwi.add_argument(
+        "--aoi-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Only process these aoi_id values",
+    )
+    p_naip_ndwi.add_argument(
+        "--fips-col",
+        default=None,
+        help="AOI shapefile column with county FIPS codes (auto-detected if missing)",
+    )
+
     p_et = sub.add_parser("et", help="ET workflows (OpenET v2.0 ensemble)")
     et_sub = p_et.add_subparsers(dest="et_cmd", required=True)
 
@@ -636,6 +670,63 @@ def main(argv=None):
             print(f"Flowlines FGB written: {out}")
             return 0
 
+    if args.cmd == "naip":
+        import geopandas as _gpd
+        from handily.naip import naip_ndwi_for_aoi
+
+        aoi_gdf = _gpd.read_file(os.path.expanduser(args.aoi_shp))
+        if args.aoi_ids and "aoi_id" in aoi_gdf.columns:
+            aoi_gdf = aoi_gdf[aoi_gdf["aoi_id"].isin(args.aoi_ids)].reset_index(
+                drop=True
+            )
+            print(f"Filtered to {len(aoi_gdf)} AOIs by aoi_id")
+
+        cache_dir = args.cache_dir or "/tmp/naip_cache"
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Determine county FIPS for each AOI via spatial join with census counties
+        if args.fips_col and args.fips_col in aoi_gdf.columns:
+            aoi_gdf["_fips3"] = aoi_gdf[args.fips_col].astype(str).str[-3:]
+        else:
+            # Auto-detect: intersect AOI centroids with county boundaries
+            try:
+                from handily.naip import _get_aoi_fips
+
+                aoi_gdf = _get_aoi_fips(aoi_gdf, args.state)
+            except Exception as exc:
+                print(f"Could not auto-detect FIPS: {exc}")
+                print("Provide --fips-col or add FIPS column to AOI shapefile")
+                return 1
+
+        out_root = os.path.expanduser(args.out_root)
+        done = 0
+        errors = 0
+        for _, row in aoi_gdf.iterrows():
+            aoi_id = int(row["aoi_id"]) if "aoi_id" in row.index else 0
+            fips = row["_fips3"]
+            aoi_dir = os.path.join(out_root, f"aoi_{aoi_id:04d}")
+            out_path = os.path.join(aoi_dir, f"naip_ndwi_aoi_{aoi_id:04d}.tif")
+            if os.path.exists(out_path):
+                print(f"  aoi_{aoi_id:04d}: exists, skipping")
+                continue
+            try:
+                naip_ndwi_for_aoi(
+                    aoi_geometry=row.geometry,
+                    aoi_crs=aoi_gdf.crs,
+                    state=args.state,
+                    fips=str(fips),
+                    year=args.year,
+                    out_path=out_path,
+                    cache_dir=cache_dir,
+                )
+                done += 1
+                print(f"  aoi_{aoi_id:04d}: done")
+            except Exception as exc:
+                errors += 1
+                print(f"  aoi_{aoi_id:04d}: ERROR {exc}")
+        print(f"NAIP NDWI: done={done} errors={errors}")
+        return 0
+
     if args.cmd == "ndwi":
         import ee
         from handily.ndwi_export import export_ndwi_for_polygons
@@ -780,6 +871,7 @@ def main(argv=None):
             bucket=config.et_bucket,
             bucket_prefix=full_prefix,
             local_root=config.local_data_root,
+            local_prefix=config.project_name,
             subdir=args.subdir,
             glob_pattern=args.glob,
             overwrite=args.overwrite,

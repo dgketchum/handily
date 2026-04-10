@@ -94,6 +94,7 @@ def sync_bucket_to_local(
     bucket: str,
     bucket_prefix: str,
     local_root: str,
+    local_prefix: str | None = None,
     subdir: str | None = None,
     glob_pattern: str = "*",
     overwrite: bool = False,
@@ -103,21 +104,23 @@ def sync_bucket_to_local(
 ) -> dict:
     """Sync files from GCS bucket to local filesystem.
 
-    Mirrors bucket structure locally:
+    Downloads from GCS using bucket_prefix, writes locally using local_prefix:
         gs://{bucket}/{bucket_prefix}/{subdir}/*
         ->
-        {local_root}/{bucket_prefix}/{subdir}/*
+        {local_root}/{local_prefix}/{subdir}/*
 
     Parameters
     ----------
     bucket : str
         Bucket name (e.g., 'wudr').
     bucket_prefix : str
-        Prefix within bucket (e.g., 'handily/beaverhead').
+        Prefix within bucket (e.g., 'handily/mt').
     local_root : str
         Local root directory.
+    local_prefix : str, optional
+        Local subdirectory prefix (e.g., 'mt'). Defaults to bucket_prefix.
     subdir : str, optional
-        Subdirectory to sync (e.g., 'irrmapper').
+        Subdirectory to sync (e.g., 'ndwi').
     glob_pattern : str
         Glob pattern to filter files (e.g., '*irr_freq*' or '*.csv').
         If no glob characters are present, it is treated as a substring match.
@@ -142,13 +145,16 @@ def sync_bucket_to_local(
 
     glob_pattern = _coerce_glob_pattern(glob_pattern)
 
+    if local_prefix is None:
+        local_prefix = bucket_prefix
+
     # Build paths
     if subdir:
         bucket_path = f"gs://{bucket}/{bucket_prefix}/{subdir}/"
-        local_dir = os.path.join(local_root, bucket_prefix, subdir)
+        local_dir = os.path.join(local_root, local_prefix, subdir)
     else:
         bucket_path = f"gs://{bucket}/{bucket_prefix}/"
-        local_dir = os.path.join(local_root, bucket_prefix)
+        local_dir = os.path.join(local_root, local_prefix)
 
     LOGGER.info("Syncing: %s -> %s", bucket_path, local_dir)
 
@@ -252,18 +258,18 @@ def build_bucket_path(
 
 def build_local_path(
     local_root: str,
-    bucket_prefix: str,
+    local_prefix: str,
     subdir: str,
     filename: str | None = None,
 ) -> str:
-    """Build a local filesystem path mirroring bucket structure.
+    """Build a local filesystem path under the project directory.
 
     Parameters
     ----------
     local_root : str
         Local root directory.
-    bucket_prefix : str
-        Prefix (mirrors bucket prefix).
+    local_prefix : str
+        Project prefix (e.g., 'mt').
     subdir : str
         Subdirectory.
     filename : str, optional
@@ -276,8 +282,8 @@ def build_local_path(
     """
     local_root = os.path.expanduser(local_root)
     if filename:
-        return os.path.join(local_root, bucket_prefix, subdir, filename)
-    return os.path.join(local_root, bucket_prefix, subdir)
+        return os.path.join(local_root, local_prefix, subdir, filename)
+    return os.path.join(local_root, local_prefix, subdir)
 
 
 def sync_irrmapper(
@@ -315,6 +321,7 @@ def sync_irrmapper(
         bucket=bucket,
         bucket_prefix=full_prefix,
         local_root=local_root,
+        local_prefix=project_name,
         subdir="irrmapper",
         glob_pattern="irr_freq",
         overwrite=overwrite,
@@ -323,7 +330,7 @@ def sync_irrmapper(
 
     if result["copied"] > 0 or result["skipped"] > 0:
         # Find the CSV file
-        local_dir = build_local_path(local_root, full_prefix, "irrmapper")
+        local_dir = build_local_path(local_root, project_name, "irrmapper")
         csvs = [f for f in os.listdir(local_dir) if f.endswith(".csv")]
         if csvs:
             return os.path.join(local_dir, csvs[0])
