@@ -121,33 +121,78 @@ def extract_et_history(
     return pd.concat(frames, ignore_index=True).reset_index(drop=True)
 
 
+def extract_gridmet_history(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Reshape GridMET wide CSV to long format with annual/GS ETo and precip."""
+    eto_cols = {
+        int(m.group(1)): col
+        for col in df.columns
+        if (m := re.match(r"eto_(\d{4})$", col))
+    }
+    pr_cols = {
+        int(m.group(1)): col
+        for col in df.columns
+        if (m := re.match(r"pr_(\d{4})$", col))
+    }
+    eto_gs_cols = {
+        int(m.group(1)): col
+        for col in df.columns
+        if (m := re.match(r"eto_gs_(\d{4})$", col))
+    }
+    pr_gs_cols = {
+        int(m.group(1)): col
+        for col in df.columns
+        if (m := re.match(r"pr_gs_(\d{4})$", col))
+    }
+
+    all_years = sorted(set(eto_cols) | set(pr_cols))
+    if not all_years:
+        raise ValueError("No eto_YYYY or pr_YYYY columns found in GridMET CSV")
+
+    frames = []
+    for year in all_years:
+        row = df[["point_id"]].copy()
+        row["year"] = year
+        row["eto_annual"] = (
+            df[eto_cols[year]].astype("float32") if year in eto_cols else np.nan
+        )
+        row["pr_annual"] = (
+            df[pr_cols[year]].astype("float32") if year in pr_cols else np.nan
+        )
+        row["eto_gs"] = (
+            df[eto_gs_cols[year]].astype("float32") if year in eto_gs_cols else np.nan
+        )
+        row["pr_gs"] = (
+            df[pr_gs_cols[year]].astype("float32") if year in pr_gs_cols else np.nan
+        )
+        frames.append(row)
+
+    return pd.concat(frames, ignore_index=True).reset_index(drop=True)
+
+
 def build_point_year_table(
     irrmapper_csv: str | None,
     ndvi_csv: str | None,
     openet_eta_csv: str | None,
     point_ids: list[str],
+    gridmet_csv: str | None = None,
 ) -> pd.DataFrame:
-    """Build a point × year table by joining IrrMapper, NDVI, and OpenET ETa CSVs.
-
-    Year range spans all years found across available CSV files.  IrrMapper
-    typically covers 1987–present; NDVI and ETa cover the config year window.
-    Only point_ids present in the input list are included; all years are kept
-    for each point, with NaN for sources that do not cover that year.
+    """Build a point × year table by joining IrrMapper, NDVI, OpenET, and GridMET CSVs.
 
     Parameters
     ----------
-    irrmapper_csv : str or None
-        Path to the downloaded IrrMapper points CSV, or None to skip.
-    ndvi_csv : str or None
-        Path to the downloaded NDVI points CSV, or None to skip.
-    openet_eta_csv : str or None
-        Path to the downloaded OpenET ETa points CSV, or None to skip.
+    irrmapper_csv, ndvi_csv, openet_eta_csv : str or None
+        Paths to downloaded EE CSV exports.
     point_ids : list[str]
-        Authoritative list of point_id values (from points_static).
+        Authoritative list of point_id values.
+    gridmet_csv : str or None
+        Path to GridMET CSV with ETo and precipitation columns.
 
     Returns
     -------
-    DataFrame with columns: point_id, year, irr_class, ndvi_*, aet_*, validity flags.
+    DataFrame with columns: point_id, year, irr_class, ndvi_*, aet_*, eto_*, pr_*,
+    etf, net_et, and validity flags.
     """
     irr_long: pd.DataFrame | None = None
     ndvi_long: pd.DataFrame | None = None
@@ -220,6 +265,29 @@ def build_point_year_table(
 
     if et_long is not None:
         base = base.merge(et_long, on=["point_id", "year"], how="left")
+
+    # GridMET: ETo and precipitation
+    gridmet_long: pd.DataFrame | None = None
+    if gridmet_csv and os.path.exists(gridmet_csv):
+        gridmet_raw = pd.read_csv(gridmet_csv)
+        gridmet_long = extract_gridmet_history(gridmet_raw)
+        LOGGER.info(
+            "GridMET: %d point-years  years %d–%d",
+            len(gridmet_long),
+            gridmet_long["year"].min(),
+            gridmet_long["year"].max(),
+        )
+        base = base.merge(gridmet_long, on=["point_id", "year"], how="left")
+    else:
+        if gridmet_csv:
+            LOGGER.warning("GridMET CSV not found: %s", gridmet_csv)
+
+    # Derived: ETf = AET / ETo, net_et = AET - precip
+    if "aet_gs" in base.columns and "eto_gs" in base.columns:
+        eto = base["eto_gs"].astype("float32")
+        base["etf"] = np.where(eto > 0, base["aet_gs"] / eto, np.nan).astype("float32")
+    if "aet_annual" in base.columns and "pr_annual" in base.columns:
+        base["net_et"] = (base["aet_annual"] - base["pr_annual"]).astype("float32")
 
     base["irr_valid"] = base["irr_class"].notna()
     base["ndvi_valid"] = (

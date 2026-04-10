@@ -69,9 +69,27 @@ def build_point_summary(
         et_mask = (
             point_year["et_valid"] if "et_valid" in point_year.columns else slice(None)
         )
-        et_grp = point_year.loc[et_mask].groupby("point_id")["aet_annual"]
+        et_sub = point_year.loc[et_mask]
+        et_grp = et_sub.groupby("point_id")["aet_annual"]
         summary["aet_mean"] = et_grp.mean()
         summary["aet_std"] = et_grp.std()
+
+        if "eto_annual" in et_sub.columns:
+            eto_grp = et_sub.groupby("point_id")["eto_annual"]
+            summary["eto_mean"] = eto_grp.mean()
+        if "eto_gs" in et_sub.columns:
+            summary["eto_gs_mean"] = et_sub.groupby("point_id")["eto_gs"].mean()
+        if "pr_annual" in et_sub.columns:
+            pr_grp = et_sub.groupby("point_id")["pr_annual"]
+            summary["prcp_mean"] = pr_grp.mean()
+        if "pr_gs" in et_sub.columns:
+            summary["prcp_gs_mean"] = et_sub.groupby("point_id")["pr_gs"].mean()
+        if "etf" in et_sub.columns:
+            etf_grp = et_sub.groupby("point_id")["etf"]
+            summary["etf_mean"] = etf_grp.mean()
+            summary["etf_std"] = etf_grp.std()
+        if "net_et" in et_sub.columns:
+            summary["net_et_mean"] = et_sub.groupby("point_id")["net_et"].mean()
 
     ndvi_src_cols = ["ndvi_amp_gs", "ndvi_peak_gs", "ndvi_mean_gs"]
     if any(c in point_year.columns for c in ndvi_src_cols):
