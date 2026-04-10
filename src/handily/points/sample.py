@@ -9,7 +9,12 @@ from rasterio.transform import rowcol
 from shapely.geometry import Point
 
 from handily.config import HandilyConfig
-from handily.io import aoi_from_bounds, ensure_dir, get_flowlines_within_aoi, load_and_clip_fields
+from handily.io import (
+    aoi_from_bounds,
+    ensure_dir,
+    get_flowlines_within_aoi,
+    load_and_clip_fields,
+)
 from handily.nhd import classify_flowlines, filter_flowlines_for_stratification
 
 LOGGER = logging.getLogger("handily.points.sample")
@@ -40,7 +45,9 @@ def _load_rem_da(config: HandilyConfig):
     return rem_da
 
 
-def _load_fields(config: HandilyConfig, aoi_gdf: gpd.GeoDataFrame, target_crs) -> gpd.GeoDataFrame:
+def _load_fields(
+    config: HandilyConfig, aoi_gdf: gpd.GeoDataFrame, target_crs
+) -> gpd.GeoDataFrame:
     fields_path = os.path.join(config.out_dir, "fields_bounds.fgb")
     if os.path.exists(fields_path):
         LOGGER.info("Loading AOI fields from %s", fields_path)
@@ -52,7 +59,9 @@ def _load_fields(config: HandilyConfig, aoi_gdf: gpd.GeoDataFrame, target_crs) -
     return fields
 
 
-def _load_flowlines(config: HandilyConfig, aoi_gdf: gpd.GeoDataFrame, target_crs) -> gpd.GeoDataFrame:
+def _load_flowlines(
+    config: HandilyConfig, aoi_gdf: gpd.GeoDataFrame, target_crs
+) -> gpd.GeoDataFrame:
     flowlines_path = os.path.join(config.out_dir, "flowlines_bounds.fgb")
     if os.path.exists(flowlines_path):
         LOGGER.info("Loading AOI flowlines from %s", flowlines_path)
@@ -60,7 +69,9 @@ def _load_flowlines(config: HandilyConfig, aoi_gdf: gpd.GeoDataFrame, target_crs
         return flowlines.to_crs(target_crs)
 
     LOGGER.info("Fetching flowlines for AOI")
-    flowlines = get_flowlines_within_aoi(aoi_gdf, local_flowlines_dir=config.flowlines_local_dir)
+    flowlines = get_flowlines_within_aoi(
+        aoi_gdf, local_flowlines_dir=config.flowlines_local_dir
+    )
     return flowlines.to_crs(target_crs)
 
 
@@ -116,7 +127,9 @@ def _sample_rem_values(points: gpd.GeoDataFrame, rem_da) -> gpd.GeoDataFrame:
     return out
 
 
-def _assign_stream_context(points: gpd.GeoDataFrame, flowlines: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+def _assign_stream_context(
+    points: gpd.GeoDataFrame, flowlines: gpd.GeoDataFrame
+) -> gpd.GeoDataFrame:
     flowlines = classify_flowlines(flowlines)
     flowlines = filter_flowlines_for_stratification(flowlines)
 
@@ -133,14 +146,20 @@ def _assign_stream_context(points: gpd.GeoDataFrame, flowlines: gpd.GeoDataFrame
         how="left",
         distance_col="stream_distance",
     )
-    join = join.sort_values("candidate_id").drop_duplicates(subset=["candidate_id"], keep="first").reset_index(drop=True)
+    join = (
+        join.sort_values("candidate_id")
+        .drop_duplicates(subset=["candidate_id"], keep="first")
+        .reset_index(drop=True)
+    )
     out["nearest_stream_type"] = join["stream_category"].fillna("none")
     out["stream_distance"] = join["stream_distance"].fillna(np.inf)
     out["stream_context_at_sample"] = out["nearest_stream_type"]
     return out
 
 
-def _assign_field_context(points: gpd.GeoDataFrame, fields: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+def _assign_field_context(
+    points: gpd.GeoDataFrame, fields: gpd.GeoDataFrame
+) -> gpd.GeoDataFrame:
     out = points.copy()
     if fields.empty:
         out["in_irrigated_lands"] = False
@@ -154,7 +173,11 @@ def _assign_field_context(points: gpd.GeoDataFrame, fields: gpd.GeoDataFrame) ->
         how="left",
         predicate="within",
     )
-    join = join.sort_values("candidate_id").drop_duplicates(subset=["candidate_id"], keep="first").reset_index(drop=True)
+    join = (
+        join.sort_values("candidate_id")
+        .drop_duplicates(subset=["candidate_id"], keep="first")
+        .reset_index(drop=True)
+    )
     out["in_irrigated_lands"] = join["index_right"].notna().to_numpy()
 
     boundary = fields.geometry.boundary.unary_union
@@ -165,20 +188,25 @@ def _assign_field_context(points: gpd.GeoDataFrame, fields: gpd.GeoDataFrame) ->
     return out
 
 
-def build_sample_masks(points: gpd.GeoDataFrame, config: HandilyConfig) -> gpd.GeoDataFrame:
+def build_sample_masks(
+    points: gpd.GeoDataFrame, config: HandilyConfig
+) -> gpd.GeoDataFrame:
     out = points.copy()
     valid_rem = np.isfinite(out["rem_at_sample"])
     out["has_valid_rem"] = valid_rem
-    out["is_low_rem_target"] = valid_rem & (out["rem_at_sample"] < float(config.points_low_rem_threshold_m))
-    out["is_riparian_target"] = (
-        valid_rem
-        & (
+    out["is_low_rem_target"] = valid_rem & (
+        out["rem_at_sample"] < float(config.points_low_rem_threshold_m)
+    )
+    out["is_riparian_target"] = valid_rem & (
         out["nearest_stream_type"].isin(["perennial", "intermittent", "managed"])
         & (out["stream_distance"] <= float(config.points_riparian_buffer_m))
-        )
     )
-    out["is_field_edge_target"] = valid_rem & (out["dist_field_edge_m"] <= float(config.points_field_edge_buffer_m))
-    out["is_high_rem_control"] = valid_rem & (out["rem_at_sample"] > float(config.points_high_rem_threshold_m))
+    out["is_field_edge_target"] = valid_rem & (
+        out["dist_field_edge_m"] <= float(config.points_field_edge_buffer_m)
+    )
+    out["is_high_rem_control"] = valid_rem & (
+        out["rem_at_sample"] > float(config.points_high_rem_threshold_m)
+    )
     out["is_valid_base"] = valid_rem
     return out
 
@@ -191,7 +219,9 @@ def sample_points_from_mask(
     selected_ids: set[int],
     sample_group: str,
 ) -> gpd.GeoDataFrame:
-    eligible = candidates[candidates[mask_col] & ~candidates["candidate_id"].isin(selected_ids)].copy()
+    eligible = candidates[
+        candidates[mask_col] & ~candidates["candidate_id"].isin(selected_ids)
+    ].copy()
     eligible_count = len(eligible)
 
     if eligible_count == 0 or int(n_points) <= 0:
@@ -222,8 +252,12 @@ def deduplicate_sample_points(
         group_priority = GROUP_PRIORITY
     priority_map = {name: idx for idx, name in enumerate(group_priority)}
     out = points.copy()
-    out["__priority__"] = out["sample_group"].map(priority_map).fillna(len(priority_map))
-    out = out.sort_values(["candidate_id", "__priority__"]).drop_duplicates(subset=["candidate_id"], keep="first")
+    out["__priority__"] = (
+        out["sample_group"].map(priority_map).fillna(len(priority_map))
+    )
+    out = out.sort_values(["candidate_id", "__priority__"]).drop_duplicates(
+        subset=["candidate_id"], keep="first"
+    )
     out = out.drop(columns="__priority__").reset_index(drop=True)
     return out
 
@@ -251,7 +285,10 @@ def build_aoi_sample_points(
     config: HandilyConfig,
     aoi_id: str | int = "aoi",
 ) -> gpd.GeoDataFrame:
-    spacing_m = max(float(config.points_candidate_spacing_m), float(config.points_min_spacing_m or 0.0))
+    spacing_m = max(
+        float(config.points_candidate_spacing_m),
+        float(config.points_min_spacing_m or 0.0),
+    )
     rng = np.random.default_rng(int(config.points_seed))
 
     LOGGER.info("Building candidate grid (spacing=%.1f m)", spacing_m)
@@ -287,7 +324,12 @@ def build_aoi_sample_points(
                 "Sample group '%s': requested=%d, available=%d, selected=%d",
                 sample_group,
                 int(n_points),
-                int((candidates[mask_col] & ~candidates["candidate_id"].isin(selected_ids)).sum()),
+                int(
+                    (
+                        candidates[mask_col]
+                        & ~candidates["candidate_id"].isin(selected_ids)
+                    ).sum()
+                ),
                 len(sampled),
             )
         else:
