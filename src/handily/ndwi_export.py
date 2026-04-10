@@ -74,7 +74,7 @@ def export_ndwi_for_polygons(
         region = _ee_geom(geom)
         ndwi = _naip_ndwi_image(region, start_date, end_date)
         idx = int(row["aoi_id"]) if "aoi_id" in aoi_gdf.columns else int(i)
-        fname = f"{prefix}/naip_ndwi_aoi_{idx:04d}"
+        fname = f"{prefix}/aoi_{idx:04d}/naip_ndwi_aoi_{idx:04d}"
         if skip_if_present_dir:
             present = glob.glob(
                 os.path.join(skip_if_present_dir, f"{os.path.basename(fname)}*.tif")

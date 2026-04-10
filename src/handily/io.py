@@ -319,10 +319,10 @@ def ndwi_files_for_bounds(ndwi_dir: str, bounds_wsen):
     w, s, e, n = bounds_wsen
     target = box(w, s, e, n)
 
-    candidates = sorted(glob.glob(os.path.join(ndwi_dir, "*.tif")))
+    candidates = sorted(glob.glob(os.path.join(ndwi_dir, "*ndwi*.tif")))
     if not candidates:
         candidates = sorted(
-            glob.glob(os.path.join(ndwi_dir, "**", "*.tif"), recursive=True)
+            glob.glob(os.path.join(ndwi_dir, "**", "*ndwi*.tif"), recursive=True)
         )
 
     hits: list[str] = []
@@ -373,10 +373,11 @@ def load_and_clip_fields(fields_path: str, aoi_gdf: gpd.GeoDataFrame, target_crs
     fields = fields[~fields.geometry.is_empty & fields.geometry.notnull()].copy()
 
     LOGGER.info("Clipping irrigation dataset to AOI")
+    aoi_clip = aoi_gdf.to_crs(fields.crs) if aoi_gdf.crs != fields.crs else aoi_gdf
     try:
-        clipped = gpd.clip(fields, aoi_gdf)
+        clipped = gpd.clip(fields, aoi_clip)
     except Exception:
-        clipped = gpd.overlay(fields, aoi_gdf, how="intersection")
+        clipped = gpd.overlay(fields, aoi_clip, how="intersection")
 
     clipped = clipped.to_crs(target_crs)
     return clipped.reset_index(drop=True)
