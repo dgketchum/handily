@@ -690,6 +690,11 @@ def mosaic_from_stac(
         if asset is None:
             continue
         href = asset.href
+        # Rewrite FTP URLs to HTTPS — USGS mirrors FTP at rockyweb.usgs.gov
+        if href.startswith("ftp://rockyftp.cr.usgs.gov/"):
+            href = href.replace(
+                "ftp://rockyftp.cr.usgs.gov/", "https://rockyweb.usgs.gov/"
+            )
         fname = os.path.basename(href)
         local = os.path.join(cache_dir, fname)
         if not os.path.exists(local):
@@ -705,14 +710,56 @@ def mosaic_from_stac(
     if not tifs_local:
         raise ValueError("No GeoTIFF assets available among intersecting Items.")
 
-    srcs = [rasterio.open(p) for p in tifs_local]
+    # Reproject tiles to the target CRS before merging — tiles from different
+    # UTM zones (e.g., AOIs on zone boundaries) cannot be merged directly.
+    target_crs = rasterio.crs.CRS.from_epsg(int(target_crs_epsg))
+    reprojected = []
+    for p in tifs_local:
+        ds = rasterio.open(p)
+        if ds.crs != target_crs:
+            from rasterio.warp import calculate_default_transform, reproject, Resampling
+
+            transform, width, height = calculate_default_transform(
+                ds.crs, target_crs, ds.width, ds.height, *ds.bounds
+            )
+            profile = ds.profile.copy()
+            profile.update(
+                crs=target_crs, transform=transform, width=width, height=height
+            )
+            reproj_path = p + ".reproj.tif"
+            with rasterio.open(reproj_path, "w", **profile) as dst:
+                for band in range(1, ds.count + 1):
+                    reproject(
+                        source=rasterio.band(ds, band),
+                        destination=rasterio.band(dst, band),
+                        src_transform=ds.transform,
+                        src_crs=ds.crs,
+                        dst_transform=transform,
+                        dst_crs=target_crs,
+                        resampling=Resampling.bilinear,
+                    )
+            ds.close()
+            reprojected.append(reproj_path)
+        else:
+            reprojected.append(p)
+            ds.close()
+
+    srcs = [rasterio.open(p) for p in reprojected]
     mosaic, mosaic_tr = rio_merge(srcs)
-    crs = srcs[0].crs
+    crs = target_crs
     for ds in srcs:
         try:
             ds.close()
         except Exception:
             pass
+
+    # Clean up reprojected temp files
+    for p in reprojected:
+        if p.endswith(".reproj.tif"):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
     if delete_tiles:
         for p in tifs_local:
@@ -725,9 +772,6 @@ def mosaic_from_stac(
     dem = xr.DataArray(mosaic[0].astype("float32"), dims=("y", "x"), name="elevation")
     dem = dem.rio.write_crs(crs, inplace=False)
     dem = dem.rio.write_transform(mosaic_tr)
-    epsg = crs.to_epsg()
-    if (epsg is None) or (int(epsg) != int(target_crs_epsg)):
-        dem = dem.rio.reproject(f"EPSG:{int(target_crs_epsg)}")
 
     dem = dem.rio.clip(
         aoi_gdf.to_crs(dem.rio.crs).geometry, aoi_gdf.to_crs(dem.rio.crs).crs
