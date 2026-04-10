@@ -144,15 +144,13 @@ class HandilyConfig:
         return base
 
     def get_local_path(self, subdir: str, filename: str | None = None) -> str:
-        """Get local path mirroring bucket structure.
+        """Get local path under the state project directory.
 
-        Example: /nas/handily/handily/beaverhead/irrmapper/beaverhead_irr_freq.csv
+        Example: /data/ssd2/handily/mt/irrmapper/mt_irr_freq.csv
         """
         if self.local_data_root is None:
             raise ValueError("local_data_root not set in config")
-        base = os.path.join(
-            self.local_data_root, self.bucket_prefix, self.project_name, subdir
-        )
+        base = os.path.join(self.local_data_root, self.project_name, subdir)
         if filename:
             return os.path.join(base, filename)
         return base

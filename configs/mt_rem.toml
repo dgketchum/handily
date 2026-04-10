@@ -22,11 +22,11 @@ et_bucket = "wudr"
 # Input data
 fields_path = "/nas/Montana/statewide_irrigation_dataset/statewide_irrigation_dataset_15FEB2024.shp"
 flowlines_local_dir = "/nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape"
-ndwi_dir = "/data/ssd2/handily/handily/mt/ndwi/"
+ndwi_dir = "/data/ssd2/handily/mt/ndwi/"
 stac_dir = "/nas/handily/stac/3dep_1m/"
 
 # Output directory (used for single-AOI runs; batch REM uses --out-root)
-out_dir = "/data/ssd2/handily/rem/mt/"
+out_dir = "/data/ssd2/handily/mt/"
 
 feature_id = "FID"
 
