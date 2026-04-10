@@ -82,7 +82,9 @@ def download_gridmet(
         pts = gpd.read_file(gridmet_centroids_path)
         pts = pts.to_crs(join_crs)
         if bounds_wsen is not None:
-            aoi_pts = gpd.GeoDataFrame(geometry=[box(w, s, e, n)], crs="EPSG:4326").to_crs(join_crs)
+            aoi_pts = gpd.GeoDataFrame(
+                geometry=[box(w, s, e, n)], crs="EPSG:4326"
+            ).to_crs(join_crs)
             aoi_pts["geometry"] = aoi_pts.geometry.buffer(4000)
             minx, miny, maxx, maxy = aoi_pts.total_bounds
             pts = pts.cx[minx:maxx, miny:maxy]
@@ -114,12 +116,20 @@ def download_gridmet(
 
     if gridmet_centroids_path is not None:
         gfids = [int(i) for i in pd.unique(df[gridmet_id_col].values)]
-        for gfid in tqdm(gfids, desc="Downloading GridMET per centroid", total=len(gfids)):
+        for gfid in tqdm(
+            gfids, desc="Downloading GridMET per centroid", total=len(gfids)
+        ):
             centroid_file = None
             if gridmet_centroid_parquet_dir is not None:
-                centroid_file = os.path.join(gridmet_centroid_parquet_dir, f"{gfid}.parquet")
+                centroid_file = os.path.join(
+                    gridmet_centroid_parquet_dir, f"{gfid}.parquet"
+                )
 
-            if centroid_file is not None and os.path.exists(centroid_file) and not overwrite:
+            if (
+                centroid_file is not None
+                and os.path.exists(centroid_file)
+                and not overwrite
+            ):
                 centroid_cache[gfid] = centroid_file
                 continue
 
@@ -130,7 +140,7 @@ def download_gridmet(
             first = True
 
             for thredds_var, meta in CLIMATE_COLS.items():
-                if thredds_var not in ['pet', 'pr']:
+                if thredds_var not in ["pet", "pr"]:
                     continue
                 variable = meta["col"]
                 g = GridMet(thredds_var, start=start, end=end, lat=lat, lon=lon)
@@ -153,7 +163,11 @@ def download_gridmet(
                 out.to_parquet(centroid_file)
                 centroid_cache[gfid] = centroid_file
 
-        for fid, row in tqdm(df.iterrows(), desc="Writing field GridMET from centroid cache", total=df.shape[0]):
+        for fid, row in tqdm(
+            df.iterrows(),
+            desc="Writing field GridMET from centroid cache",
+            total=df.shape[0],
+        ):
             out_file = os.path.join(gridmet_parquet_dir, f"{fid}.parquet")
             if os.path.exists(out_file) and not overwrite:
                 continue
@@ -166,7 +180,11 @@ def download_gridmet(
                 return met
 
     else:
-        for fid, row in tqdm(df.iterrows(), desc="Downloading GridMET per field centroid", total=df.shape[0]):
+        for fid, row in tqdm(
+            df.iterrows(),
+            desc="Downloading GridMET per field centroid",
+            total=df.shape[0],
+        ):
             out_file = os.path.join(gridmet_parquet_dir, f"{fid}.parquet")
             if os.path.exists(out_file) and not overwrite:
                 continue

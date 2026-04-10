@@ -63,14 +63,22 @@ def partition_et(
     fields = fields[[feature_id, strata_col, pattern_col, "geometry"]]
     if bounds_wsen is not None:
         w, s, e, n = bounds_wsen
-        aoi = gpd.GeoDataFrame(geometry=[box(w, s, e, n)], crs="EPSG:4326").to_crs(fields.crs)
+        aoi = gpd.GeoDataFrame(geometry=[box(w, s, e, n)], crs="EPSG:4326").to_crs(
+            fields.crs
+        )
         minx, miny, maxx, maxy = aoi.total_bounds
         fields = fields.cx[minx:maxx, miny:maxy]
 
     # Filter out non_partitioned fields - they shouldn't be partitioned
     fields = fields[fields[strata_col] != "non_partitioned"]
     if fields.empty:
-        return {"out_dir": out_parquet_dir, "n_fields": 0, "n_donors": 0, "donor_map": {}, "strata_counts": {}}
+        return {
+            "out_dir": out_parquet_dir,
+            "n_fields": 0,
+            "n_donors": 0,
+            "donor_map": {},
+            "strata_counts": {},
+        }
 
     fields_cent = fields.copy()
     fields_cent["geometry"] = fields_cent.geometry.centroid
@@ -85,7 +93,9 @@ def partition_et(
         d = donors[donors[strata_col] == strata][[feature_id, "geometry"]]
         if d.empty:
             raise ValueError
-        j = gpd.sjoin_nearest(r, d, how="left", distance_col="dist", lsuffix="r", rsuffix="d")
+        j = gpd.sjoin_nearest(
+            r, d, how="left", distance_col="dist", lsuffix="r", rsuffix="d"
+        )
         for _, row in j.iterrows():
             donor_map[row[f"{feature_id}_r"]] = row[f"{feature_id}_d"]
 
@@ -108,17 +118,25 @@ def partition_et(
         etf = donor_etf[donor_fid].reindex(annual.index)
 
         annual["et_gwsm"] = etf.values * annual["eto"].values
-        annual["et_irr"] = annual["aet"].values - annual["et_gwsm"].values - annual["pe"].values
+        annual["et_irr"] = (
+            annual["aet"].values - annual["et_gwsm"].values - annual["pe"].values
+        )
 
         neg = annual["et_irr"].values < 0
         annual.loc[neg, "et_irr"] = 0.0
-        annual.loc[neg, "et_gwsm"] = annual.loc[neg, "aet"].values - annual.loc[neg, "pe"].values
+        annual.loc[neg, "et_gwsm"] = (
+            annual.loc[neg, "aet"].values - annual.loc[neg, "pe"].values
+        )
         annual["etf_gwsm_used"] = annual["et_gwsm"].values / annual["eto"].values
 
         fdisag = _monthly_disaggregation(df)
         wy_m = _water_year_index(fdisag.index)
-        et_gwsm_a = pd.Series([annual.loc[int(w), "et_gwsm"] for w in wy_m], index=fdisag.index)
-        et_irr_a = pd.Series([annual.loc[int(w), "et_irr"] for w in wy_m], index=fdisag.index)
+        et_gwsm_a = pd.Series(
+            [annual.loc[int(w), "et_gwsm"] for w in wy_m], index=fdisag.index
+        )
+        et_irr_a = pd.Series(
+            [annual.loc[int(w), "et_irr"] for w in wy_m], index=fdisag.index
+        )
 
         out = pd.DataFrame(index=fdisag.index)
         out["water_year"] = wy_m

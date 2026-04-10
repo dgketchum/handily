@@ -6,7 +6,9 @@ from xarray import open_dataset
 
 
 class GridMet:
-    def __init__(self, variable=None, date=None, start=None, end=None, lat=None, lon=None):
+    def __init__(
+        self, variable=None, date=None, start=None, end=None, lat=None, lon=None
+    ):
         self.variable = variable
         self.date = date
         self.start = start
