@@ -121,16 +121,53 @@ class REMWorkflow:
         else:
             flowlines_for_mask = flowlines_dem
         flowlines_for_mask = compute.filter_disconnected_flowlines(flowlines_for_mask)
-        self.streams = compute.build_streams_mask_from_nhd_ndwi(
-            flowlines_for_mask,
-            self.dem,
-            ndwi_da=self.ndwi,
-            ndwi_threshold=float(ndwi_threshold),
-            flowlines_buffer_m=flowlines_buffer_m,
+        buf_m = (
+            flowlines_buffer_m
+            if flowlines_buffer_m is not None
+            else self.config.flowlines_buffer_m
         )
-        self.rem = compute.compute_rem_edt_smooth(
-            self.dem, self.streams, sigma=self.config.rem_smooth_sigma
-        )
+
+        if self.config.rem_method == "anisotropic_frame":
+            from . import rem_frame
+
+            annotated = compute.propagate_flowline_confirmation(
+                flowlines_for_mask,
+                self.dem,
+                ndwi_da=self.ndwi,
+                ndwi_threshold=float(ndwi_threshold),
+                flowlines_buffer_m=buf_m,
+                max_hops=self.config.rem_propagate_hops,
+            )
+            # Use water_seeded for primary frame building; reachable for raster mask
+            confirmed = annotated[annotated["reachable_from_seed"]].copy()
+            self.streams = compute.rasterize_confirmed_flowlines(confirmed, self.dem)
+            result = rem_frame.compute_rem_anisotropic_frame(
+                self.dem, self.ndwi, confirmed, self.config
+            )
+            self.rem = result.rem_da
+        elif self.config.rem_propagate_mask:
+            self.streams = compute.build_network_propagated_mask(
+                flowlines_for_mask,
+                self.dem,
+                ndwi_da=self.ndwi,
+                ndwi_threshold=float(ndwi_threshold),
+                flowlines_buffer_m=buf_m,
+                max_hops=self.config.rem_propagate_hops,
+            )
+            self.rem = compute.compute_rem_edt_smooth(
+                self.dem, self.streams, sigma=self.config.rem_smooth_sigma
+            )
+        else:
+            self.streams = compute.build_streams_mask_from_nhd_ndwi(
+                flowlines_for_mask,
+                self.dem,
+                ndwi_da=self.ndwi,
+                ndwi_threshold=float(ndwi_threshold),
+                flowlines_buffer_m=flowlines_buffer_m,
+            )
+            self.rem = compute.compute_rem_edt_smooth(
+                self.dem, self.streams, sigma=self.config.rem_smooth_sigma
+            )
         self.fields = io.load_and_clip_fields(
             self.config.fields_path, self.aoi_gdf, dem_crs
         )
@@ -407,7 +444,24 @@ def run_experiment(
     # --- compute ---
     t0 = time.monotonic()
 
-    if config.rem_propagate_mask:
+    if config.rem_method == "anisotropic_frame":
+        from . import rem_frame
+
+        annotated = compute.propagate_flowline_confirmation(
+            flowlines_for_mask,
+            dem_da,
+            ndwi_da=ndwi_da,
+            ndwi_threshold=config.ndwi_threshold,
+            flowlines_buffer_m=config.flowlines_buffer_m,
+            max_hops=config.rem_propagate_hops,
+        )
+        confirmed = annotated[annotated["reachable_from_seed"]].copy()
+        streams = compute.rasterize_confirmed_flowlines(confirmed, dem_da)
+        result = rem_frame.compute_rem_anisotropic_frame(
+            dem_da, ndwi_da, confirmed, config
+        )
+        rem_da = result.rem_da
+    elif config.rem_propagate_mask:
         streams = compute.build_network_propagated_mask(
             flowlines_for_mask,
             dem_da,
@@ -415,6 +469,9 @@ def run_experiment(
             ndwi_threshold=config.ndwi_threshold,
             flowlines_buffer_m=config.flowlines_buffer_m,
             max_hops=config.rem_propagate_hops,
+        )
+        rem_da = compute.compute_rem_edt_smooth(
+            dem_da, streams, sigma=config.rem_smooth_sigma
         )
     else:
         streams = compute.build_streams_mask_from_nhd_ndwi(
@@ -424,9 +481,9 @@ def run_experiment(
             ndwi_threshold=config.ndwi_threshold,
             flowlines_buffer_m=config.flowlines_buffer_m,
         )
-    rem_da = compute.compute_rem_edt_smooth(
-        dem_da, streams, sigma=config.rem_smooth_sigma
-    )
+        rem_da = compute.compute_rem_edt_smooth(
+            dem_da, streams, sigma=config.rem_smooth_sigma
+        )
     fields = io.load_and_clip_fields(config.fields_path, aoi_gdf, dem_crs)
     fields_stats = compute.compute_field_rem_stats(fields, rem_da, stats=("mean",))
 
@@ -471,19 +528,41 @@ def run_experiment(
     except Exception:
         git_hash = None
 
+    params = {
+        "ndwi_threshold": config.ndwi_threshold,
+        "flowlines_buffer_m": config.flowlines_buffer_m,
+        "rem_smooth_sigma": config.rem_smooth_sigma,
+        "rem_excluded_fcodes": sorted(excluded),
+        "rem_propagate_mask": config.rem_propagate_mask,
+        "rem_propagate_hops": config.rem_propagate_hops,
+        "rem_method": config.rem_method,
+    }
+    if config.rem_method == "anisotropic_frame":
+        params.update(
+            {
+                "rem_snap_w_elev": config.rem_snap_w_elev,
+                "rem_snap_w_water": config.rem_snap_w_water,
+                "rem_snap_w_prior": config.rem_snap_w_prior,
+                "rem_snap_w_transition": config.rem_snap_w_transition,
+                "rem_water_support_mode": config.rem_water_support_mode,
+                "rem_support_corridor_half_width_m": config.rem_support_corridor_half_width_m,
+                "rem_support_corridor_half_length_m": config.rem_support_corridor_half_length_m,
+                "rem_min_station_water_hit_fraction": config.rem_min_station_water_hit_fraction,
+                "rem_max_consecutive_no_water_m": config.rem_max_consecutive_no_water_m,
+                "rem_max_mean_snap_offset_m": config.rem_max_mean_snap_offset_m,
+                "rem_min_seeded_fraction": config.rem_min_seeded_fraction,
+                "rem_snap_max_offset_m": config.rem_snap_max_offset_m,
+                "rem_frame_station_spacing_m": config.rem_frame_station_spacing_m,
+                "rem_frame_smoothing_m": config.rem_frame_smoothing_m,
+                "rem_zero_mode": config.rem_zero_mode,
+            }
+        )
     run_meta = {
         "experiment_id": experiment_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "git_commit": git_hash,
         "notes": notes,
-        "parameters": {
-            "ndwi_threshold": config.ndwi_threshold,
-            "flowlines_buffer_m": config.flowlines_buffer_m,
-            "rem_smooth_sigma": config.rem_smooth_sigma,
-            "rem_excluded_fcodes": sorted(excluded),
-            "rem_propagate_mask": config.rem_propagate_mask,
-            "rem_propagate_hops": config.rem_propagate_hops,
-        },
+        "parameters": params,
         "timing_s": round(elapsed, 1),
         "summary": summary,
     }
