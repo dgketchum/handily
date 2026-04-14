@@ -476,6 +476,71 @@ def sample_station_water_support(
         }
 
 
+def _batch_corridor_support(
+    centers_xy: np.ndarray,
+    normals: np.ndarray,
+    tangents: np.ndarray,
+    water_interp: RegularGridInterpolator,
+    corridor_half_width_m: float,
+    corridor_half_length_m: float,
+    step_m: float,
+    mode: str,
+    water_hit_threshold: float = 0.0,
+) -> np.ndarray:
+    """Vectorized corridor water support for a batch of candidate positions.
+
+    Parameters
+    ----------
+    centers_xy : (N, 2) array of candidate center coordinates
+    normals : (N, 2) array of unit normal vectors (one per candidate)
+    tangents : (N, 2) array of unit tangent vectors (one per candidate)
+
+    Returns
+    -------
+    water_support_frac : (N,) array of corridor water fractions
+    """
+    n = len(centers_xy)
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    # Build corridor offset grid (shared across all candidates)
+    across = np.arange(
+        -corridor_half_width_m, corridor_half_width_m + step_m * 0.5, step_m
+    )
+    along = np.arange(
+        -corridor_half_length_m, corridor_half_length_m + step_m * 0.5, step_m
+    )
+    da, dc = np.meshgrid(along, across, indexing="ij")
+    da_flat = da.ravel()  # (K,)
+    dc_flat = dc.ravel()  # (K,)
+    k = len(da_flat)
+
+    # Broadcast offsets to all candidates: (N, K, 2)
+    # offset[i, j] = da_flat[j] * tangent[i] + dc_flat[j] * normal[i]
+    offset_xy = (
+        da_flat[np.newaxis, :, np.newaxis] * tangents[:, np.newaxis, :]
+        + dc_flat[np.newaxis, :, np.newaxis] * normals[:, np.newaxis, :]
+    )
+    # Sample points: (N, K, 2)
+    pts_xy = centers_xy[:, np.newaxis, :] + offset_xy
+
+    # Flatten for single interpolation call
+    flat_x = pts_xy[:, :, 0].ravel()
+    flat_y = pts_xy[:, :, 1].ravel()
+    flat_vals = _sample_raster_at_points(water_interp, flat_x, flat_y)
+    vals = flat_vals.reshape(n, k)
+
+    # Compute support fraction per candidate
+    if mode == "binary_mask":
+        hits = vals >= 0.5
+    else:
+        hits = vals > water_hit_threshold
+    # Treat NaN as non-hit
+    hits[np.isnan(vals)] = False
+    support_frac = np.mean(hits, axis=1)
+    return support_frac
+
+
 def snap_reach_to_thalweg(
     reach_geom: LineString,
     dem_da: xr.DataArray,
@@ -565,22 +630,25 @@ def snap_reach_to_thalweg(
         n_stations, n_offsets
     )
 
-    # --- Water cost: corridor-based support per candidate ---
-    water_cost = np.ones((n_stations, n_offsets), dtype=np.float64)
-    for s in range(n_stations):
-        for j in range(n_offsets):
-            sup = sample_station_water_support(
-                cand_xy[s, j],
-                normal[s],
-                tangent[s],
-                ndwi_interp,
-                corridor_hw,
-                corridor_hl,
-                step_m=snap_search_spacing_m,
-                mode=support_mode,
-                **support_kwargs,
-            )
-            water_cost[s, j] = 1.0 - sup["water_support_frac"]
+    # --- Water cost: vectorized corridor support for all candidates ---
+    # Flatten (n_stations, n_offsets) → (N,) with matching normals/tangents
+    n_cand = n_stations * n_offsets
+    flat_centers = cand_xy.reshape(n_cand, 2)
+    flat_normals = np.repeat(normal, n_offsets, axis=0)  # (N, 2)
+    flat_tangents = np.repeat(tangent, n_offsets, axis=0)  # (N, 2)
+    hit_threshold = support_kwargs.get("water_hit_threshold", 0.0)
+    flat_frac = _batch_corridor_support(
+        flat_centers,
+        flat_normals,
+        flat_tangents,
+        ndwi_interp,
+        corridor_hw,
+        corridor_hl,
+        step_m=snap_search_spacing_m,
+        mode=support_mode,
+        water_hit_threshold=hit_threshold,
+    )
+    water_cost = 1.0 - flat_frac.reshape(n_stations, n_offsets)
 
     # --- Build cost matrix ---
     dem_min = np.nanmin(dem_vals, axis=1, keepdims=True)
@@ -614,24 +682,41 @@ def snap_reach_to_thalweg(
     for s in range(n_stations - 2, -1, -1):
         chosen[s] = dp_prev[s + 1, chosen[s + 1]]
 
-    # --- Corridor support at snapped positions ---
+    # --- Corridor support at snapped positions (vectorized) ---
     snap_offsets = offsets[chosen]
     snap_xy = coords + snap_offsets[:, np.newaxis] * normal
     snap_elev = np.array([dem_vals[s, chosen[s]] for s in range(n_stations)])
 
-    station_rows = []
-    for s in range(n_stations):
-        sup = sample_station_water_support(
-            snap_xy[s],
-            normal[s],
-            tangent[s],
+    snap_frac = _batch_corridor_support(
+        snap_xy,
+        normal,
+        tangent,
+        ndwi_interp,
+        corridor_hw,
+        corridor_hl,
+        step_m=snap_search_spacing_m,
+        mode=support_mode,
+        water_hit_threshold=hit_threshold,
+    )
+    # For binary_mask mode, frac == mean; for continuous, compute mean separately
+    if support_mode == "binary_mask":
+        snap_mean = snap_frac
+    else:
+        snap_mean = _batch_corridor_support(
+            snap_xy,
+            normal,
+            tangent,
             ndwi_interp,
             corridor_hw,
             corridor_hl,
             step_m=snap_search_spacing_m,
-            mode=support_mode,
-            **support_kwargs,
+            mode="binary_mask",
+            water_hit_threshold=0.0,
         )
+    snap_hit = snap_frac > 0
+
+    station_rows = []
+    for s in range(n_stations):
         station_rows.append(
             {
                 "station_id": s,
@@ -642,9 +727,9 @@ def snap_reach_to_thalweg(
                 "y_snap": float(snap_xy[s, 1]),
                 "snap_offset_m": float(snap_offsets[s]),
                 "thalweg_elev_m": float(snap_elev[s]),
-                "water_support_frac": sup["water_support_frac"],
-                "water_support_mean": sup["water_support_mean"],
-                "water_hit": sup["water_hit"],
+                "water_support_frac": float(snap_frac[s]),
+                "water_support_mean": float(snap_mean[s]),
+                "water_hit": bool(snap_hit[s]),
                 "geometry": Point(snap_xy[s, 0], snap_xy[s, 1]),
             }
         )
@@ -1222,20 +1307,8 @@ def compute_rem_anisotropic_frame(
         )
     LOGGER.info("Processing %d eligible reaches", len(eligible))
 
-    snapped_reaches = []
-    frame_reaches = []
-    all_sections = []
-    all_support = []
-    metrics = {
-        "n_reaches_total": n_all,
-        "n_reaches_eligible": len(eligible),
-        "n_reaches_skipped_no_seed": n_skipped_seed,
-        "n_reaches_processed": 0,
-        "n_reaches_skipped": 0,
-        "snap_offsets": [],
-    }
-
-    for _, row in eligible.iterrows():
+    def _process_one_reach(row):
+        """Snap + smooth + cross-section for a single reach. Thread-safe."""
         rid = int(row["reach_id"])
         geom = row["geometry"]
         if (
@@ -1243,33 +1316,26 @@ def compute_rem_anisotropic_frame(
             or geom.is_empty
             or geom.length < config.rem_min_support_width_m
         ):
-            metrics["n_reaches_skipped"] += 1
             LOGGER.info(
-                "Skipping reach %d: too short (%.0f m)", rid, geom.length if geom else 0
+                "Skipping reach %d: too short (%.0f m)",
+                rid,
+                geom.length if geom else 0,
             )
-            continue
+            return None
 
-        # Phase 5: snap to thalweg
         snapped = snap_reach_to_thalweg(geom, dem_da, ndwi_da, config)
         snapped.reach_id = rid
         if snapped.metrics is not None:
             snapped.metrics.seeded_fraction = float(row.get("seeded_fraction", 0.0))
 
-        # Phase 5b: reach acceptance
         reject_reason = evaluate_reach_acceptance(snapped, config)
         if reject_reason:
-            metrics["n_reaches_skipped"] += 1
             LOGGER.info("Skipping reach %d: %s", rid, reject_reason)
-            continue
+            return None
 
-        snapped_reaches.append(snapped)
-
-        # Phase 6: frame smoothing
         frame = build_smoothed_frame(snapped, smoothing_m=config.rem_frame_smoothing_m)
         frame.reach_id = rid
-        frame_reaches.append(frame)
 
-        # Phase 6: cross-sections
         xsec = sample_cross_sections(
             frame,
             dem_da,
@@ -1284,6 +1350,37 @@ def compute_rem_anisotropic_frame(
         sec_df["reach_id"] = rid
         sup_df = xsec.support_polygons.copy()
         sup_df["reach_id"] = rid
+        return (snapped, frame, sec_df, sup_df)
+
+    # Run reaches in parallel (ThreadPool — numpy/scipy release the GIL)
+    from concurrent.futures import ThreadPoolExecutor
+
+    max_workers = getattr(config, "rem_max_workers", None)
+    reach_rows = [row for _, row in eligible.iterrows()]
+
+    snapped_reaches = []
+    frame_reaches = []
+    all_sections = []
+    all_support = []
+    metrics = {
+        "n_reaches_total": n_all,
+        "n_reaches_eligible": len(eligible),
+        "n_reaches_skipped_no_seed": n_skipped_seed,
+        "n_reaches_processed": 0,
+        "n_reaches_skipped": 0,
+        "snap_offsets": [],
+    }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        results = list(pool.map(_process_one_reach, reach_rows))
+
+    for result in results:
+        if result is None:
+            metrics["n_reaches_skipped"] += 1
+            continue
+        snapped, frame, sec_df, sup_df = result
+        snapped_reaches.append(snapped)
+        frame_reaches.append(frame)
         all_sections.append(sec_df)
         all_support.append(sup_df)
         metrics["n_reaches_processed"] += 1
