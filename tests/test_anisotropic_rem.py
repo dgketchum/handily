@@ -164,7 +164,7 @@ class TestReachSplitting:
             assert r["n_flowlines"] < 4
 
     def test_seeded_fraction_propagates(self):
-        """Seeded fraction on reaches reflects per-flowline seeded status."""
+        """Each NHD feature becomes its own reach; seeded_fraction is per-feature."""
         lines = gpd.GeoDataFrame(
             {"lengthkm": [0.03, 0.03], "water_seeded": [True, False]},
             geometry=[
@@ -174,9 +174,10 @@ class TestReachSplitting:
             crs="EPSG:5070",
         )
         reaches = rem_frame.split_confirmed_flowlines_into_reaches(lines)
-        # Single chain with mixed seeded: fraction should be 0.5
-        assert len(reaches) == 1
-        assert 0.4 < reaches.iloc[0]["seeded_fraction"] < 0.6
+        # Each feature is its own reach — no feature duplication across reaches
+        assert len(reaches) == 2
+        fractions = sorted(reaches["seeded_fraction"].tolist())
+        assert fractions == [0.0, 1.0]
 
 
 # ---------------------------------------------------------------------------
