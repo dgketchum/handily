@@ -14,6 +14,7 @@ This module implements an experimental REM workflow that:
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -395,87 +396,6 @@ def _sample_raster_at_points(
     return interp(pts)
 
 
-def sample_station_water_support(
-    center_xy: np.ndarray,
-    normal: np.ndarray,
-    tangent: np.ndarray,
-    water_interp: RegularGridInterpolator,
-    corridor_half_width_m: float,
-    corridor_half_length_m: float,
-    step_m: float = 5.0,
-    mode: str = "binary_mask",
-    **kwargs,
-) -> dict:
-    """Evaluate water support in a corridor around a snapped station.
-
-    The corridor is a rectangle oriented along the stream (tangent) and
-    across it (normal).
-
-    Parameters
-    ----------
-    center_xy : (2,) array — station center in map coords
-    normal : (2,) unit vector perpendicular to stream
-    tangent : (2,) unit vector along stream
-    water_interp : interpolator for water raster
-    corridor_half_width_m : half-width across stream
-    corridor_half_length_m : half-length along stream
-    step_m : sample grid spacing within the corridor
-    mode : "binary_mask" or "continuous_index"
-
-    Returns
-    -------
-    dict with water_support_mean, water_support_max, water_support_frac, water_hit
-    """
-    # Build a sample grid within the corridor
-    across = np.arange(
-        -corridor_half_width_m, corridor_half_width_m + step_m * 0.5, step_m
-    )
-    along = np.arange(
-        -corridor_half_length_m, corridor_half_length_m + step_m * 0.5, step_m
-    )
-    da, dc = np.meshgrid(along, across, indexing="ij")
-    offsets = (
-        da.ravel()[:, np.newaxis] * tangent[np.newaxis, :]
-        + dc.ravel()[:, np.newaxis] * normal[np.newaxis, :]
-    )
-    pts_xy = center_xy[np.newaxis, :] + offsets
-    vals = _sample_raster_at_points(water_interp, pts_xy[:, 0], pts_xy[:, 1])
-    valid = vals[np.isfinite(vals)]
-
-    if len(valid) == 0:
-        return {
-            "water_support_mean": 0.0,
-            "water_support_max": 0.0,
-            "water_support_frac": 0.0,
-            "water_hit": False,
-        }
-
-    if mode == "binary_mask":
-        # Threshold at 0.5 to avoid bilinear interpolation dilation:
-        # sub-pixel positions near a water pixel edge get fractional values
-        # that should not count as water hits.
-        hits = valid >= 0.5
-        frac = float(np.mean(hits))
-        return {
-            "water_support_mean": frac,
-            "water_support_max": float(np.max(valid)),
-            "water_support_frac": frac,
-            "water_hit": frac > 0,
-        }
-    else:
-        # Continuous mode: use the configured NDWI threshold (passed via
-        # water_hit_threshold) rather than a bare > 0 test.
-        hit_threshold = kwargs.get("water_hit_threshold", 0.0)
-        frac = float(np.mean(valid > hit_threshold))
-        mean_val = float(np.mean(valid))
-        return {
-            "water_support_mean": mean_val,
-            "water_support_max": float(np.max(valid)),
-            "water_support_frac": frac,
-            "water_hit": frac > 0,
-        }
-
-
 def _batch_corridor_support(
     centers_xy: np.ndarray,
     normals: np.ndarray,
@@ -486,7 +406,8 @@ def _batch_corridor_support(
     step_m: float,
     mode: str,
     water_hit_threshold: float = 0.0,
-) -> np.ndarray:
+    return_raw_mean: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Vectorized corridor water support for a batch of candidate positions.
 
     Parameters
@@ -494,14 +415,17 @@ def _batch_corridor_support(
     centers_xy : (N, 2) array of candidate center coordinates
     normals : (N, 2) array of unit normal vectors (one per candidate)
     tangents : (N, 2) array of unit tangent vectors (one per candidate)
+    return_raw_mean : if True, also return mean of raw (un-thresholded) values
 
     Returns
     -------
-    water_support_frac : (N,) array of corridor water fractions
+    water_support_frac : (N,) array of corridor water hit fractions
+    raw_mean : (N,) array of mean raw values (only if return_raw_mean=True)
     """
     n = len(centers_xy)
     if n == 0:
-        return np.zeros(0, dtype=np.float64)
+        empty = np.zeros(0, dtype=np.float64)
+        return (empty, empty) if return_raw_mean else empty
 
     # Build corridor offset grid (shared across all candidates)
     across = np.arange(
@@ -516,12 +440,10 @@ def _batch_corridor_support(
     k = len(da_flat)
 
     # Broadcast offsets to all candidates: (N, K, 2)
-    # offset[i, j] = da_flat[j] * tangent[i] + dc_flat[j] * normal[i]
     offset_xy = (
         da_flat[np.newaxis, :, np.newaxis] * tangents[:, np.newaxis, :]
         + dc_flat[np.newaxis, :, np.newaxis] * normals[:, np.newaxis, :]
     )
-    # Sample points: (N, K, 2)
     pts_xy = centers_xy[:, np.newaxis, :] + offset_xy
 
     # Flatten for single interpolation call
@@ -535,9 +457,13 @@ def _batch_corridor_support(
         hits = vals >= 0.5
     else:
         hits = vals > water_hit_threshold
-    # Treat NaN as non-hit
     hits[np.isnan(vals)] = False
     support_frac = np.mean(hits, axis=1)
+
+    if return_raw_mean:
+        safe_vals = np.where(np.isnan(vals), 0.0, vals)
+        raw_mean = np.mean(safe_vals, axis=1)
+        return support_frac, raw_mean
     return support_frac
 
 
@@ -687,7 +613,7 @@ def snap_reach_to_thalweg(
     snap_xy = coords + snap_offsets[:, np.newaxis] * normal
     snap_elev = np.array([dem_vals[s, chosen[s]] for s in range(n_stations)])
 
-    snap_frac = _batch_corridor_support(
+    snap_frac, snap_mean = _batch_corridor_support(
         snap_xy,
         normal,
         tangent,
@@ -697,22 +623,8 @@ def snap_reach_to_thalweg(
         step_m=snap_search_spacing_m,
         mode=support_mode,
         water_hit_threshold=hit_threshold,
+        return_raw_mean=True,
     )
-    # For binary_mask mode, frac == mean; for continuous, compute mean separately
-    if support_mode == "binary_mask":
-        snap_mean = snap_frac
-    else:
-        snap_mean = _batch_corridor_support(
-            snap_xy,
-            normal,
-            tangent,
-            ndwi_interp,
-            corridor_hw,
-            corridor_hl,
-            step_m=snap_search_spacing_m,
-            mode="binary_mask",
-            water_hit_threshold=0.0,
-        )
     snap_hit = snap_frac > 0
 
     station_rows = []
@@ -1353,10 +1265,8 @@ def compute_rem_anisotropic_frame(
         return (snapped, frame, sec_df, sup_df)
 
     # Run reaches in parallel (ThreadPool — numpy/scipy release the GIL)
-    from concurrent.futures import ThreadPoolExecutor
-
     max_workers = getattr(config, "rem_max_workers", None)
-    reach_rows = [row for _, row in eligible.iterrows()]
+    reach_rows = [eligible.iloc[i] for i in range(len(eligible))]
 
     snapped_reaches = []
     frame_reaches = []

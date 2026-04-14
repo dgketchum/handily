@@ -206,10 +206,10 @@ class TestCorridorSupport:
             bounds_error=False,
             fill_value=0.0,
         )
-        center = np.array([50.5, 50.5])
-        normal = np.array([1.0, 0.0])
-        tangent_vec = np.array([0.0, 1.0])
-        result = rem_frame.sample_station_water_support(
+        center = np.array([[50.5, 50.5]])
+        normal = np.array([[1.0, 0.0]])
+        tangent_vec = np.array([[0.0, 1.0]])
+        frac = rem_frame._batch_corridor_support(
             center,
             normal,
             tangent_vec,
@@ -219,8 +219,7 @@ class TestCorridorSupport:
             step_m=1.0,
             mode="binary_mask",
         )
-        assert result["water_support_frac"] > 0
-        assert result["water_hit"] is True
+        assert frac[0] > 0
 
 
 # ---------------------------------------------------------------------------
