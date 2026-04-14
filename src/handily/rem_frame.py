@@ -212,8 +212,8 @@ def split_confirmed_flowlines_into_reaches(
     reaches = []
 
     def _walk_one_direction(start_feat, next_feat):
-        """Walk a single branch from start_feat through next_feat."""
-        chain = [start_feat]
+        """Walk a branch from next_feat onward (start_feat is NOT included)."""
+        chain = []
         prev, cur = start_feat, next_feat
         while cur not in used:
             used.add(cur)
@@ -236,31 +236,21 @@ def split_confirmed_flowlines_into_reaches(
     for start in sorted(starters):
         if start in used:
             continue
+        used.add(start)
         neighbors = adj.get(start, set())
         if not neighbors:
-            # Isolated feature
-            used.add(start)
+            # Isolated feature — emit as its own reach
             reaches.append([start])
             continue
+        # Emit the starter as its own reach (each NHD feature appears once)
+        reaches.append([start])
         # Walk each branch direction separately
-        branches_started = 0
-        emitted_solo = False
         for nb in sorted(neighbors):
             if nb in used and nb not in junction_features:
                 continue
             chain = _walk_one_direction(start, nb)
-            if len(chain) == 1:
-                # Walk went nowhere (neighbor already used); emit at most once
-                if emitted_solo:
-                    continue
-                emitted_solo = True
-            reaches.append(chain)
-            branches_started += 1
-        if branches_started > 0:
-            used.add(start)
-        elif start not in used:
-            used.add(start)
-            reaches.append([start])
+            if chain:
+                reaches.append(chain)
 
     # Catch remaining isolated loops (all degree-2, no junction)
     for fidx in range(n):
