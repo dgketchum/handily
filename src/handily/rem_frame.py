@@ -757,6 +757,240 @@ def evaluate_reach_acceptance(
 
 
 # ---------------------------------------------------------------------------
+# Phase 5b: Merge adjacent snapped reaches into chains
+# ---------------------------------------------------------------------------
+
+
+def merge_snapped_reaches(
+    snapped_list: list[SnappedReach],
+    snap_tolerance: float = 5.0,
+) -> list[SnappedReach]:
+    """Chain adjacent snapped reaches into longer merged reaches.
+
+    After individual per-feature snapping, this reconnects reaches whose
+    snapped endpoints are within *snap_tolerance* of each other.  Chains of
+    degree-2 connections are merged into single SnappedReach objects so that
+    downstream smoothing operates across former feature boundaries.
+
+    Junction endpoints (degree > 2) break chains — each branch becomes its
+    own merged reach.
+    """
+    from collections import defaultdict
+    from scipy.spatial import cKDTree
+
+    n = len(snapped_list)
+    if n <= 1:
+        return list(snapped_list)
+
+    # Collect endpoints: index 2*i = start, 2*i+1 = end of snapped_geom
+    endpoints = np.empty((2 * n, 2), dtype=np.float64)
+    for i, sr in enumerate(snapped_list):
+        coords = sr.snapped_geom.coords
+        endpoints[2 * i] = coords[0][:2]
+        endpoints[2 * i + 1] = coords[-1][:2]
+
+    tree = cKDTree(endpoints)
+    pairs = tree.query_pairs(r=snap_tolerance)
+
+    # Build feature-level adjacency (which reaches connect)
+    adj = defaultdict(set)
+    # Also track which endpoint-pair matched (for orientation)
+    # ep_links[i] = set of (j, i_end, j_end) where i_end/j_end in {0, 1}
+    ep_links = defaultdict(list)
+    for p, q in pairs:
+        fi, fi_end = divmod(p, 2)  # fi_end: 0=start, 1=end
+        fj, fj_end = divmod(q, 2)
+        if fi != fj:
+            adj[fi].add(fj)
+            adj[fj].add(fi)
+            ep_links[fi].append((fj, fi_end, fj_end))
+            ep_links[fj].append((fi, fj_end, fi_end))
+
+    # Identify junction features (connected to > 2 others at a single endpoint)
+    # Count connections per endpoint
+    ep_degree = defaultdict(int)
+    for p, q in pairs:
+        fi, fi_end = divmod(p, 2)
+        fj, fj_end = divmod(q, 2)
+        if fi != fj:
+            ep_degree[(fi, fi_end)] += 1
+            ep_degree[(fj, fj_end)] += 1
+
+    junction_features = {feat for (feat, _), deg in ep_degree.items() if deg > 1}
+
+    # Walk chains: start from dead-ends and junctions
+    used = set()
+    chains = []  # list of [(feat_idx, reversed_bool), ...]
+
+    def _get_link(fi, fj):
+        """Get the endpoint link between fi and fj."""
+        for link_fj, fi_end, fj_end in ep_links[fi]:
+            if link_fj == fj:
+                return fi_end, fj_end
+        return None, None
+
+    def _walk_chain(start, direction_neighbor=None):
+        """Walk a chain from start, optionally toward direction_neighbor."""
+        chain = []
+        if direction_neighbor is not None:
+            fi_end, fj_end = _get_link(start, direction_neighbor)
+            # start is oriented so its fi_end connects to neighbor
+            # We want the chain to go: start → neighbor → ...
+            # start should be reversed if its connecting end is 0 (start of geom)
+            chain.append((start, fi_end == 0))
+            used.add(start)
+            cur = direction_neighbor
+            prev_connecting_end = fj_end  # which end of cur connects to prev
+        else:
+            chain.append((start, False))
+            used.add(start)
+            # Pick any unused neighbor
+            neighbors = adj.get(start, set()) - used
+            if not neighbors:
+                return chain
+            cur = next(iter(sorted(neighbors)))
+            fi_end, fj_end = _get_link(start, cur)
+            chain[0] = (start, fi_end == 0)  # reorient start
+            prev_connecting_end = fj_end
+
+        while cur not in used:
+            used.add(cur)
+            # cur connects to prev at prev_connecting_end
+            # We want cur oriented so prev_connecting_end is its start (index 0)
+            # If prev_connecting_end == 1, cur's end connects to prev → reverse
+            # If prev_connecting_end == 0, cur's start connects to prev → as-is
+            needs_reverse = prev_connecting_end == 1
+            chain.append((cur, needs_reverse))
+
+            if cur in junction_features:
+                break
+
+            # Find next
+            neighbors = adj.get(cur, set()) - used
+            if len(neighbors) != 1:
+                break
+            nxt = neighbors.pop()
+            cur_end, nxt_end = _get_link(cur, nxt)
+            # cur_end is which end of cur connects to nxt
+            # If we reversed cur, flip cur_end
+            if needs_reverse:
+                cur_end = 1 - cur_end
+            # Only continue if cur connects to nxt from its far end (end=1 after orientation)
+            if cur_end != 1:
+                break
+            prev_connecting_end = nxt_end
+            cur = nxt
+
+        return chain
+
+    # Start from dead-ends and junctions
+    starters = set()
+    for i in range(n):
+        degree = len(adj.get(i, set()))
+        if degree != 2 or i in junction_features:
+            starters.add(i)
+
+    for start in sorted(starters):
+        if start in used:
+            continue
+        neighbors = sorted(adj.get(start, set()))
+        if not neighbors:
+            used.add(start)
+            chains.append([(start, False)])
+            continue
+        for nb in neighbors:
+            if nb in used and nb not in junction_features:
+                continue
+            chain = _walk_chain(start, nb)
+            if chain:
+                chains.append(chain)
+                break  # start is now used
+        else:
+            if start not in used:
+                used.add(start)
+                chains.append([(start, False)])
+
+    # Catch isolated loops
+    for i in range(n):
+        if i not in used:
+            chain = _walk_chain(i)
+            if chain:
+                chains.append(chain)
+
+    # Build merged SnappedReach objects
+    merged = []
+    for chain_id, chain in enumerate(chains):
+        all_stations = []
+        cumulative_s = 0.0
+
+        for feat_idx, needs_reverse in chain:
+            sr = snapped_list[feat_idx]
+            st = sr.stations.copy()
+
+            if needs_reverse:
+                st = st.iloc[::-1].reset_index(drop=True)
+                max_s = st["s_m"].max()
+                st["s_m"] = max_s - st["s_m"]
+
+            # Shift s_m to be continuous
+            st["s_m"] = st["s_m"] - st["s_m"].iloc[0] + cumulative_s
+            cumulative_s = st["s_m"].iloc[-1] + (
+                sr.stations["s_m"].diff().median() if len(sr.stations) > 1 else 10.0
+            )
+
+            # Update station_id and coordinates
+            st["x_snap"] = [g.x for g in st.geometry]
+            st["y_snap"] = [g.y for g in st.geometry]
+
+            all_stations.append(st)
+
+        merged_stations = gpd.GeoDataFrame(
+            pd.concat(all_stations, ignore_index=True),
+            geometry="geometry",
+        )
+        merged_stations["station_id"] = range(len(merged_stations))
+
+        # Build merged geometry
+        snap_xy = np.column_stack(
+            [
+                merged_stations["x_snap"].values,
+                merged_stations["y_snap"].values,
+            ]
+        )
+        merged_geom = LineString(snap_xy.tolist())
+
+        # Aggregate metrics
+        n_stations = len(merged_stations)
+        hit_frac = float(merged_stations["water_hit"].mean()) if n_stations else 0.0
+        abs_offsets = merged_stations["snap_offset_m"].abs()
+
+        merged_sr = SnappedReach(
+            reach_id=chain_id,
+            prior_geom=merged_geom,  # no single prior for merged
+            snapped_geom=merged_geom,
+            stations=merged_stations,
+            confidence=hit_frac,
+            metrics=ReachMetrics(
+                station_water_hit_fraction=hit_frac,
+                station_water_support_mean=float(
+                    merged_stations["water_support_mean"].mean()
+                )
+                if n_stations
+                else 0.0,
+                mean_snap_offset_m=float(abs_offsets.mean()) if n_stations else 0.0,
+                max_snap_offset_m=float(abs_offsets.max()) if n_stations else 0.0,
+                max_consecutive_no_water_m=0.0,  # recomputed if needed
+                n_stations=n_stations,
+                n_supported_stations=int(merged_stations["water_hit"].sum()),
+            ),
+        )
+        merged.append(merged_sr)
+
+    LOGGER.info("Merged %d snapped reaches into %d chains", n, len(merged))
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # Phase 6: Frame smoothing and cross-sections
 # ---------------------------------------------------------------------------
 
@@ -1270,8 +1504,9 @@ def compute_rem_anisotropic_frame(
         )
     LOGGER.info("Processing %d eligible reaches", len(eligible))
 
-    def _process_one_reach(row):
-        """Snap + smooth + cross-section for a single reach. Thread-safe."""
+    # --- Phase 5a: Snap each reach independently (parallel) ---
+    def _snap_one_reach(row):
+        """Snap a single reach. Thread-safe."""
         rid = int(row["reach_id"])
         geom = row["geometry"]
         if (
@@ -1301,6 +1536,44 @@ def compute_rem_anisotropic_frame(
                 "Reach %d: %s (keeping — propagation-confirmed)", rid, reject_reason
             )
 
+        return (snapped, reject_reason)
+
+    max_workers = getattr(config, "rem_max_workers", None)
+    reach_rows = [eligible.iloc[i] for i in range(len(eligible))]
+
+    metrics = {
+        "n_reaches_total": n_all,
+        "n_reaches_eligible": len(eligible),
+        "n_reaches_skipped_no_seed": n_skipped_seed,
+        "n_reaches_processed": 0,
+        "n_reaches_warned": 0,
+        "n_reaches_skipped": 0,
+        "snap_offsets": [],
+    }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        snap_results = list(pool.map(_snap_one_reach, reach_rows))
+
+    # Collect successful snaps
+    snapped_list = []
+    for result in snap_results:
+        if result is None:
+            metrics["n_reaches_skipped"] += 1
+            continue
+        snapped, reject_reason = result
+        if reject_reason:
+            metrics["n_reaches_warned"] += 1
+        snapped_list.append(snapped)
+
+    # --- Phase 5b: Merge adjacent snapped reaches into chains ---
+    merged_reaches = merge_snapped_reaches(
+        snapped_list, snap_tolerance=config.rem_snap_search_spacing_m
+    )
+
+    # --- Phase 6: Frame + cross-sections on merged chains (parallel) ---
+    def _frame_one_chain(snapped):
+        """Smooth + cross-section for a merged chain. Thread-safe."""
+        rid = snapped.reach_id
         frame = build_smoothed_frame(snapped, smoothing_m=config.rem_frame_smoothing_m)
         frame.reach_id = rid
 
@@ -1318,44 +1591,22 @@ def compute_rem_anisotropic_frame(
         sec_df["reach_id"] = rid
         sup_df = xsec.support_polygons.copy()
         sup_df["reach_id"] = rid
-        return (snapped, frame, sec_df, sup_df, reject_reason)
+        return (frame, sec_df, sup_df)
 
-    # Run reaches in parallel (ThreadPool — numpy/scipy release the GIL)
-    max_workers = getattr(config, "rem_max_workers", None)
-    reach_rows = [eligible.iloc[i] for i in range(len(eligible))]
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        frame_results = list(pool.map(_frame_one_chain, merged_reaches))
 
     snapped_reaches = []
     frame_reaches = []
     all_sections = []
     all_support = []
-    metrics = {
-        "n_reaches_total": n_all,
-        "n_reaches_eligible": len(eligible),
-        "n_reaches_skipped_no_seed": n_skipped_seed,
-        "n_reaches_processed": 0,
-        "n_reaches_warned": 0,
-        "n_reaches_skipped": 0,
-        "snap_offsets": [],
-    }
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        results = list(pool.map(_process_one_reach, reach_rows))
-
-    # Deduplicate overlapping snapped reaches (keep the longer one)
-    results = _dedup_overlapping_results(results, metrics)
-
-    for result in results:
-        if result is None:
-            metrics["n_reaches_skipped"] += 1
-            continue
-        snapped, frame, sec_df, sup_df, reject_reason = result
-        snapped_reaches.append((snapped, reject_reason))
+    for snapped, (frame, sec_df, sup_df) in zip(merged_reaches, frame_results):
+        snapped_reaches.append((snapped, None))
         frame_reaches.append(frame)
         all_sections.append(sec_df)
         all_support.append(sup_df)
         metrics["n_reaches_processed"] += 1
-        if reject_reason:
-            metrics["n_reaches_warned"] += 1
         metrics["snap_offsets"].extend(snapped.stations["snap_offset_m"].abs().tolist())
 
     # Aggregate geometry artifacts
