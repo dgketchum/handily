@@ -141,30 +141,24 @@ class TestFlowlineStatus:
 
 
 class TestReachSplitting:
-    def test_junction_produces_separate_branches(self):
-        """A Y-junction (3 lines meeting) should yield separate branch reaches,
-        not one merged chain.  With 5 features (2-1-junction-1-2 topology),
-        each branch is its own reach."""
-        # Build a clear Y: one trunk of 2 features, two branches of 1 each
+    def test_one_reach_per_feature(self):
+        """Each NHD feature maps to exactly one reach — 1:1."""
         lines = gpd.GeoDataFrame(
             {"lengthkm": [0.05] * 4, "water_seeded": [True] * 4},
             geometry=[
-                LineString([(0, 0), (50, 0)]),  # trunk seg 1
-                LineString([(50, 0), (100, 0)]),  # trunk seg 2
-                LineString([(100, 0), (150, 50)]),  # branch A
-                LineString([(100, 0), (150, -50)]),  # branch B
+                LineString([(0, 0), (50, 0)]),
+                LineString([(50, 0), (100, 0)]),
+                LineString([(100, 0), (150, 50)]),
+                LineString([(100, 0), (150, -50)]),
             ],
             crs="EPSG:5070",
         )
         reaches = rem_frame.split_confirmed_flowlines_into_reaches(lines)
-        # Should produce at least 2 separate reaches (trunk + each branch)
-        assert len(reaches) >= 2
-        # No single reach should contain all 4 features
-        for _, r in reaches.iterrows():
-            assert r["n_flowlines"] < 4
+        assert len(reaches) == 4
+        assert all(reaches["n_flowlines"] == 1)
 
-    def test_seeded_fraction_propagates(self):
-        """Each NHD feature becomes its own reach; seeded_fraction is per-feature."""
+    def test_seeded_fraction_per_feature(self):
+        """Seeded fraction reflects per-feature seeded status."""
         lines = gpd.GeoDataFrame(
             {"lengthkm": [0.03, 0.03], "water_seeded": [True, False]},
             geometry=[
@@ -174,7 +168,6 @@ class TestReachSplitting:
             crs="EPSG:5070",
         )
         reaches = rem_frame.split_confirmed_flowlines_into_reaches(lines)
-        # Each feature is its own reach — no feature duplication across reaches
         assert len(reaches) == 2
         fractions = sorted(reaches["seeded_fraction"].tolist())
         assert fractions == [0.0, 1.0]
