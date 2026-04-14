@@ -91,6 +91,7 @@ class HandilyConfig:
     rem_max_consecutive_no_water_m: float = 2000.0
     rem_max_mean_snap_offset_m: float = 100.0
     rem_min_seeded_fraction: float = 0.0
+    rem_max_workers: int | None = None  # Thread pool workers for reach processing
 
     # Points sampling
     points_out_dir: str | None = None
@@ -265,6 +266,9 @@ class HandilyConfig:
                 data.get("rem_max_mean_snap_offset_m", 100.0)
             ),
             rem_min_seeded_fraction=float(data.get("rem_min_seeded_fraction", 0.0)),
+            rem_max_workers=int(data["rem_max_workers"])
+            if data.get("rem_max_workers") is not None
+            else None,
             run_rem=bool(data.get("run_rem", True)),
             overwrite_outputs=bool(data.get("overwrite_outputs", False)),
             rem_threshold=float(data.get("rem_threshold", 2.0)),
