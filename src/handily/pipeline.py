@@ -138,11 +138,13 @@ class REMWorkflow:
                 flowlines_buffer_m=buf_m,
                 max_hops=self.config.rem_propagate_hops,
             )
-            # Use water_seeded for primary frame building; reachable for raster mask
-            confirmed = annotated[annotated["reachable_from_seed"]].copy()
-            self.streams = compute.rasterize_confirmed_flowlines(confirmed, self.dem)
+            # Raster mask from all reachable flowlines (for EDT fallback / diagnostics)
+            reachable = annotated[annotated["reachable_from_seed"]].copy()
+            self.streams = compute.rasterize_confirmed_flowlines(reachable, self.dem)
+            # Frame building uses only water-seeded flowlines
+            seeded = annotated[annotated["water_seeded"]].copy()
             result = rem_frame.compute_rem_anisotropic_frame(
-                self.dem, self.ndwi, confirmed, self.config
+                self.dem, self.ndwi, seeded, self.config
             )
             self.rem = result.rem_da
         elif self.config.rem_propagate_mask:
@@ -455,10 +457,11 @@ def run_experiment(
             flowlines_buffer_m=config.flowlines_buffer_m,
             max_hops=config.rem_propagate_hops,
         )
-        confirmed = annotated[annotated["reachable_from_seed"]].copy()
-        streams = compute.rasterize_confirmed_flowlines(confirmed, dem_da)
+        reachable = annotated[annotated["reachable_from_seed"]].copy()
+        streams = compute.rasterize_confirmed_flowlines(reachable, dem_da)
+        seeded = annotated[annotated["water_seeded"]].copy()
         result = rem_frame.compute_rem_anisotropic_frame(
-            dem_da, ndwi_da, confirmed, config
+            dem_da, ndwi_da, seeded, config
         )
         rem_da = result.rem_da
     elif config.rem_propagate_mask:
