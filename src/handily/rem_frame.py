@@ -244,10 +244,16 @@ def split_confirmed_flowlines_into_reaches(
             continue
         # Walk each branch direction separately
         branches_started = 0
+        emitted_solo = False
         for nb in sorted(neighbors):
             if nb in used and nb not in junction_features:
                 continue
             chain = _walk_one_direction(start, nb)
+            if len(chain) == 1:
+                # Walk went nowhere (neighbor already used); emit at most once
+                if emitted_solo:
+                    continue
+                emitted_solo = True
             reaches.append(chain)
             branches_started += 1
         if branches_started > 0:
