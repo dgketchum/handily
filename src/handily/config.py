@@ -61,6 +61,36 @@ class HandilyConfig:
         False  # Use network-propagated stream mask (BFS from NDWI seeds)
     )
     rem_propagate_hops: int | None = None  # Max BFS hops from seeds; None = unlimited
+    rem_method: str = "edt"  # "edt" | "anisotropic_frame"
+    rem_zero_mode: str = "thalweg"  # "thalweg" | "section_min"
+    rem_frame_station_spacing_m: float = 10.0
+    rem_snap_max_offset_m: float = 75.0
+    rem_snap_search_spacing_m: float = 5.0
+    rem_frame_smoothing_m: float = 75.0
+    rem_cross_max_dist_m: float = 1200.0
+    rem_cross_step_m: float = 5.0
+    rem_cross_ridge_prominence_m: float = 2.0
+    rem_cross_descend_stop_m: float = 0.5
+    rem_min_support_width_m: float = 20.0
+    rem_min_confidence: float = 0.25
+    rem_debug_write_intermediates: bool = True
+
+    # Snap cost weights (must sum to 1.0 for unary; transition is separate)
+    rem_snap_w_elev: float = 0.3
+    rem_snap_w_water: float = 0.4
+    rem_snap_w_prior: float = 0.3
+    rem_snap_w_transition: float = 1.0
+
+    # Corridor support
+    rem_support_corridor_half_width_m: float = 15.0
+    rem_support_corridor_half_length_m: float = 10.0
+    rem_water_support_mode: str = "binary_mask"  # "binary_mask" | "continuous_index"
+
+    # Reach acceptance thresholds
+    rem_min_station_water_hit_fraction: float = 0.10
+    rem_max_consecutive_no_water_m: float = 2000.0
+    rem_max_mean_snap_offset_m: float = 100.0
+    rem_min_seeded_fraction: float = 0.0
 
     # Points sampling
     points_out_dir: str | None = None
@@ -193,6 +223,48 @@ class HandilyConfig:
             rem_propagate_hops=int(data.get("rem_propagate_hops"))
             if data.get("rem_propagate_hops") is not None
             else None,
+            rem_method=str(data.get("rem_method", "edt")),
+            rem_zero_mode=str(data.get("rem_zero_mode", "thalweg")),
+            rem_frame_station_spacing_m=float(
+                data.get("rem_frame_station_spacing_m", 10.0)
+            ),
+            rem_snap_max_offset_m=float(data.get("rem_snap_max_offset_m", 75.0)),
+            rem_snap_search_spacing_m=float(data.get("rem_snap_search_spacing_m", 5.0)),
+            rem_frame_smoothing_m=float(data.get("rem_frame_smoothing_m", 75.0)),
+            rem_cross_max_dist_m=float(data.get("rem_cross_max_dist_m", 1200.0)),
+            rem_cross_step_m=float(data.get("rem_cross_step_m", 5.0)),
+            rem_cross_ridge_prominence_m=float(
+                data.get("rem_cross_ridge_prominence_m", 2.0)
+            ),
+            rem_cross_descend_stop_m=float(data.get("rem_cross_descend_stop_m", 0.5)),
+            rem_min_support_width_m=float(data.get("rem_min_support_width_m", 20.0)),
+            rem_min_confidence=float(data.get("rem_min_confidence", 0.25)),
+            rem_debug_write_intermediates=bool(
+                data.get("rem_debug_write_intermediates", True)
+            ),
+            rem_snap_w_elev=float(data.get("rem_snap_w_elev", 0.3)),
+            rem_snap_w_water=float(data.get("rem_snap_w_water", 0.4)),
+            rem_snap_w_prior=float(data.get("rem_snap_w_prior", 0.3)),
+            rem_snap_w_transition=float(data.get("rem_snap_w_transition", 1.0)),
+            rem_support_corridor_half_width_m=float(
+                data.get("rem_support_corridor_half_width_m", 15.0)
+            ),
+            rem_support_corridor_half_length_m=float(
+                data.get("rem_support_corridor_half_length_m", 10.0)
+            ),
+            rem_water_support_mode=str(
+                data.get("rem_water_support_mode", "binary_mask")
+            ),
+            rem_min_station_water_hit_fraction=float(
+                data.get("rem_min_station_water_hit_fraction", 0.10)
+            ),
+            rem_max_consecutive_no_water_m=float(
+                data.get("rem_max_consecutive_no_water_m", 2000.0)
+            ),
+            rem_max_mean_snap_offset_m=float(
+                data.get("rem_max_mean_snap_offset_m", 100.0)
+            ),
+            rem_min_seeded_fraction=float(data.get("rem_min_seeded_fraction", 0.0)),
             run_rem=bool(data.get("run_rem", True)),
             overwrite_outputs=bool(data.get("overwrite_outputs", False)),
             rem_threshold=float(data.get("rem_threshold", 2.0)),

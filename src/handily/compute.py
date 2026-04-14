@@ -210,7 +210,7 @@ def filter_disconnected_flowlines(
     return flowlines_gdf.iloc[sorted(keep_idx)].reset_index(drop=True)
 
 
-def build_network_propagated_mask(
+def propagate_flowline_confirmation(
     flowlines_gdf,
     dem_da,
     ndwi_da,
@@ -218,13 +218,24 @@ def build_network_propagated_mask(
     flowlines_buffer_m: float,
     max_hops: int | None = None,
     snap_tolerance: float = 1.0,
-):
-    """Build a stream mask using NDWI-seeded network propagation.
+) -> gpd.GeoDataFrame:
+    """Annotate flowlines with water-seeding evidence and BFS reachability.
 
-    If any pixel of an NHD segment overlaps the NDWI mask, the entire segment
-    is confirmed.  Neighboring segments are also confirmed via BFS up to
-    *max_hops* (None = unlimited).  Returns a binary mask identical in format
-    to ``build_streams_mask_from_nhd_ndwi``.
+    Returns a copy of *flowlines_gdf* (projected to the DEM CRS) with columns:
+
+    - ``flowline_id``: 0-based index matching the input row order
+    - ``water_seeded``: True if the segment directly overlaps water pixels
+    - ``water_seed_pixels``: count of water pixels overlapping the segment
+    - ``water_seed_fraction``: fraction of segment raster cells with water
+    - ``reachable_from_seed``: True if connected to a seeded segment via BFS
+    - ``seed_hops``: BFS distance from nearest seeded segment (-1 if unreachable)
+    - ``propagation_component_id``: connected-component label
+
+    Legacy aliases (for backward compatibility with EDT pipeline):
+
+    - ``propagation_seeded``: alias for ``water_seeded``
+    - ``propagation_confirmed``: alias for ``reachable_from_seed``
+    - ``propagation_hops``: alias for ``seed_hops``
     """
     if dem_da.rio.crs is None:
         raise ValueError("DEM must have a valid CRS.")
@@ -233,12 +244,12 @@ def build_network_propagated_mask(
     flowlines_gdf = flowlines_gdf.reset_index(drop=True)
     n_features = len(flowlines_gdf)
     if n_features == 0:
-        raise ValueError("No flowline features to rasterize.")
+        raise ValueError("No flowline features to propagate.")
 
     transform = dem_da.rio.transform()
     shape = dem_da.shape
 
-    # Step 1: rasterize each feature with a unique ID (1-based, 0 = background)
+    # Rasterize each feature with a unique ID (1-based, 0 = background)
     id_shapes = [
         (geom, i + 1)
         for i, geom in enumerate(flowlines_gdf.geometry)
@@ -253,7 +264,7 @@ def build_network_propagated_mask(
         dtype="uint16",
     )
 
-    # Step 2: build NDWI-confirmed mask (buffered NHD AND NDWI > threshold)
+    # Water mask (buffered NHD AND water > threshold)
     buffered = flowlines_gdf.copy()
     buffered["geometry"] = buffered.geometry.buffer(float(flowlines_buffer_m))
     buf_raster = features.rasterize(
@@ -270,49 +281,107 @@ def build_network_propagated_mask(
     water = np.asarray((ndwi_match > float(ndwi_threshold)).data, dtype="uint8")
     ndwi_mask = (buf_raster > 0) & (water > 0)
 
-    # Step 3: determine seed features (any cell of feature overlaps NDWI mask)
-    confirmed_ids = set(np.unique(id_raster[ndwi_mask]).tolist()) - {0}
-    LOGGER.info(
-        "NDWI seed features: %d / %d (%.0f%%)",
-        len(confirmed_ids),
-        n_features,
-        100.0 * len(confirmed_ids) / n_features if n_features else 0,
+    # Per-feature water pixel counts and total raster cell counts
+    water_seed_pixels = np.zeros(n_features, dtype=np.int64)
+    segment_total_pixels = np.zeros(n_features, dtype=np.int64)
+    for fid in range(1, n_features + 1):
+        seg_mask = id_raster == fid
+        segment_total_pixels[fid - 1] = int(seg_mask.sum())
+        water_seed_pixels[fid - 1] = int((seg_mask & ndwi_mask).sum())
+
+    seed_indices = {i for i in range(n_features) if water_seed_pixels[i] > 0}
+    water_seed_fraction = np.where(
+        segment_total_pixels > 0,
+        water_seed_pixels / segment_total_pixels,
+        0.0,
     )
 
-    # Step 4: build adjacency graph and BFS propagation
+    LOGGER.info(
+        "Water-seeded features: %d / %d (%.0f%%)",
+        len(seed_indices),
+        n_features,
+        100.0 * len(seed_indices) / n_features if n_features else 0,
+    )
+
+    # Adjacency graph and BFS
     adjacency = _build_nhd_adjacency(flowlines_gdf, snap_tolerance=snap_tolerance)
 
-    seeds_0 = {fid - 1 for fid in confirmed_ids}
-    visited = set(seeds_0)
-    queue = deque((fidx, 0) for fidx in seeds_0)
+    # Connected components (for component_id labelling)
+    comp_id = np.full(n_features, -1, dtype=np.intp)
+    current_comp = 0
+    for start in range(n_features):
+        if comp_id[start] >= 0:
+            continue
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            if comp_id[node] >= 0:
+                continue
+            comp_id[node] = current_comp
+            stack.extend(adjacency.get(node, []))
+        current_comp += 1
+
+    # BFS from seeds, tracking hop distance
+    hop_dist = np.full(n_features, -1, dtype=np.intp)
+    for s in seed_indices:
+        hop_dist[s] = 0
+    queue = deque((fidx, 0) for fidx in seed_indices)
 
     while queue:
         current, hops = queue.popleft()
         if max_hops is not None and hops >= max_hops:
             continue
         for neighbor in adjacency.get(current, []):
-            if neighbor not in visited:
-                visited.add(neighbor)
+            if hop_dist[neighbor] < 0:
+                hop_dist[neighbor] = hops + 1
                 queue.append((neighbor, hops + 1))
 
-    confirmed_raster_ids = {fidx + 1 for fidx in visited}
-    n_propagated = len(confirmed_raster_ids) - len(confirmed_ids)
+    reachable_mask = hop_dist >= 0
+    n_reachable = int(reachable_mask.sum())
+    n_reachable_only = n_reachable - len(seed_indices)
     LOGGER.info(
-        "After BFS (max_hops=%s): %d confirmed (%d propagated from %d seeds)",
+        "After BFS (max_hops=%s): %d seeded, %d reachable-only, %d unreachable",
         max_hops,
-        len(confirmed_raster_ids),
-        n_propagated,
-        len(confirmed_ids),
+        len(seed_indices),
+        n_reachable_only,
+        n_features - n_reachable,
     )
 
-    # Step 5: burn confirmed features as binary mask (unbuffered)
+    out = flowlines_gdf.copy()
+    out["flowline_id"] = np.arange(n_features)
+    out["water_seeded"] = np.isin(np.arange(n_features), list(seed_indices))
+    out["water_seed_pixels"] = water_seed_pixels
+    out["water_seed_fraction"] = water_seed_fraction.astype(np.float32)
+    out["reachable_from_seed"] = reachable_mask
+    out["seed_hops"] = hop_dist
+    out["propagation_component_id"] = comp_id
+    # Legacy aliases
+    out["propagation_seeded"] = out["water_seeded"]
+    out["propagation_confirmed"] = out["reachable_from_seed"]
+    out["propagation_hops"] = out["seed_hops"]
+    return out
+
+
+def rasterize_confirmed_flowlines(
+    confirmed_flowlines_gdf: gpd.GeoDataFrame,
+    dem_da,
+) -> xr.DataArray:
+    """Rasterize confirmed flowlines to a binary mask on the DEM grid.
+
+    Parameters
+    ----------
+    confirmed_flowlines_gdf : GeoDataFrame
+        Subset of flowlines where ``propagation_confirmed == True``.
+    dem_da : xr.DataArray
+        DEM used as the rasterization template.
+    """
+    transform = dem_da.rio.transform()
+    shape = dem_da.shape
     confirmed_shapes = [
-        (geom, 1)
-        for i, geom in enumerate(flowlines_gdf.geometry)
-        if geom is not None and (i + 1) in confirmed_raster_ids
+        (geom, 1) for geom in confirmed_flowlines_gdf.geometry if geom is not None
     ]
     if not confirmed_shapes:
-        raise ValueError("No features confirmed after network propagation.")
+        raise ValueError("No confirmed features to rasterize.")
 
     mask_arr = features.rasterize(
         shapes=confirmed_shapes,
@@ -322,17 +391,45 @@ def build_network_propagated_mask(
         all_touched=True,
         dtype="uint8",
     )
-
     mask_da = xr.DataArray(
         mask_arr,
         dims=dem_da.dims,
         coords=dem_da.coords,
         name="streams",
     )
-    mask_da = mask_da.rio.write_crs(dem_da.rio.crs, inplace=False)
-    mask_da.attrs["propagation_n_seeds"] = len(confirmed_ids)
-    mask_da.attrs["propagation_n_confirmed"] = len(confirmed_raster_ids)
-    mask_da.attrs["propagation_n_propagated"] = n_propagated
+    return mask_da.rio.write_crs(dem_da.rio.crs, inplace=False)
+
+
+def build_network_propagated_mask(
+    flowlines_gdf,
+    dem_da,
+    ndwi_da,
+    ndwi_threshold: float,
+    flowlines_buffer_m: float,
+    max_hops: int | None = None,
+    snap_tolerance: float = 1.0,
+):
+    """Build a stream mask using NDWI-seeded network propagation.
+
+    Thin wrapper around :func:`propagate_flowline_confirmation` and
+    :func:`rasterize_confirmed_flowlines`.
+    """
+    annotated = propagate_flowline_confirmation(
+        flowlines_gdf,
+        dem_da,
+        ndwi_da,
+        ndwi_threshold=ndwi_threshold,
+        flowlines_buffer_m=flowlines_buffer_m,
+        max_hops=max_hops,
+        snap_tolerance=snap_tolerance,
+    )
+    confirmed = annotated[annotated["propagation_confirmed"]].copy()
+    mask_da = rasterize_confirmed_flowlines(confirmed, dem_da)
+    mask_da.attrs["propagation_n_seeds"] = int(annotated["propagation_seeded"].sum())
+    mask_da.attrs["propagation_n_confirmed"] = len(confirmed)
+    mask_da.attrs["propagation_n_propagated"] = int(
+        len(confirmed) - annotated["propagation_seeded"].sum()
+    )
     return mask_da
 
 
@@ -383,7 +480,9 @@ def compute_rem_quick(dem_da, streams_da, radius: int = 1000):
     return rem_da.rio.write_crs(dem_da.rio.crs, inplace=False)
 
 
-def compute_rem_edt_smooth(dem_da, streams_da, sigma: float = 50.0):
+def compute_rem_edt_smooth(
+    dem_da, streams_da, sigma: float = 50.0, max_dist: float | None = None
+):
     """Compute REM via EDT nearest-cell allocation then Gaussian-smooth the water surface.
 
     1. For each pixel, assign the DEM elevation of the nearest stream cell (EDT).
@@ -403,6 +502,10 @@ def compute_rem_edt_smooth(dem_da, streams_da, sigma: float = 50.0):
     sigma : float
         Gaussian sigma in pixels (= meters at 1 m resolution) for smoothing
         the EDT water surface. Default 50.
+    max_dist : float, optional
+        Maximum distance (in pixels/meters at 1 m resolution) from the nearest
+        stream cell. Pixels beyond this distance get NaN in the output REM.
+        Default None (no limit).
     """
     if dem_da.rio.crs is None or streams_da.rio.crs is None:
         raise ValueError("Both DEM and streams rasters must have a valid CRS.")
@@ -420,8 +523,8 @@ def compute_rem_edt_smooth(dem_da, streams_da, sigma: float = 50.0):
     LOGGER.info("Stream mask: %d cells, EDT sigma=%.0f", n_stream, sigma)
 
     # Step 1: nearest-cell allocation — piecewise-constant water surface
-    indices = ndi.distance_transform_edt(
-        ~streams_np, return_distances=False, return_indices=True
+    dist, indices = ndi.distance_transform_edt(
+        ~streams_np, return_distances=True, return_indices=True
     )
     base_elev = dem_np[indices[0], indices[1]]
 
@@ -441,12 +544,20 @@ def compute_rem_edt_smooth(dem_da, streams_da, sigma: float = 50.0):
     rem_np = dem_np - base_elev
     rem_np = np.where(rem_np < 0, 0, rem_np)
 
+    if max_dist is not None:
+        rem_np = np.where(dist > max_dist, np.nan, rem_np)
+        n_masked = int((dist > max_dist).sum())
+        pct = n_masked / dist.size * 100
+        LOGGER.info("max_dist=%.0f: masked %d pixels (%.1f%%)", max_dist, n_masked, pct)
+
     rem_da = xr.DataArray(
-        rem_np,
+        rem_np.astype("float32"),
         dims=dem_da.dims,
         coords=dem_da.coords,
         name="REM",
-        attrs={"description": f"REM (EDT + Gaussian smooth, sigma={sigma})"},
+        attrs={
+            "description": f"REM (EDT + Gaussian smooth, sigma={sigma}, max_dist={max_dist})"
+        },
     )
     return rem_da.rio.write_crs(dem_da.rio.crs, inplace=False)
 
