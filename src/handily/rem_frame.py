@@ -1187,6 +1187,61 @@ def rasterize_anisotropic_water_surface(
     )
 
 
+def _dedup_overlapping_results(
+    results: list,
+    metrics: dict,
+    buf_m: float = 10.0,
+    overlap_frac: float = 0.5,
+) -> list:
+    """Drop shorter reaches whose snapped geometry is mostly covered by a longer one.
+
+    Two reaches that follow the same physical channel (from different NHD features)
+    produce overlapping snapped geometries.  Keep the longer reach, drop the shorter
+    if more than *overlap_frac* of its length falls within *buf_m* of the longer.
+    """
+    # Collect (index, snapped_geom_length) for non-None results
+    valid = []
+    for i, r in enumerate(results):
+        if r is not None:
+            valid.append((i, r[0].snapped_geom.length))
+    if len(valid) < 2:
+        return results
+
+    # Sort longest first so longer reaches are checked as "keepers" first
+    valid.sort(key=lambda x: x[1], reverse=True)
+
+    drop = set()
+    kept_geoms = []  # (index, buffered_geom)
+
+    for idx, length in valid:
+        geom = results[idx][0].snapped_geom
+        # Check if this reach is mostly covered by an already-kept longer reach
+        dominated = False
+        for kept_idx, kept_buf in kept_geoms:
+            overlap = geom.intersection(kept_buf).length
+            if length > 0 and overlap / length > overlap_frac:
+                drop.add(idx)
+                dominated = True
+                rid = results[idx][0].reach_id
+                kept_rid = results[kept_idx][0].reach_id
+                LOGGER.info(
+                    "Dedup: dropping reach %d (%.0f m, %.0f%% covered by reach %d)",
+                    rid,
+                    length,
+                    100 * overlap / length,
+                    kept_rid,
+                )
+                break
+        if not dominated:
+            kept_geoms.append((idx, geom.buffer(buf_m)))
+
+    n_deduped = len(drop)
+    if n_deduped:
+        metrics["n_reaches_deduped"] = n_deduped
+    filtered = [None if i in drop else r for i, r in enumerate(results)]
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Phase 9: End-to-end entry point
 # ---------------------------------------------------------------------------
@@ -1295,6 +1350,9 @@ def compute_rem_anisotropic_frame(
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         results = list(pool.map(_process_one_reach, reach_rows))
+
+    # Deduplicate overlapping snapped reaches (keep the longer one)
+    results = _dedup_overlapping_results(results, metrics)
 
     for result in results:
         if result is None:
