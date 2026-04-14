@@ -1240,10 +1240,15 @@ def compute_rem_anisotropic_frame(
         if snapped.metrics is not None:
             snapped.metrics.seeded_fraction = float(row.get("seeded_fraction", 0.0))
 
+        if snapped.metrics is None:
+            LOGGER.info("Skipping reach %d: no metrics (too few stations)", rid)
+            return None
+
         reject_reason = evaluate_reach_acceptance(snapped, config)
         if reject_reason:
-            LOGGER.info("Skipping reach %d: %s", rid, reject_reason)
-            return None
+            LOGGER.info(
+                "Reach %d: %s (keeping — propagation-confirmed)", rid, reject_reason
+            )
 
         frame = build_smoothed_frame(snapped, smoothing_m=config.rem_frame_smoothing_m)
         frame.reach_id = rid
@@ -1262,7 +1267,7 @@ def compute_rem_anisotropic_frame(
         sec_df["reach_id"] = rid
         sup_df = xsec.support_polygons.copy()
         sup_df["reach_id"] = rid
-        return (snapped, frame, sec_df, sup_df)
+        return (snapped, frame, sec_df, sup_df, reject_reason)
 
     # Run reaches in parallel (ThreadPool — numpy/scipy release the GIL)
     max_workers = getattr(config, "rem_max_workers", None)
@@ -1277,6 +1282,7 @@ def compute_rem_anisotropic_frame(
         "n_reaches_eligible": len(eligible),
         "n_reaches_skipped_no_seed": n_skipped_seed,
         "n_reaches_processed": 0,
+        "n_reaches_warned": 0,
         "n_reaches_skipped": 0,
         "snap_offsets": [],
     }
@@ -1288,21 +1294,24 @@ def compute_rem_anisotropic_frame(
         if result is None:
             metrics["n_reaches_skipped"] += 1
             continue
-        snapped, frame, sec_df, sup_df = result
-        snapped_reaches.append(snapped)
+        snapped, frame, sec_df, sup_df, reject_reason = result
+        snapped_reaches.append((snapped, reject_reason))
         frame_reaches.append(frame)
         all_sections.append(sec_df)
         all_support.append(sup_df)
         metrics["n_reaches_processed"] += 1
+        if reject_reason:
+            metrics["n_reaches_warned"] += 1
         metrics["snap_offsets"].extend(snapped.stations["snap_offset_m"].abs().tolist())
 
     # Aggregate geometry artifacts
     if snapped_reaches:
         snapped_rows = []
-        for s in snapped_reaches:
+        for s, reject_reason in snapped_reaches:
             row_dict = {
                 "reach_id": s.reach_id,
                 "confidence": s.confidence,
+                "reject_reason": reject_reason,
                 "geometry": s.snapped_geom,
             }
             if s.metrics is not None:
@@ -1351,9 +1360,10 @@ def compute_rem_anisotropic_frame(
     del metrics["snap_offsets"]
 
     LOGGER.info(
-        "Anisotropic frame: %d/%d reaches processed, %d skipped",
+        "Anisotropic frame: %d/%d reaches processed (%d warned), %d skipped",
         metrics["n_reaches_processed"],
         metrics["n_reaches_total"],
+        metrics["n_reaches_warned"],
         metrics["n_reaches_skipped"],
     )
 
