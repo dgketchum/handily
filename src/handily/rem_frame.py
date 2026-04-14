@@ -96,244 +96,50 @@ def split_confirmed_flowlines_into_reaches(
     confirmed_flowlines: gpd.GeoDataFrame,
     snap_tolerance: float = 1.0,
 ) -> gpd.GeoDataFrame:
-    """Decompose confirmed flowlines into simple, non-branching reaches.
+    """Map each NHD feature to one reach — 1:1, no chaining.
 
-    Each outgoing branch from a junction becomes its own reach.  Chains are
-    walked from junction features and dead-ends (degree != 2) along degree-2
-    interior nodes.
+    Each NHD feature keeps its own geometry unchanged.  MultiLineStrings
+    are merged via ``linemerge``; if that produces multiple parts, only
+    the longest is kept.
 
     Returns a GeoDataFrame with columns:
-        reach_id, component_id, n_flowlines, is_simple_chain,
-        seeded_fraction, geometry
+        reach_id, n_flowlines, seeded_fraction, geometry
     """
-    from collections import defaultdict
-    from scipy.spatial import cKDTree
-
     gdf = confirmed_flowlines.reset_index(drop=True)
     n = len(gdf)
-    empty_cols = [
-        "reach_id",
-        "component_id",
-        "n_flowlines",
-        "is_simple_chain",
-        "seeded_fraction",
-        "geometry",
-    ]
     if n == 0:
         return gpd.GeoDataFrame(
-            columns=empty_cols,
+            columns=["reach_id", "n_flowlines", "seeded_fraction", "geometry"],
             geometry="geometry",
             crs=gdf.crs,
         )
 
-    # Per-feature seeded status (carried from Phase 1 annotation)
     has_seeded_col = "water_seeded" in gdf.columns
     seeded = gdf["water_seeded"].values if has_seeded_col else np.ones(n, dtype=bool)
 
-    # --- Build endpoint array and adjacency ---
-    endpoints = np.empty((2 * n, 2), dtype=np.float64)
-    owner = np.empty(2 * n, dtype=np.intp)
-    for i, geom in enumerate(gdf.geometry):
-        if geom is None or geom.is_empty:
-            endpoints[2 * i] = [np.inf, np.inf]
-            endpoints[2 * i + 1] = [np.inf, np.inf]
-        elif geom.geom_type == "LineString":
-            endpoints[2 * i] = geom.coords[0][:2]
-            endpoints[2 * i + 1] = geom.coords[-1][:2]
-        elif geom.geom_type == "MultiLineString":
-            parts = list(geom.geoms)
-            endpoints[2 * i] = parts[0].coords[0][:2]
-            endpoints[2 * i + 1] = parts[-1].coords[-1][:2]
-        else:
-            endpoints[2 * i] = [np.inf, np.inf]
-            endpoints[2 * i + 1] = [np.inf, np.inf]
-        owner[2 * i] = i
-        owner[2 * i + 1] = i
-
-    tree = cKDTree(endpoints)
-    pairs = tree.query_pairs(r=snap_tolerance)
-
-    adj = defaultdict(set)
-    for p, q in pairs:
-        fi, fj = int(owner[p]), int(owner[q])
-        if fi != fj:
-            adj[fi].add(fj)
-            adj[fj].add(fi)
-
-    # --- Connected components ---
-    comp_id = np.full(n, -1, dtype=np.intp)
-    current_comp = 0
-    for start in range(n):
-        if comp_id[start] >= 0:
-            continue
-        stack = [start]
-        while stack:
-            node = stack.pop()
-            if comp_id[node] >= 0:
-                continue
-            comp_id[node] = current_comp
-            for nb in adj.get(node, set()):
-                if comp_id[nb] < 0:
-                    stack.append(nb)
-        current_comp += 1
-
-    # --- Identify junction nodes (endpoint clusters with degree != 2) ---
-    groups = tree.query_ball_tree(tree, r=snap_tolerance)
-    visited_ep = set()
-    ep_cluster = np.full(2 * n, -1, dtype=np.intp)
-    cluster_id = 0
-    for ep_idx in range(2 * n):
-        if ep_idx in visited_ep:
-            continue
-        cluster = set()
-        for member in groups[ep_idx]:
-            if member not in visited_ep:
-                cluster.add(member)
-                visited_ep.add(member)
-        for m in cluster:
-            ep_cluster[m] = cluster_id
-        cluster_id += 1
-
-    cluster_features = defaultdict(set)
-    for ep_idx in range(2 * n):
-        cid = ep_cluster[ep_idx]
-        if cid >= 0:
-            cluster_features[cid].add(int(owner[ep_idx]))
-
-    junction_clusters = {
-        cid for cid, feats in cluster_features.items() if len(feats) > 2
-    }
-    junction_features = set()
-    for cid in junction_clusters:
-        junction_features.update(cluster_features[cid])
-
-    # --- Walk chains: one branch per direction from each junction/dead-end ---
-    used = set()
-    reaches = []
-
-    def _walk_one_direction(start_feat, next_feat):
-        """Walk a branch from next_feat onward (start_feat is NOT included)."""
-        chain = []
-        prev, cur = start_feat, next_feat
-        while cur not in used:
-            used.add(cur)
-            chain.append(cur)
-            if cur in junction_features:
-                break
-            nbs = adj.get(cur, set()) - {prev}
-            if len(nbs) != 1:
-                break
-            prev, cur = cur, nbs.pop()
-        return chain
-
-    # Starters: junction features and dead-ends (degree != 2)
-    starters = set()
-    for fidx in range(n):
-        degree = len(adj.get(fidx, set()))
-        if degree != 2 or fidx in junction_features:
-            starters.add(fidx)
-
-    for start in sorted(starters):
-        if start in used:
-            continue
-        used.add(start)
-        neighbors = adj.get(start, set())
-        if not neighbors:
-            # Isolated feature — emit as its own reach
-            reaches.append([start])
-            continue
-        # Emit the starter as its own reach (each NHD feature appears once)
-        reaches.append([start])
-        # Walk each branch direction separately
-        for nb in sorted(neighbors):
-            if nb in used and nb not in junction_features:
-                continue
-            chain = _walk_one_direction(start, nb)
-            if chain:
-                reaches.append(chain)
-
-    # Catch remaining isolated loops (all degree-2, no junction)
-    for fidx in range(n):
-        if fidx not in used:
-            used.add(fidx)
-            chain = [fidx]
-            for nb in adj.get(fidx, set()):
-                prev_inner, cur_inner = fidx, nb
-                while cur_inner not in used:
-                    used.add(cur_inner)
-                    chain.append(cur_inner)
-                    nbs = adj.get(cur_inner, set()) - {prev_inner}
-                    if len(nbs) != 1:
-                        break
-                    prev_inner, cur_inner = cur_inner, nbs.pop()
-            reaches.append(chain)
-
-    # --- Build output GeoDataFrame ---
     rows = []
-    for rid, chain in enumerate(reaches):
-        # Track which features contribute valid geometry
-        valid_features = []
-        geoms = []
-        for fidx in chain:
-            g = gdf.geometry.iloc[fidx]
-            if g is None or g.is_empty:
-                continue
-            if g.geom_type == "MultiLineString":
-                geoms.extend(g.geoms)
-            else:
-                geoms.append(g)
-            valid_features.append(fidx)
-        if not geoms:
+    for i in range(n):
+        g = gdf.geometry.iloc[i]
+        if g is None or g.is_empty:
             continue
-        merged = linemerge(geoms)
-        if isinstance(merged, MultiLineString):
-            # Merge failed: keep only the longest part and recount metadata
-            # to reflect only the features whose geometry is retained.
-            longest = max(merged.geoms, key=lambda g: g.length)
-            # Identify which input features intersect the retained geometry
-            contributing = [
-                fidx
-                for fidx in valid_features
-                if gdf.geometry.iloc[fidx].intersects(longest.buffer(1.0))
-            ]
-            if not contributing:
-                contributing = valid_features
-            merged = longest
-            n_in_reach = len(contributing)
-            n_seeded = sum(1 for f in contributing if seeded[f])
-            LOGGER.debug(
-                "Reach %d: linemerge partial — kept %.0f m of %.0f m (%d/%d features)",
-                rid,
-                longest.length,
-                sum(g.length for g in geoms),
-                n_in_reach,
-                len(valid_features),
-            )
-        else:
-            n_in_reach = len(valid_features)
-            n_seeded = sum(1 for f in valid_features if seeded[f])
-        cid = int(comp_id[chain[0]])
-        sf = n_seeded / n_in_reach if n_in_reach else 0.0
+        if g.geom_type == "MultiLineString":
+            merged = linemerge(g)
+            if isinstance(merged, MultiLineString):
+                g = max(merged.geoms, key=lambda p: p.length)
+            else:
+                g = merged
         rows.append(
             {
-                "reach_id": rid,
-                "component_id": cid,
-                "n_flowlines": n_in_reach,
-                "is_simple_chain": not any(f in junction_features for f in chain)
-                or len(chain) == 1,
-                "seeded_fraction": float(sf),
-                "geometry": merged,
+                "reach_id": i,
+                "n_flowlines": 1,
+                "seeded_fraction": 1.0 if seeded[i] else 0.0,
+                "geometry": g,
             }
         )
 
     result = gpd.GeoDataFrame(rows, geometry="geometry", crs=gdf.crs)
     LOGGER.info(
-        "Reach decomposition: %d reaches from %d flowlines "
-        "(%d components, %d junction clusters)",
-        len(result),
-        n,
-        current_comp,
-        len(junction_clusters),
+        "Reach decomposition: %d reaches from %d flowlines (1:1)", len(result), n
     )
     return result
 
@@ -757,240 +563,6 @@ def evaluate_reach_acceptance(
 
 
 # ---------------------------------------------------------------------------
-# Phase 5b: Merge adjacent snapped reaches into chains
-# ---------------------------------------------------------------------------
-
-
-def merge_snapped_reaches(
-    snapped_list: list[SnappedReach],
-    snap_tolerance: float = 5.0,
-) -> list[SnappedReach]:
-    """Chain adjacent snapped reaches into longer merged reaches.
-
-    After individual per-feature snapping, this reconnects reaches whose
-    snapped endpoints are within *snap_tolerance* of each other.  Chains of
-    degree-2 connections are merged into single SnappedReach objects so that
-    downstream smoothing operates across former feature boundaries.
-
-    Junction endpoints (degree > 2) break chains — each branch becomes its
-    own merged reach.
-    """
-    from collections import defaultdict
-    from scipy.spatial import cKDTree
-
-    n = len(snapped_list)
-    if n <= 1:
-        return list(snapped_list)
-
-    # Collect endpoints: index 2*i = start, 2*i+1 = end of snapped_geom
-    endpoints = np.empty((2 * n, 2), dtype=np.float64)
-    for i, sr in enumerate(snapped_list):
-        coords = sr.snapped_geom.coords
-        endpoints[2 * i] = coords[0][:2]
-        endpoints[2 * i + 1] = coords[-1][:2]
-
-    tree = cKDTree(endpoints)
-    pairs = tree.query_pairs(r=snap_tolerance)
-
-    # Build feature-level adjacency (which reaches connect)
-    adj = defaultdict(set)
-    # Also track which endpoint-pair matched (for orientation)
-    # ep_links[i] = set of (j, i_end, j_end) where i_end/j_end in {0, 1}
-    ep_links = defaultdict(list)
-    for p, q in pairs:
-        fi, fi_end = divmod(p, 2)  # fi_end: 0=start, 1=end
-        fj, fj_end = divmod(q, 2)
-        if fi != fj:
-            adj[fi].add(fj)
-            adj[fj].add(fi)
-            ep_links[fi].append((fj, fi_end, fj_end))
-            ep_links[fj].append((fi, fj_end, fi_end))
-
-    # Identify junction features (connected to > 2 others at a single endpoint)
-    # Count connections per endpoint
-    ep_degree = defaultdict(int)
-    for p, q in pairs:
-        fi, fi_end = divmod(p, 2)
-        fj, fj_end = divmod(q, 2)
-        if fi != fj:
-            ep_degree[(fi, fi_end)] += 1
-            ep_degree[(fj, fj_end)] += 1
-
-    junction_features = {feat for (feat, _), deg in ep_degree.items() if deg > 1}
-
-    # Walk chains: start from dead-ends and junctions
-    used = set()
-    chains = []  # list of [(feat_idx, reversed_bool), ...]
-
-    def _get_link(fi, fj):
-        """Get the endpoint link between fi and fj."""
-        for link_fj, fi_end, fj_end in ep_links[fi]:
-            if link_fj == fj:
-                return fi_end, fj_end
-        return None, None
-
-    def _walk_chain(start, direction_neighbor=None):
-        """Walk a chain from start, optionally toward direction_neighbor."""
-        chain = []
-        if direction_neighbor is not None:
-            fi_end, fj_end = _get_link(start, direction_neighbor)
-            # start is oriented so its fi_end connects to neighbor
-            # We want the chain to go: start → neighbor → ...
-            # start should be reversed if its connecting end is 0 (start of geom)
-            chain.append((start, fi_end == 0))
-            used.add(start)
-            cur = direction_neighbor
-            prev_connecting_end = fj_end  # which end of cur connects to prev
-        else:
-            chain.append((start, False))
-            used.add(start)
-            # Pick any unused neighbor
-            neighbors = adj.get(start, set()) - used
-            if not neighbors:
-                return chain
-            cur = next(iter(sorted(neighbors)))
-            fi_end, fj_end = _get_link(start, cur)
-            chain[0] = (start, fi_end == 0)  # reorient start
-            prev_connecting_end = fj_end
-
-        while cur not in used:
-            used.add(cur)
-            # cur connects to prev at prev_connecting_end
-            # We want cur oriented so prev_connecting_end is its start (index 0)
-            # If prev_connecting_end == 1, cur's end connects to prev → reverse
-            # If prev_connecting_end == 0, cur's start connects to prev → as-is
-            needs_reverse = prev_connecting_end == 1
-            chain.append((cur, needs_reverse))
-
-            if cur in junction_features:
-                break
-
-            # Find next
-            neighbors = adj.get(cur, set()) - used
-            if len(neighbors) != 1:
-                break
-            nxt = neighbors.pop()
-            cur_end, nxt_end = _get_link(cur, nxt)
-            # cur_end is which end of cur connects to nxt
-            # If we reversed cur, flip cur_end
-            if needs_reverse:
-                cur_end = 1 - cur_end
-            # Only continue if cur connects to nxt from its far end (end=1 after orientation)
-            if cur_end != 1:
-                break
-            prev_connecting_end = nxt_end
-            cur = nxt
-
-        return chain
-
-    # Start from dead-ends and junctions
-    starters = set()
-    for i in range(n):
-        degree = len(adj.get(i, set()))
-        if degree != 2 or i in junction_features:
-            starters.add(i)
-
-    for start in sorted(starters):
-        if start in used:
-            continue
-        neighbors = sorted(adj.get(start, set()))
-        if not neighbors:
-            used.add(start)
-            chains.append([(start, False)])
-            continue
-        for nb in neighbors:
-            if nb in used and nb not in junction_features:
-                continue
-            chain = _walk_chain(start, nb)
-            if chain:
-                chains.append(chain)
-                break  # start is now used
-        else:
-            if start not in used:
-                used.add(start)
-                chains.append([(start, False)])
-
-    # Catch isolated loops
-    for i in range(n):
-        if i not in used:
-            chain = _walk_chain(i)
-            if chain:
-                chains.append(chain)
-
-    # Build merged SnappedReach objects
-    merged = []
-    for chain_id, chain in enumerate(chains):
-        all_stations = []
-        cumulative_s = 0.0
-
-        for feat_idx, needs_reverse in chain:
-            sr = snapped_list[feat_idx]
-            st = sr.stations.copy()
-
-            if needs_reverse:
-                st = st.iloc[::-1].reset_index(drop=True)
-                max_s = st["s_m"].max()
-                st["s_m"] = max_s - st["s_m"]
-
-            # Shift s_m to be continuous
-            st["s_m"] = st["s_m"] - st["s_m"].iloc[0] + cumulative_s
-            cumulative_s = st["s_m"].iloc[-1] + (
-                sr.stations["s_m"].diff().median() if len(sr.stations) > 1 else 10.0
-            )
-
-            # Update station_id and coordinates
-            st["x_snap"] = [g.x for g in st.geometry]
-            st["y_snap"] = [g.y for g in st.geometry]
-
-            all_stations.append(st)
-
-        merged_stations = gpd.GeoDataFrame(
-            pd.concat(all_stations, ignore_index=True),
-            geometry="geometry",
-        )
-        merged_stations["station_id"] = range(len(merged_stations))
-
-        # Build merged geometry
-        snap_xy = np.column_stack(
-            [
-                merged_stations["x_snap"].values,
-                merged_stations["y_snap"].values,
-            ]
-        )
-        merged_geom = LineString(snap_xy.tolist())
-
-        # Aggregate metrics
-        n_stations = len(merged_stations)
-        hit_frac = float(merged_stations["water_hit"].mean()) if n_stations else 0.0
-        abs_offsets = merged_stations["snap_offset_m"].abs()
-
-        merged_sr = SnappedReach(
-            reach_id=chain_id,
-            prior_geom=merged_geom,  # no single prior for merged
-            snapped_geom=merged_geom,
-            stations=merged_stations,
-            confidence=hit_frac,
-            metrics=ReachMetrics(
-                station_water_hit_fraction=hit_frac,
-                station_water_support_mean=float(
-                    merged_stations["water_support_mean"].mean()
-                )
-                if n_stations
-                else 0.0,
-                mean_snap_offset_m=float(abs_offsets.mean()) if n_stations else 0.0,
-                max_snap_offset_m=float(abs_offsets.max()) if n_stations else 0.0,
-                max_consecutive_no_water_m=0.0,  # recomputed if needed
-                n_stations=n_stations,
-                n_supported_stations=int(merged_stations["water_hit"].sum()),
-            ),
-        )
-        merged.append(merged_sr)
-
-    LOGGER.info("Merged %d snapped reaches into %d chains", n, len(merged))
-    return merged
-
-
-# ---------------------------------------------------------------------------
 # Phase 6: Frame smoothing and cross-sections
 # ---------------------------------------------------------------------------
 
@@ -1028,6 +600,10 @@ def build_smoothed_frame(
 
     xs_smooth = ndi.gaussian_filter1d(xs, sigma=sigma_px, mode="nearest")
     ys_smooth = ndi.gaussian_filter1d(ys, sigma=sigma_px, mode="nearest")
+
+    # Pin endpoints so adjacent frames meet at shared NHD junction points
+    xs_smooth[0], ys_smooth[0] = xs[0], ys[0]
+    xs_smooth[-1], ys_smooth[-1] = xs[-1], ys[-1]
 
     frame_rows = []
     for i in range(len(st)):
@@ -1260,19 +836,20 @@ def rasterize_anisotropic_water_surface(
     res_x = abs(float(transform.a))
     res_y = abs(float(transform.e))
 
-    ws = np.full(shape, np.nan, dtype=np.float64)
-    conf = np.full(shape, np.nan, dtype=np.float64)
+    ws_wsum = np.zeros(shape, dtype=np.float64)  # weighted sum of elevations
+    ws_wt = np.zeros(shape, dtype=np.float64)  # sum of weights
 
     secs = cross_sections.sections
     if secs.empty:
+        empty = np.full(shape, np.nan, dtype=np.float32)
         ws_da = xr.DataArray(
-            ws.astype(np.float32),
+            empty,
             dims=dem_da.dims,
             coords=dem_da.coords,
             name="water_surface",
         )
         conf_da = xr.DataArray(
-            conf.astype(np.float32),
+            empty.copy(),
             dims=dem_da.dims,
             coords=dem_da.coords,
             name="confidence",
@@ -1385,13 +962,21 @@ def rasterize_anisotropic_water_surface(
             elev_b = float(sec_b["base_elev_m"])
             interp_elev = elev_a + t * (elev_b - elev_a)
 
-            # Write — only where not already written
-            mask = np.isnan(ws[ys_idx, xs_idx])
-            ws[ys_idx[mask], xs_idx[mask]] = interp_elev[mask]
-            conf[ys_idx[mask], xs_idx[mask]] = 1.0
+            # IDW weight: inverse distance to thalweg axis
+            proj = t[:, np.newaxis] * axis[np.newaxis, :]
+            perp_dist = np.linalg.norm(px_vec - proj, axis=1)
+            weight = 1.0 / np.maximum(perp_dist, 1.0)
+
+            ws_wsum[ys_idx, xs_idx] += interp_elev * weight
+            ws_wt[ys_idx, xs_idx] += weight
             n_strips += 1
 
     LOGGER.info("Rasterized %d section strips", n_strips)
+
+    # IDW blend overlapping strips
+    valid = ws_wt > 0
+    ws = np.full(shape, np.nan, dtype=np.float64)
+    ws[valid] = ws_wsum[valid] / ws_wt[valid]
 
     ws_da = xr.DataArray(
         ws.astype(np.float32),
@@ -1400,7 +985,7 @@ def rasterize_anisotropic_water_surface(
         name="water_surface",
     )
     conf_da = xr.DataArray(
-        conf.astype(np.float32),
+        valid.astype(np.float32),
         dims=dem_da.dims,
         coords=dem_da.coords,
         name="confidence",
@@ -1409,61 +994,6 @@ def rasterize_anisotropic_water_surface(
         ws_da.rio.write_crs(dem_da.rio.crs, inplace=False),
         conf_da.rio.write_crs(dem_da.rio.crs, inplace=False),
     )
-
-
-def _dedup_overlapping_results(
-    results: list,
-    metrics: dict,
-    buf_m: float = 10.0,
-    overlap_frac: float = 0.5,
-) -> list:
-    """Drop shorter reaches whose snapped geometry is mostly covered by a longer one.
-
-    Two reaches that follow the same physical channel (from different NHD features)
-    produce overlapping snapped geometries.  Keep the longer reach, drop the shorter
-    if more than *overlap_frac* of its length falls within *buf_m* of the longer.
-    """
-    # Collect (index, snapped_geom_length) for non-None results
-    valid = []
-    for i, r in enumerate(results):
-        if r is not None:
-            valid.append((i, r[0].snapped_geom.length))
-    if len(valid) < 2:
-        return results
-
-    # Sort longest first so longer reaches are checked as "keepers" first
-    valid.sort(key=lambda x: x[1], reverse=True)
-
-    drop = set()
-    kept_geoms = []  # (index, buffered_geom)
-
-    for idx, length in valid:
-        geom = results[idx][0].snapped_geom
-        # Check if this reach is mostly covered by an already-kept longer reach
-        dominated = False
-        for kept_idx, kept_buf in kept_geoms:
-            overlap = geom.intersection(kept_buf).length
-            if length > 0 and overlap / length > overlap_frac:
-                drop.add(idx)
-                dominated = True
-                rid = results[idx][0].reach_id
-                kept_rid = results[kept_idx][0].reach_id
-                LOGGER.info(
-                    "Dedup: dropping reach %d (%.0f m, %.0f%% covered by reach %d)",
-                    rid,
-                    length,
-                    100 * overlap / length,
-                    kept_rid,
-                )
-                break
-        if not dominated:
-            kept_geoms.append((idx, geom.buffer(buf_m)))
-
-    n_deduped = len(drop)
-    if n_deduped:
-        metrics["n_reaches_deduped"] = n_deduped
-    filtered = [None if i in drop else r for i, r in enumerate(results)]
-    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -1565,14 +1095,9 @@ def compute_rem_anisotropic_frame(
             metrics["n_reaches_warned"] += 1
         snapped_list.append(snapped)
 
-    # --- Phase 5b: Merge adjacent snapped reaches into chains ---
-    merged_reaches = merge_snapped_reaches(
-        snapped_list, snap_tolerance=config.rem_snap_search_spacing_m
-    )
-
-    # --- Phase 6: Frame + cross-sections on merged chains (parallel) ---
+    # --- Phase 6: Frame + cross-sections on snapped reaches (parallel) ---
     def _frame_one_chain(snapped):
-        """Smooth + cross-section for a merged chain. Thread-safe."""
+        """Smooth + cross-section for a snapped reach. Thread-safe."""
         rid = snapped.reach_id
         frame = build_smoothed_frame(snapped, smoothing_m=config.rem_frame_smoothing_m)
         frame.reach_id = rid
@@ -1594,14 +1119,14 @@ def compute_rem_anisotropic_frame(
         return (frame, sec_df, sup_df)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        frame_results = list(pool.map(_frame_one_chain, merged_reaches))
+        frame_results = list(pool.map(_frame_one_chain, snapped_list))
 
     snapped_reaches = []
     frame_reaches = []
     all_sections = []
     all_support = []
 
-    for snapped, (frame, sec_df, sup_df) in zip(merged_reaches, frame_results):
+    for snapped, (frame, sec_df, sup_df) in zip(snapped_list, frame_results):
         snapped_reaches.append((snapped, None))
         frame_reaches.append(frame)
         all_sections.append(sec_df)
