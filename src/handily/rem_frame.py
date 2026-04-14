@@ -274,28 +274,54 @@ def split_confirmed_flowlines_into_reaches(
     # --- Build output GeoDataFrame ---
     rows = []
     for rid, chain in enumerate(reaches):
-        raw_geoms = [gdf.geometry.iloc[fidx] for fidx in chain]
+        # Track which features contribute valid geometry
+        valid_features = []
         geoms = []
-        for g in raw_geoms:
+        for fidx in chain:
+            g = gdf.geometry.iloc[fidx]
             if g is None or g.is_empty:
                 continue
             if g.geom_type == "MultiLineString":
                 geoms.extend(g.geoms)
             else:
                 geoms.append(g)
+            valid_features.append(fidx)
         if not geoms:
             continue
         merged = linemerge(geoms)
         if isinstance(merged, MultiLineString):
-            merged = max(merged.geoms, key=lambda g: g.length)
+            # Merge failed: keep only the longest part and recount metadata
+            # to reflect only the features whose geometry is retained.
+            longest = max(merged.geoms, key=lambda g: g.length)
+            # Identify which input features intersect the retained geometry
+            contributing = [
+                fidx
+                for fidx in valid_features
+                if gdf.geometry.iloc[fidx].intersects(longest.buffer(1.0))
+            ]
+            if not contributing:
+                contributing = valid_features
+            merged = longest
+            n_in_reach = len(contributing)
+            n_seeded = sum(1 for f in contributing if seeded[f])
+            LOGGER.debug(
+                "Reach %d: linemerge partial — kept %.0f m of %.0f m (%d/%d features)",
+                rid,
+                longest.length,
+                sum(g.length for g in geoms),
+                n_in_reach,
+                len(valid_features),
+            )
+        else:
+            n_in_reach = len(valid_features)
+            n_seeded = sum(1 for f in valid_features if seeded[f])
         cid = int(comp_id[chain[0]])
-        n_seeded = sum(1 for f in chain if seeded[f])
-        sf = n_seeded / len(chain) if chain else 0.0
+        sf = n_seeded / n_in_reach if n_in_reach else 0.0
         rows.append(
             {
                 "reach_id": rid,
                 "component_id": cid,
-                "n_flowlines": len(chain),
+                "n_flowlines": n_in_reach,
                 "is_simple_chain": not any(f in junction_features for f in chain)
                 or len(chain) == 1,
                 "seeded_fraction": float(sf),
@@ -378,6 +404,7 @@ def sample_station_water_support(
     corridor_half_length_m: float,
     step_m: float = 5.0,
     mode: str = "binary_mask",
+    **kwargs,
 ) -> dict:
     """Evaluate water support in a corridor around a snapped station.
 
@@ -424,7 +451,11 @@ def sample_station_water_support(
         }
 
     if mode == "binary_mask":
-        frac = float(np.mean(valid > 0))
+        # Threshold at 0.5 to avoid bilinear interpolation dilation:
+        # sub-pixel positions near a water pixel edge get fractional values
+        # that should not count as water hits.
+        hits = valid >= 0.5
+        frac = float(np.mean(hits))
         return {
             "water_support_mean": frac,
             "water_support_max": float(np.max(valid)),
@@ -432,12 +463,16 @@ def sample_station_water_support(
             "water_hit": frac > 0,
         }
     else:
+        # Continuous mode: use the configured NDWI threshold (passed via
+        # water_hit_threshold) rather than a bare > 0 test.
+        hit_threshold = kwargs.get("water_hit_threshold", 0.0)
+        frac = float(np.mean(valid > hit_threshold))
         mean_val = float(np.mean(valid))
         return {
             "water_support_mean": mean_val,
             "water_support_max": float(np.max(valid)),
-            "water_support_frac": float(np.mean(valid > 0)),
-            "water_hit": mean_val > 0,
+            "water_support_frac": frac,
+            "water_hit": frac > 0,
         }
 
 
@@ -472,6 +507,10 @@ def snap_reach_to_thalweg(
     corridor_hw = config.rem_support_corridor_half_width_m
     corridor_hl = config.rem_support_corridor_half_length_m
     support_mode = config.rem_water_support_mode
+    # For continuous NDWI, use the same threshold as seeding
+    support_kwargs = {}
+    if support_mode == "continuous_index":
+        support_kwargs["water_hit_threshold"] = config.ndwi_threshold
 
     stations = stationize_reach(reach_geom, station_spacing_m)
     n_stations = len(stations)
@@ -539,6 +578,7 @@ def snap_reach_to_thalweg(
                 corridor_hl,
                 step_m=snap_search_spacing_m,
                 mode=support_mode,
+                **support_kwargs,
             )
             water_cost[s, j] = 1.0 - sup["water_support_frac"]
 
@@ -590,6 +630,7 @@ def snap_reach_to_thalweg(
             corridor_hl,
             step_m=snap_search_spacing_m,
             mode=support_mode,
+            **support_kwargs,
         )
         station_rows.append(
             {
@@ -653,7 +694,7 @@ def _compute_reach_metrics(
         )
 
     hits = station_gdf["water_hit"].values.astype(bool)
-    support_frac = station_gdf["water_support_frac"].values
+    support_mean = station_gdf["water_support_mean"].values
     abs_offsets = station_gdf["snap_offset_m"].abs().values
     s_m = station_gdf["s_m"].values
 
@@ -679,7 +720,7 @@ def _compute_reach_metrics(
 
     return ReachMetrics(
         station_water_hit_fraction=float(hits.mean()),
-        station_water_support_mean=float(support_frac.mean()),
+        station_water_support_mean=float(support_mean.mean()),
         mean_snap_offset_m=float(abs_offsets.mean()),
         max_snap_offset_m=float(abs_offsets.max()),
         max_consecutive_no_water_m=float(max_gap),
@@ -1167,14 +1208,14 @@ def compute_rem_anisotropic_frame(
     # Phase 4: reach decomposition
     reaches = split_confirmed_flowlines_into_reaches(confirmed_flowlines)
 
-    # Filter to seeded-only reaches (seeded_fraction > 0)
+    # Filter reaches by seeded fraction
     n_all = len(reaches)
-    min_seeded = getattr(config, "rem_min_seeded_fraction", 0.0)
-    eligible = reaches[reaches["seeded_fraction"] > min_seeded].copy()
+    min_seeded = config.rem_min_seeded_fraction
+    eligible = reaches[reaches["seeded_fraction"] >= min_seeded].copy()
     n_skipped_seed = n_all - len(eligible)
     if n_skipped_seed:
         LOGGER.info(
-            "Reach eligibility: %d/%d reaches have seeded_fraction > %.2f",
+            "Reach eligibility: %d/%d reaches have seeded_fraction >= %.2f",
             len(eligible),
             n_all,
             min_seeded,
