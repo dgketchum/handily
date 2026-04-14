@@ -21,6 +21,7 @@ LOGGER = logging.getLogger("handily.points.sample")
 
 GROUP_PRIORITY = [
     "riparian",
+    "field_interior",
     "low_rem",
     "field_edge",
     "high_rem_control",
@@ -188,6 +189,29 @@ def _assign_field_context(
     return out
 
 
+def _generate_field_interior_points(
+    fields: gpd.GeoDataFrame,
+    candidate_id_offset: int,
+    target_crs,
+) -> gpd.GeoDataFrame:
+    """Return one representative point per field polygon.
+
+    Uses ``representative_point()`` which is guaranteed to lie inside the
+    polygon, unlike the centroid which may fall outside for concave shapes.
+    """
+    if fields.empty:
+        return gpd.GeoDataFrame()
+
+    fields_proj = fields.to_crs(target_crs)
+    rep_points = fields_proj.geometry.representative_point()
+
+    pts = gpd.GeoDataFrame(geometry=rep_points, crs=target_crs).reset_index(drop=True)
+    pts["candidate_id"] = candidate_id_offset + pts.index.astype(int)
+    pts["x"] = pts.geometry.x
+    pts["y"] = pts.geometry.y
+    return pts
+
+
 def build_sample_masks(
     points: gpd.GeoDataFrame, config: HandilyConfig
 ) -> gpd.GeoDataFrame:
@@ -336,6 +360,28 @@ def build_aoi_sample_points(
             LOGGER.info("Sample group '%s': selected=%d", sample_group, len(sampled))
         selected_ids.update(sampled["candidate_id"].tolist())
         groups.append(sampled)
+
+    # Add one representative point per irrigated field — guaranteed field coverage.
+    if not fields.empty:
+        fi = _generate_field_interior_points(
+            fields, candidate_id_offset=len(candidates), target_crs=rem_da.rio.crs
+        )
+        fi = _sample_rem_values(fi, rem_da)
+        n_before = len(fi)
+        fi = fi.dropna(subset=["rem_at_sample"]).reset_index(drop=True)
+        if len(fi) < n_before:
+            LOGGER.info(
+                "Field interior: dropped %d/%d points with no REM value",
+                n_before - len(fi),
+                n_before,
+            )
+        fi = _assign_stream_context(fi, flowlines)
+        fi = _assign_field_context(fi, fields)
+        fi = build_sample_masks(fi, config)
+        fi["sample_group"] = "field_interior"
+        fi["sampling_weight"] = 1.0
+        groups.append(fi)
+        LOGGER.info("Field interior points: %d (one per field polygon)", len(fi))
 
     points = merge_sample_groups(groups)
     points = deduplicate_sample_points(points)
