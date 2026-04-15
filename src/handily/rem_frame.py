@@ -605,6 +605,22 @@ def build_smoothed_frame(
     xs_smooth[0], ys_smooth[0] = xs[0], ys[0]
     xs_smooth[-1], ys_smooth[-1] = xs[-1], ys[-1]
 
+    # Smooth thalweg elevation with the same kernel, then enforce monotonicity
+    elev = st["thalweg_elev_m"].values.astype(np.float64)
+    elev_smooth = ndi.gaussian_filter1d(elev, sigma=sigma_px, mode="nearest")
+
+    # Infer flow direction from dominant elevation trend
+    if elev_smooth[-1] <= elev_smooth[0]:
+        # Downstream = increasing index → enforce non-increasing
+        elev_mono = np.minimum.accumulate(elev_smooth)
+    else:
+        # Downstream = decreasing index → enforce non-decreasing then flip
+        elev_mono = np.maximum.accumulate(elev_smooth)
+
+    # Update snapped stations with conditioned elevation
+    st = st.copy()
+    st["thalweg_elev_m"] = elev_mono
+
     frame_rows = []
     for i in range(len(st)):
         frame_rows.append(
@@ -674,6 +690,7 @@ def sample_cross_sections(
     ridge_prominence_m: float,
     descend_stop_m: float,
     zero_mode: str,
+    other_frame_geoms: list[LineString] | None = None,
 ) -> CrossSectionSet:
     """Sample cross-sections normal to the frame with ridge-stop logic.
 
@@ -681,12 +698,24 @@ def sample_cross_sections(
     terminates when a crest rises more than *ridge_prominence_m* above the
     section base and then descends by *descend_stop_m*, or at *cross_max_dist_m*.
 
+    If *other_frame_geoms* is provided, cross-section rays are truncated at the
+    nearest intersection with another reach's frame line.
+
     Parameters
     ----------
     zero_mode : str
         ``"thalweg"`` — base elevation from snapped thalweg station
         ``"section_min"`` — base elevation from accepted section minimum
+    other_frame_geoms : list of LineString, optional
+        Frame geometries from other reaches, used for truncation.
     """
+    from shapely import STRtree
+
+    # Build spatial index of other frames for ray truncation
+    if other_frame_geoms:
+        frame_tree = STRtree(other_frame_geoms)
+    else:
+        frame_tree = None
     fs = frame_reach.frame_stations
     ss = frame_reach.snapped_stations
     n_stations = len(fs)
@@ -740,6 +769,30 @@ def sample_cross_sections(
                 ray_elev, ridge_prominence_m, descend_stop_m
             )
             limits[side] = limit_idx
+
+        # Truncate at intersection with other frames
+        if frame_tree is not None:
+            for side, sign in [("left", -1.0), ("right", 1.0)]:
+                ray_end = base_xy + sign * cross_max_dist_m * normal[s]
+                ray_line = LineString([base_xy.tolist(), ray_end.tolist()])
+                hit_idxs = frame_tree.query(ray_line, predicate="intersects")
+                for idx in hit_idxs:
+                    ix = ray_line.intersection(other_frame_geoms[idx])
+                    if ix.is_empty:
+                        continue
+                    if ix.geom_type == "Point":
+                        d = float(np.hypot(ix.x - base_xy[0], ix.y - base_xy[1]))
+                    elif ix.geom_type == "MultiPoint":
+                        d = min(
+                            float(np.hypot(p.x - base_xy[0], p.y - base_xy[1]))
+                            for p in ix.geoms
+                        )
+                    else:
+                        continue
+                    # Truncate: convert distance to index
+                    if d > 0 and cross_step_m > 0:
+                        trunc_idx = int(d / cross_step_m)
+                        limits[side] = min(limits[side], trunc_idx)
 
         left_dist = float(side_dists[min(limits["left"], n_side_pts - 1)])
         right_dist = float(side_dists[min(limits["right"], n_side_pts - 1)])
@@ -836,9 +889,6 @@ def rasterize_anisotropic_water_surface(
     res_x = abs(float(transform.a))
     res_y = abs(float(transform.e))
 
-    ws_wsum = np.zeros(shape, dtype=np.float64)  # weighted sum of elevations
-    ws_wt = np.zeros(shape, dtype=np.float64)  # sum of weights
-
     secs = cross_sections.sections
     if secs.empty:
         empty = np.full(shape, np.nan, dtype=np.float32)
@@ -860,7 +910,9 @@ def rasterize_anisotropic_water_surface(
 
     n_strips = 0
 
-    # Process each reach's sections in sequence
+    # --- Phase A: rasterize each reach independently (linear interp within) ---
+    reach_surfaces = []  # list of (ws_array, thalweg_dist_array) per reach
+
     for frame in frame_reaches:
         reach_secs = (
             secs[secs["reach_id"] == frame.reach_id]
@@ -870,6 +922,9 @@ def rasterize_anisotropic_water_surface(
 
         if len(reach_secs) < 2:
             continue
+
+        reach_ws = np.full(shape, np.nan, dtype=np.float64)
+        reach_dist = np.full(shape, np.inf, dtype=np.float64)
 
         for i in range(len(reach_secs) - 1):
             sec_a = reach_secs.iloc[i]
@@ -957,26 +1012,45 @@ def rasterize_anisotropic_water_surface(
             px_vec = np.column_stack([px_x - base_a[0], px_y - base_a[1]])
             t = np.clip(px_vec @ axis_unit / axis_len, 0, 1)
 
-            # Interpolate base elevation
+            # Interpolate base elevation linearly along reach
             elev_a = float(sec_a["base_elev_m"])
             elev_b = float(sec_b["base_elev_m"])
             interp_elev = elev_a + t * (elev_b - elev_a)
 
-            # IDW weight: inverse distance to thalweg axis
+            # Perpendicular distance to thalweg axis (for inter-reach blending)
             proj = t[:, np.newaxis] * axis[np.newaxis, :]
             perp_dist = np.linalg.norm(px_vec - proj, axis=1)
-            weight = 1.0 / np.maximum(perp_dist, 1.0)
 
-            ws_wsum[ys_idx, xs_idx] += interp_elev * weight
-            ws_wt[ys_idx, xs_idx] += weight
+            # Within-reach: last strip wins (adjacent strips share boundary
+            # values so this is clean linear interpolation)
+            reach_ws[ys_idx, xs_idx] = interp_elev
+            reach_dist[ys_idx, xs_idx] = np.minimum(
+                reach_dist[ys_idx, xs_idx], perp_dist
+            )
             n_strips += 1
 
-    LOGGER.info("Rasterized %d section strips", n_strips)
+        if np.any(np.isfinite(reach_ws)):
+            reach_surfaces.append((reach_ws, reach_dist))
 
-    # IDW blend overlapping strips
-    valid = ws_wt > 0
+    LOGGER.info(
+        "Rasterized %d section strips across %d reaches", n_strips, len(reach_surfaces)
+    )
+
+    # --- Phase B: IDW blend across reaches ---
     ws = np.full(shape, np.nan, dtype=np.float64)
-    ws[valid] = ws_wsum[valid] / ws_wt[valid]
+    if reach_surfaces:
+        ws_wsum = np.zeros(shape, dtype=np.float64)
+        ws_wt = np.zeros(shape, dtype=np.float64)
+        for reach_ws, reach_dist in reach_surfaces:
+            covered = np.isfinite(reach_ws)
+            d = np.maximum(reach_dist[covered], 1.0)
+            weight = 1.0 / (d * d)
+            ws_wsum[covered] += reach_ws[covered] * weight
+            ws_wt[covered] += weight
+        valid = ws_wt > 0
+        ws[valid] = ws_wsum[valid] / ws_wt[valid]
+    else:
+        valid = np.zeros(shape, dtype=bool)
 
     ws_da = xr.DataArray(
         ws.astype(np.float32),
@@ -1095,13 +1169,21 @@ def compute_rem_anisotropic_frame(
             metrics["n_reaches_warned"] += 1
         snapped_list.append(snapped)
 
-    # --- Phase 6: Frame + cross-sections on snapped reaches (parallel) ---
-    def _frame_one_chain(snapped):
-        """Smooth + cross-section for a snapped reach. Thread-safe."""
-        rid = snapped.reach_id
+    # --- Phase 6a: Build smoothed frames (parallel) ---
+    def _build_frame(snapped):
+        """Build smoothed frame for a snapped reach. Thread-safe."""
         frame = build_smoothed_frame(snapped, smoothing_m=config.rem_frame_smoothing_m)
-        frame.reach_id = rid
+        frame.reach_id = snapped.reach_id
+        return frame
 
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        frame_list = list(pool.map(_build_frame, snapped_list))
+
+    # --- Phase 6b: Sample cross-sections with inter-frame truncation (parallel) ---
+    def _xsec_one_reach(args):
+        """Sample cross-sections, truncating at other frames. Thread-safe."""
+        frame, other_geoms = args
+        rid = frame.reach_id
         xsec = sample_cross_sections(
             frame,
             dem_da,
@@ -1111,22 +1193,29 @@ def compute_rem_anisotropic_frame(
             ridge_prominence_m=config.rem_cross_ridge_prominence_m,
             descend_stop_m=config.rem_cross_descend_stop_m,
             zero_mode=config.rem_zero_mode,
+            other_frame_geoms=other_geoms,
         )
         sec_df = xsec.sections.copy()
         sec_df["reach_id"] = rid
         sup_df = xsec.support_polygons.copy()
         sup_df["reach_id"] = rid
-        return (frame, sec_df, sup_df)
+        return (sec_df, sup_df)
+
+    # For each reach, collect all *other* frame geometries
+    xsec_args = []
+    for i, frame in enumerate(frame_list):
+        other_geoms = [f.frame_geom for j, f in enumerate(frame_list) if j != i]
+        xsec_args.append((frame, other_geoms))
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        frame_results = list(pool.map(_frame_one_chain, snapped_list))
+        xsec_results = list(pool.map(_xsec_one_reach, xsec_args))
 
     snapped_reaches = []
     frame_reaches = []
     all_sections = []
     all_support = []
 
-    for snapped, (frame, sec_df, sup_df) in zip(snapped_list, frame_results):
+    for snapped, frame, (sec_df, sup_df) in zip(snapped_list, frame_list, xsec_results):
         snapped_reaches.append((snapped, None))
         frame_reaches.append(frame)
         all_sections.append(sec_df)
