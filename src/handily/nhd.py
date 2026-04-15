@@ -58,7 +58,7 @@ FCODE_CATEGORIES = {
 # Hillside canals (33601) traverse slope contours and cause false near-zero REM patches
 # on adjacent hillside pixels. They are retained for DTW modeling via the FGB.
 # Intermittent streams (46003) are kept and filtered by network connectivity instead.
-REM_EXCLUDED_FCODES: frozenset[int] = frozenset({33601})
+REM_EXCLUDED_FCODES: frozenset[int] = frozenset({33601, 46007})
 
 StreamCategory = Literal["perennial", "intermittent", "managed"]
 

@@ -164,11 +164,22 @@ def stationize_reach(
     distances = np.arange(0, total + spacing_m * 0.5, spacing_m)
     if distances[-1] < total:
         distances = np.append(distances, total)
-    rows = []
-    for i, d in enumerate(distances):
-        pt = reach_geom.interpolate(d)
-        rows.append({"station_id": i, "s_m": float(d), "geometry": pt})
-    return gpd.GeoDataFrame(rows, geometry="geometry")
+
+    # Vectorized interpolation via numpy (avoids per-station shapely calls)
+    coords = np.array(reach_geom.coords)
+    seg_lengths = np.linalg.norm(np.diff(coords, axis=0), axis=1)
+    seg_dists = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+    # Compact zero-length segments to keep np.interp monotonic
+    mask = np.concatenate([[True], seg_lengths > 0])
+    seg_dists_clean = seg_dists[mask]
+    coords_clean = coords[mask]
+    xs = np.interp(distances, seg_dists_clean, coords_clean[:, 0])
+    ys = np.interp(distances, seg_dists_clean, coords_clean[:, 1])
+
+    return gpd.GeoDataFrame(
+        {"station_id": np.arange(len(distances)), "s_m": distances},
+        geometry=gpd.points_from_xy(xs, ys),
+    )
 
 
 def _build_dem_interpolator(dem_da: xr.DataArray) -> RegularGridInterpolator:
@@ -274,6 +285,8 @@ def snap_reach_to_thalweg(
     dem_da: xr.DataArray,
     ndwi_da: xr.DataArray,
     config: HandilyConfig,
+    dem_interp: RegularGridInterpolator | None = None,
+    ndwi_interp: RegularGridInterpolator | None = None,
 ) -> SnappedReach:
     """Snap a reach to the DEM thalweg via dynamic-programming offset optimization.
 
@@ -316,9 +329,11 @@ def snap_reach_to_thalweg(
             confidence=0.0,
         )
 
-    # Build interpolators
-    dem_interp = _build_dem_interpolator(dem_da)
-    ndwi_interp = _build_dem_interpolator(ndwi_da)
+    # Build interpolators (use pre-built if provided)
+    if dem_interp is None:
+        dem_interp = _build_dem_interpolator(dem_da)
+    if ndwi_interp is None:
+        ndwi_interp = _build_dem_interpolator(ndwi_da)
 
     # Candidate offsets
     offsets = np.arange(
@@ -529,6 +544,126 @@ def _compute_reach_metrics(
     )
 
 
+def _merge_at_passthrough_junctions(
+    snapped_list: list[SnappedReach],
+    snap_tol: float = 2.0,
+) -> list[SnappedReach]:
+    """Merge snapped reaches that share a 2-way junction into single reaches.
+
+    After filtering removes a spur from a 3-way junction, the remaining two
+    reaches should form one continuous reach so that frame smoothing produces
+    a continuous curve through the former junction.
+
+    Only merges pairs where exactly two reach endpoints meet (within
+    *snap_tol* meters) and no other reach connects at that point.
+    """
+    if len(snapped_list) < 2:
+        return snapped_list
+
+    from scipy.spatial import cKDTree
+
+    # Collect all endpoints: (x, y, reach_index, which_end)
+    # which_end: 0 = start, 1 = end
+    endpoints = []
+    for i, s in enumerate(snapped_list):
+        coords = np.array(s.snapped_geom.coords)
+        endpoints.append((coords[0][0], coords[0][1], i, 0))
+        endpoints.append((coords[-1][0], coords[-1][1], i, 1))
+
+    pts = np.array([(e[0], e[1]) for e in endpoints])
+    tree = cKDTree(pts)
+    pairs = tree.query_pairs(snap_tol)
+
+    # Build junction map: for each matched pair, record which reaches connect
+    junction_reaches = {}  # frozenset of endpoint indices → list of (reach_idx, end)
+    for a, b in pairs:
+        ea, eb = endpoints[a], endpoints[b]
+        # Skip if same reach
+        if ea[2] == eb[2]:
+            continue
+        mid = ((ea[0] + eb[0]) / 2, (ea[1] + eb[1]) / 2)
+        key = (round(mid[0], 1), round(mid[1], 1))
+        if key not in junction_reaches:
+            junction_reaches[key] = set()
+        junction_reaches[key].add((ea[2], ea[3]))
+        junction_reaches[key].add((eb[2], eb[3]))
+
+    # Find 2-way junctions (exactly 2 reaches meet)
+    merged = set()
+    merge_pairs = []
+    for key, reach_ends in junction_reaches.items():
+        reach_indices = {re[0] for re in reach_ends}
+        if len(reach_indices) == 2 and all(ri not in merged for ri in reach_indices):
+            re_list = list(reach_ends)
+            # Only merge if each reach contributes exactly one endpoint here
+            if len(re_list) == 2:
+                merge_pairs.append((re_list[0], re_list[1]))
+                merged.update(reach_indices)
+
+    if not merge_pairs:
+        return snapped_list
+
+    result = []
+    for (idx_a, end_a), (idx_b, end_b) in merge_pairs:
+        sa = snapped_list[idx_a]
+        sb = snapped_list[idx_b]
+        st_a = sa.stations.copy()
+        st_b = sb.stations.copy()
+
+        # Orient so that sa's matching end connects to sb's matching end
+        # We need sa to end where sb starts
+        if end_a == 0:
+            # Reverse reach a so its start becomes its end
+            st_a = st_a.iloc[::-1].reset_index(drop=True)
+        if end_b == 1:
+            # Reverse reach b so its end becomes its start
+            st_b = st_b.iloc[::-1].reset_index(drop=True)
+
+        # Recompute s_m for the combined reach
+        s_offset = float(st_a.iloc[-1]["s_m"])
+        # Add small gap for the junction distance
+        junction_gap = np.hypot(
+            float(st_a.iloc[-1]["x_snap"]) - float(st_b.iloc[0]["x_snap"]),
+            float(st_a.iloc[-1]["y_snap"]) - float(st_b.iloc[0]["y_snap"]),
+        )
+        st_b = st_b.copy()
+        st_b["s_m"] = (
+            st_b["s_m"].values - float(st_b.iloc[0]["s_m"]) + s_offset + junction_gap
+        )
+
+        combined_st = pd.concat([st_a, st_b], ignore_index=True)
+        combined_st["station_id"] = range(len(combined_st))
+
+        coords_combined = np.column_stack(
+            [combined_st["x_snap"].values, combined_st["y_snap"].values]
+        )
+        combined_geom = LineString(coords_combined.tolist())
+
+        merged_reach = SnappedReach(
+            reach_id=sa.reach_id,
+            prior_geom=combined_geom,
+            snapped_geom=combined_geom,
+            stations=combined_st,
+            confidence=min(sa.confidence, sb.confidence),
+            metrics=sa.metrics,
+        )
+        result.append(merged_reach)
+        LOGGER.info(
+            "Merged reaches %d+%d at 2-way junction (%d+%d stations)",
+            sa.reach_id,
+            sb.reach_id,
+            len(st_a),
+            len(st_b),
+        )
+
+    # Add unmerged reaches
+    for i, s in enumerate(snapped_list):
+        if i not in merged:
+            result.append(s)
+
+    return result
+
+
 def evaluate_reach_acceptance(
     snapped: SnappedReach,
     config: HandilyConfig,
@@ -684,13 +819,16 @@ def _find_support_limit(
 def sample_cross_sections(
     frame_reach: FrameReach,
     dem_da: xr.DataArray,
-    ndwi_da: xr.DataArray,
     cross_max_dist_m: float,
     cross_step_m: float,
     ridge_prominence_m: float,
     descend_stop_m: float,
     zero_mode: str,
     other_frame_geoms: list[LineString] | None = None,
+    dem_interp: RegularGridInterpolator | None = None,
+    all_frame_geoms: list[LineString] | None = None,
+    frame_tree=None,
+    self_reach_idx: int = -1,
 ) -> CrossSectionSet:
     """Sample cross-sections normal to the frame with ridge-stop logic.
 
@@ -698,29 +836,32 @@ def sample_cross_sections(
     terminates when a crest rises more than *ridge_prominence_m* above the
     section base and then descends by *descend_stop_m*, or at *cross_max_dist_m*.
 
-    If *other_frame_geoms* is provided, cross-section rays are truncated at the
-    nearest intersection with another reach's frame line.
+    Cross-section rays are truncated at the nearest intersection with another
+    reach's frame line, either via a shared STRtree (``all_frame_geoms`` +
+    ``frame_tree`` + ``self_reach_idx``) or a per-reach list
+    (``other_frame_geoms``, legacy).
 
     Parameters
     ----------
     zero_mode : str
         ``"thalweg"`` — base elevation from snapped thalweg station
         ``"section_min"`` — base elevation from accepted section minimum
-    other_frame_geoms : list of LineString, optional
-        Frame geometries from other reaches, used for truncation.
+    dem_interp : RegularGridInterpolator, optional
+        Pre-built DEM interpolator. Built from dem_da if not provided.
     """
     from shapely import STRtree
 
-    # Build spatial index of other frames for ray truncation
-    if other_frame_geoms:
+    # Build or use spatial index for ray truncation
+    if frame_tree is None and other_frame_geoms:
         frame_tree = STRtree(other_frame_geoms)
-    else:
-        frame_tree = None
+        all_frame_geoms = other_frame_geoms
+        self_reach_idx = -1  # no self to skip
     fs = frame_reach.frame_stations
     ss = frame_reach.snapped_stations
     n_stations = len(fs)
 
-    dem_interp = _build_dem_interpolator(dem_da)
+    if dem_interp is None:
+        dem_interp = _build_dem_interpolator(dem_da)
 
     # Compute frame tangent and normals
     frame_xy = np.column_stack([fs["x_frame"].values, fs["y_frame"].values]).astype(
@@ -743,41 +884,90 @@ def sample_cross_sections(
     n_side_pts = int(cross_max_dist_m / cross_step_m) + 1
     side_dists = np.arange(0, n_side_pts) * cross_step_m
 
+    # Curvature-based max distance: prevent adjacent cross-sections from
+    # crossing on the inside of curves.  For each station, compute the angle
+    # change to its neighbors; the safe distance on the concave side is
+    # half_spacing / tan(delta_angle / 2).
+    angles = np.arctan2(normal[:, 1], normal[:, 0])
+    curvature_max_left = np.full(n_stations, cross_max_dist_m)
+    curvature_max_right = np.full(n_stations, cross_max_dist_m)
+
+    for i in range(n_stations):
+        for nb in (i - 1, i + 1):
+            if nb < 0 or nb >= n_stations:
+                continue
+            da = angles[nb] - angles[i]
+            da = (da + np.pi) % (2 * np.pi) - np.pi  # wrap to [-pi, pi]
+            half_spacing = np.linalg.norm(frame_xy[nb] - frame_xy[i]) / 2
+            if abs(da) < 1e-6:
+                continue
+            safe = half_spacing / abs(np.tan(da / 2))
+            # Positive da → normals converge on the left (negative-normal) side
+            # Negative da → normals converge on the right (positive-normal) side
+            if da > 0:
+                curvature_max_left[i] = min(curvature_max_left[i], safe)
+            else:
+                curvature_max_right[i] = min(curvature_max_right[i], safe)
+
+    # Batch DEM sampling: compute all ray points upfront (2 calls instead of 2*N)
+    base_xy_all = np.column_stack([ss["x_snap"].values, ss["y_snap"].values]).astype(
+        np.float64
+    )
+
+    # (n_stations, n_side_pts, 2) arrays for left and right rays
+    left_ray_xy = (
+        base_xy_all[:, np.newaxis, :]
+        - side_dists[np.newaxis, :, np.newaxis] * normal[:, np.newaxis, :]
+    )
+    right_ray_xy = (
+        base_xy_all[:, np.newaxis, :]
+        + side_dists[np.newaxis, :, np.newaxis] * normal[:, np.newaxis, :]
+    )
+
+    left_elev_all = _sample_raster_at_points(
+        dem_interp,
+        left_ray_xy[:, :, 0].ravel(),
+        left_ray_xy[:, :, 1].ravel(),
+    ).reshape(n_stations, n_side_pts)
+
+    right_elev_all = _sample_raster_at_points(
+        dem_interp,
+        right_ray_xy[:, :, 0].ravel(),
+        right_ray_xy[:, :, 1].ravel(),
+    ).reshape(n_stations, n_side_pts)
+
+    # Per-station ridge-stop limits
+    left_limits = np.array(
+        [
+            _find_support_limit(left_elev_all[s], ridge_prominence_m, descend_stop_m)
+            for s in range(n_stations)
+        ]
+    )
+    right_limits = np.array(
+        [
+            _find_support_limit(right_elev_all[s], ridge_prominence_m, descend_stop_m)
+            for s in range(n_stations)
+        ]
+    )
+
     section_rows = []
     support_rows = []
 
     for s in range(n_stations):
-        base_xy = np.array(
-            [
-                float(ss.iloc[s]["x_snap"]),
-                float(ss.iloc[s]["y_snap"]),
-            ]
-        )
+        base_xy = base_xy_all[s]
         thalweg_elev = float(ss.iloc[s]["thalweg_elev_m"])
-
-        # Cast left (negative normal) and right (positive normal)
-        limits = {}
-        profiles = {}
-        for side, sign in [("left", -1.0), ("right", 1.0)]:
-            ray_xy = (
-                base_xy[np.newaxis, :]
-                + (sign * side_dists[:, np.newaxis]) * normal[s][np.newaxis, :]
-            )
-            ray_elev = _sample_raster_at_points(dem_interp, ray_xy[:, 0], ray_xy[:, 1])
-            profiles[side] = ray_elev
-            limit_idx = _find_support_limit(
-                ray_elev, ridge_prominence_m, descend_stop_m
-            )
-            limits[side] = limit_idx
+        limits = {"left": int(left_limits[s]), "right": int(right_limits[s])}
 
         # Truncate at intersection with other frames
-        if frame_tree is not None:
+        if frame_tree is not None and all_frame_geoms:
             for side, sign in [("left", -1.0), ("right", 1.0)]:
                 ray_end = base_xy + sign * cross_max_dist_m * normal[s]
                 ray_line = LineString([base_xy.tolist(), ray_end.tolist()])
                 hit_idxs = frame_tree.query(ray_line, predicate="intersects")
                 for idx in hit_idxs:
-                    ix = ray_line.intersection(other_frame_geoms[idx])
+                    if idx == self_reach_idx:
+                        continue
+                    ix = ray_line.intersection(all_frame_geoms[idx])
                     if ix.is_empty:
                         continue
                     if ix.geom_type == "Point":
@@ -794,6 +984,12 @@ def sample_cross_sections(
                         trunc_idx = int(d / cross_step_m)
                         limits[side] = min(limits[side], trunc_idx)
 
+        # Curvature clamp: prevent self-intersection on tight curves
+        left_max_idx = int(curvature_max_left[s] / cross_step_m)
+        right_max_idx = int(curvature_max_right[s] / cross_step_m)
+        limits["left"] = min(limits["left"], left_max_idx)
+        limits["right"] = min(limits["right"], right_max_idx)
+
         left_dist = float(side_dists[min(limits["left"], n_side_pts - 1)])
         right_dist = float(side_dists[min(limits["right"], n_side_pts - 1)])
 
@@ -801,8 +997,8 @@ def sample_cross_sections(
         if zero_mode == "section_min":
             all_elev = np.concatenate(
                 [
-                    profiles["left"][: limits["left"]],
-                    profiles["right"][: limits["right"]],
+                    left_elev_all[s, : limits["left"]],
+                    right_elev_all[s, : limits["right"]],
                 ]
             )
             valid = all_elev[np.isfinite(all_elev)]
@@ -880,6 +1076,7 @@ def rasterize_anisotropic_water_surface(
     Returns (water_surface_da, support_confidence_da).
     """
     from rasterio import features as rio_features
+    from rasterio.transform import from_origin
     from shapely.geometry import Polygon
 
     shape = dem_da.shape
@@ -971,8 +1168,6 @@ def rasterize_anisotropic_water_surface(
             # Build sub-window transform
             sub_x_origin = x_coords[col_min] - res_x * 0.5
             sub_y_origin = y_coords[row_min] + res_y * 0.5  # top-left
-            from rasterio.transform import from_origin
-
             sub_transform = from_origin(sub_x_origin, sub_y_origin, res_x, res_y)
 
             strip_mask = rio_features.rasterize(
@@ -1091,6 +1286,10 @@ def compute_rem_anisotropic_frame(
         LOGGER.info("Reprojecting NDWI from %s to %s", ndwi_da.rio.crs, dem_da.rio.crs)
         ndwi_da = ndwi_da.rio.reproject_match(dem_da)
 
+    # Build interpolators once (shared across all reaches, thread-safe for reads)
+    dem_interp = _build_dem_interpolator(dem_da)
+    ndwi_interp = _build_dem_interpolator(ndwi_da)
+
     # Phase 4: reach decomposition
     reaches = split_confirmed_flowlines_into_reaches(confirmed_flowlines)
 
@@ -1125,7 +1324,14 @@ def compute_rem_anisotropic_frame(
             )
             return None
 
-        snapped = snap_reach_to_thalweg(geom, dem_da, ndwi_da, config)
+        snapped = snap_reach_to_thalweg(
+            geom,
+            dem_da,
+            ndwi_da,
+            config,
+            dem_interp=dem_interp,
+            ndwi_interp=ndwi_interp,
+        )
         snapped.reach_id = rid
         if snapped.metrics is not None:
             snapped.metrics.seeded_fraction = float(row.get("seeded_fraction", 0.0))
@@ -1169,6 +1375,86 @@ def compute_rem_anisotropic_frame(
             metrics["n_reaches_warned"] += 1
         snapped_list.append(snapped)
 
+    # --- Phase 5b: Filter cross-gradient reaches (slope + asymmetry) ---
+    min_slope = getattr(config, "rem_min_thalweg_slope_pct", 0.20)
+    asym_sample_dist = 100.0  # meters to sample left/right of thalweg
+    if min_slope > 0:
+        filtered = []
+        for snapped in snapped_list:
+            st = snapped.stations
+            elevs = st["thalweg_elev_m"].values
+            valid_elevs = elevs[np.isfinite(elevs)]
+            s_m = st["s_m"].values
+            reach_len = s_m[-1] - s_m[0] if len(s_m) > 1 else 0
+            if reach_len > 0 and len(valid_elevs) >= 2:
+                slope_pct = abs(valid_elevs[-1] - valid_elevs[0]) / reach_len * 100
+            else:
+                slope_pct = 0.0
+
+            low_slope = slope_pct < min_slope
+
+            # Quick asymmetry: sample DEM 100m left and right of each station
+            asymmetric = False
+            if low_slope:
+                coords = np.column_stack(
+                    [st["x_snap"].values, st["y_snap"].values]
+                ).astype(np.float64)
+                tangent = np.zeros_like(coords)
+                n_st = len(coords)
+                for i in range(n_st):
+                    if i == 0:
+                        tangent[i] = coords[1] - coords[0]
+                    elif i == n_st - 1:
+                        tangent[i] = coords[-1] - coords[-2]
+                    else:
+                        tangent[i] = coords[i + 1] - coords[i - 1]
+                norms = np.linalg.norm(tangent, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                tangent /= norms
+                normal = np.column_stack([-tangent[:, 1], tangent[:, 0]])
+
+                left_pts = coords - asym_sample_dist * normal
+                right_pts = coords + asym_sample_dist * normal
+                base_elev = _sample_raster_at_points(
+                    dem_interp, coords[:, 0], coords[:, 1]
+                )
+                left_elev = _sample_raster_at_points(
+                    dem_interp, left_pts[:, 0], left_pts[:, 1]
+                )
+                right_elev = _sample_raster_at_points(
+                    dem_interp, right_pts[:, 0], right_pts[:, 1]
+                )
+                left_rise = np.nanmedian(left_elev - base_elev)
+                right_rise = np.nanmedian(right_elev - base_elev)
+                # Asymmetric = one side drops below thalweg (negative rise)
+                asymmetric = (left_rise < 0) or (right_rise < 0)
+
+            if low_slope and asymmetric:
+                LOGGER.info(
+                    "Reach %d: cross-gradient (slope=%.3f%%, left_rise=%.1f m, "
+                    "right_rise=%.1f m), dropping",
+                    snapped.reach_id,
+                    slope_pct,
+                    left_rise,
+                    right_rise,
+                )
+                metrics["n_reaches_skipped"] += 1
+            else:
+                filtered.append(snapped)
+        if len(filtered) < len(snapped_list):
+            LOGGER.info(
+                "Cross-gradient filter: dropped %d/%d reaches",
+                len(snapped_list) - len(filtered),
+                len(snapped_list),
+            )
+        snapped_list = filtered
+
+    # --- Phase 5c: Merge reaches at 2-way junctions ---
+    # After filtering, a former 3-way junction may now be 2-way. The two
+    # surviving reaches should be chained into one so the frame passes
+    # smoothly through the junction instead of meeting at a sharp angle.
+    snapped_list = _merge_at_passthrough_junctions(snapped_list, snap_tol=2.0)
+
     # --- Phase 6a: Build smoothed frames (parallel) ---
     def _build_frame(snapped):
         """Build smoothed frame for a snapped reach. Thread-safe."""
@@ -1180,20 +1466,28 @@ def compute_rem_anisotropic_frame(
         frame_list = list(pool.map(_build_frame, snapped_list))
 
     # --- Phase 6b: Sample cross-sections with inter-frame truncation (parallel) ---
+    # Build shared STRtree of all frame geometries (one build, not per-reach)
+    from shapely import STRtree
+
+    all_frame_geoms = [f.frame_geom for f in frame_list]
+    shared_frame_tree = STRtree(all_frame_geoms) if all_frame_geoms else None
+
     def _xsec_one_reach(args):
         """Sample cross-sections, truncating at other frames. Thread-safe."""
-        frame, other_geoms = args
+        frame, self_idx = args
         rid = frame.reach_id
         xsec = sample_cross_sections(
             frame,
             dem_da,
-            ndwi_da,
             cross_max_dist_m=config.rem_cross_max_dist_m,
             cross_step_m=config.rem_cross_step_m,
             ridge_prominence_m=config.rem_cross_ridge_prominence_m,
             descend_stop_m=config.rem_cross_descend_stop_m,
             zero_mode=config.rem_zero_mode,
-            other_frame_geoms=other_geoms,
+            all_frame_geoms=all_frame_geoms,
+            frame_tree=shared_frame_tree,
+            self_reach_idx=self_idx,
+            dem_interp=dem_interp,
         )
         sec_df = xsec.sections.copy()
         sec_df["reach_id"] = rid
@@ -1201,11 +1495,7 @@ def compute_rem_anisotropic_frame(
         sup_df["reach_id"] = rid
         return (sec_df, sup_df)
 
-    # For each reach, collect all *other* frame geometries
-    xsec_args = []
-    for i, frame in enumerate(frame_list):
-        other_geoms = [f.frame_geom for j, f in enumerate(frame_list) if j != i]
-        xsec_args.append((frame, other_geoms))
+    xsec_args = [(frame, i) for i, frame in enumerate(frame_list)]
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         xsec_results = list(pool.map(_xsec_one_reach, xsec_args))
