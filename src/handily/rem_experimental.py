@@ -60,9 +60,9 @@ RAY_STEP_M = 2.0
 RESNAP_MAX_OFFSET_M = 50.0
 RESNAP_SEARCH_SPACING_M = 3.0
 RESNAP_STATION_SPACING_M = 5.0
-RESNAP_W_ELEV = 0.35
-RESNAP_W_WATER = 0.35
-RESNAP_W_PRIOR = 0.3
+RESNAP_W_ELEV = 0.45
+RESNAP_W_WATER = 0.4
+RESNAP_W_PRIOR = 0.15
 RESNAP_W_TRANSITION = 1.0
 RESNAP_SMOOTHING_M = 100.0
 
@@ -927,6 +927,410 @@ def _truncate_one_sided(
     return trunc if isinstance(trunc, LineString) and trunc.length > eps_m else None
 
 
+def _build_reach_chains(
+    snapped_gdf: gpd.GeoDataFrame,
+    junction_tol_m: float = 1.0,
+) -> list[list[tuple[int, bool]]]:
+    """Partition all reaches into maximal non-branching chains.
+
+    Returns a list of chains, each chain a list of ``(reach_id, reversed_flag)``
+    in traversal order.  A chain ends at leaves (degree-1 junctions) or
+    branches (degree >= 3).
+    """
+    from scipy.spatial import cKDTree
+
+    # -- collect endpoints for every reach --
+    rids: list[int] = []
+    starts: list[np.ndarray] = []
+    ends: list[np.ndarray] = []
+    for _, row in snapped_gdf.iterrows():
+        g = row.geometry
+        if g is None or g.is_empty:
+            continue
+        coords = np.array(g.coords)
+        rids.append(int(row["reach_id"]))
+        starts.append(coords[0, :2].copy())
+        ends.append(coords[-1, :2].copy())
+
+    n = len(rids)
+    if n == 0:
+        return []
+
+    # -- union-find on endpoints within junction_tol_m --
+    # 2N points: index 2*i = start of reach i, 2*i+1 = end of reach i
+    pts = np.vstack(starts + ends)  # shape (2N, 2)
+    parent = list(range(2 * n))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    tree = cKDTree(pts)
+    pairs = tree.query_pairs(junction_tol_m)
+    for a, b in pairs:
+        union(a, b)
+
+    # -- count how many reach-endpoints meet at each junction cluster --
+    junction_degree: dict[int, int] = Counter()
+    for i in range(2 * n):
+        junction_degree[find(i)] += 1
+
+    # -- build adjacency: for each reach, which other reaches share a junction --
+    # endpoint_cluster[i] = (cluster_of_start, cluster_of_end)
+    ep_cluster = [(find(2 * i), find(2 * i + 1)) for i in range(n)]
+    # cluster -> list of (reach_index, is_end_side)
+    cluster_reaches: dict[int, list[tuple[int, bool]]] = {}
+    for i in range(n):
+        cs, ce = ep_cluster[i]
+        cluster_reaches.setdefault(cs, []).append((i, False))  # start side
+        cluster_reaches.setdefault(ce, []).append((i, True))  # end side
+
+    # -- greedy chain walk --
+    chained: set[int] = set()
+    chains: list[list[tuple[int, bool]]] = []
+
+    for seed_idx in range(n):
+        if seed_idx in chained:
+            continue
+        chain: list[tuple[int, bool]] = [(rids[seed_idx], False)]
+        chained.add(seed_idx)
+
+        # Extend forward from the end of the chain
+        def _extend(direction: str) -> None:
+            while True:
+                if direction == "forward":
+                    last_rid, last_rev = chain[-1]
+                    li = rids.index(last_rid)
+                    # free end = end if not reversed, start if reversed
+                    free_cluster = (
+                        ep_cluster[li][1] if not last_rev else ep_cluster[li][0]
+                    )
+                else:
+                    last_rid, last_rev = chain[0]
+                    li = rids.index(last_rid)
+                    # free end = start if not reversed, end if reversed
+                    free_cluster = (
+                        ep_cluster[li][0] if not last_rev else ep_cluster[li][1]
+                    )
+
+                # Only extend through degree-2 junctions
+                if junction_degree[free_cluster] != 2:
+                    break
+
+                # Find the other reach at this junction
+                candidates = cluster_reaches[free_cluster]
+                found = False
+                for ci, is_end_side in candidates:
+                    if ci in chained:
+                        continue
+                    # Determine orientation: if the candidate's end_side matches
+                    # the free cluster, the candidate connects via that end
+                    if is_end_side:
+                        # candidate's end touches our free end -> reversed
+                        reversed_flag = True
+                    else:
+                        # candidate's start touches our free end -> not reversed
+                        reversed_flag = False
+                    if direction == "forward":
+                        chain.append((rids[ci], reversed_flag))
+                    else:
+                        # Attach to start: if candidate's start touches our free
+                        # start, it's not reversed; if its end touches, reversed.
+                        # But direction=="backward" means we're extending the
+                        # start of the chain, so flip the logic:
+                        if is_end_side:
+                            chain.insert(0, (rids[ci], False))
+                        else:
+                            chain.insert(0, (rids[ci], True))
+                    chained.add(ci)
+                    found = True
+                    break
+                if not found:
+                    break
+
+        _extend("forward")
+        _extend("backward")
+        chains.append(chain)
+
+    return chains
+
+
+def _generate_chain_side_strips(
+    chain: list[tuple[int, bool]],
+    side_label: str,
+    faces: NetworkFaces,
+    frame_by_rid: dict[int, LineString],
+    snap_by_rid: dict[int, LineString],
+    dem_interp: RegularGridInterpolator,
+    obstacle_geoms: list[LineString],
+    obstacle_rids: list[int],
+    reach_tree,
+    strip_spacing_m: float,
+    max_strip_len_m: float,
+    ridge_prominence_m: float,
+    descend_stop_m: float,
+) -> list[dict]:
+    """Process one chain on one side: build stations, compute angles with
+    seed-and-interpolate blending, then generate strips center-out with
+    intra-chain truncation.
+    """
+    sign = 1.0 if side_label == "left" else -1.0
+
+    # ---- Phase A: build station list along chain ----
+    stations: list[dict] = []
+    for rid, reversed_flag in chain:
+        snap_geom = snap_by_rid.get(rid)
+        frame_geom = frame_by_rid.get(rid)
+        if snap_geom is None or snap_geom.is_empty:
+            continue
+        if frame_geom is None or frame_geom.is_empty:
+            continue
+
+        total = float(snap_geom.length)
+        s_vals = np.arange(strip_spacing_m * 0.5, total + 1e-6, strip_spacing_m)
+        if len(s_vals) == 0:
+            continue
+
+        n_stations = len(s_vals)
+        center_idx = n_stations // 2
+        indices = list(range(n_stations))
+        if reversed_flag:
+            indices = indices[::-1]
+
+        for native_i in indices:
+            s = float(s_vals[native_i])
+            anchor_pt = snap_geom.interpolate(s)
+            anchor_xy = np.array([anchor_pt.x, anchor_pt.y], dtype=np.float64)
+
+            frame_s = float(frame_geom.project(anchor_pt))
+            eps = min(1.0, frame_geom.length * 0.01)
+            p0 = frame_geom.interpolate(max(frame_s - eps, 0.0))
+            p1 = frame_geom.interpolate(min(frame_s + eps, frame_geom.length))
+            tx, ty = p1.x - p0.x, p1.y - p0.y
+            tn = float(np.hypot(tx, ty))
+            if tn < 1e-9:
+                continue
+            tx /= tn
+            ty /= tn
+            left_normal = np.array([-ty, tx], dtype=np.float64)
+            local_dir = sign * left_normal
+
+            poly_idx = faces.reach_side_map.get((rid, side_label))
+            is_interreach = poly_idx is not None
+
+            stations.append(
+                {
+                    "rid": rid,
+                    "station_id": native_i,
+                    "anchor_xy": anchor_xy,
+                    "local_dir": local_dir,
+                    "poly_idx": poly_idx,
+                    "is_interreach": is_interreach,
+                    "is_reach_center": (native_i == center_idx),
+                }
+            )
+
+    if not stations:
+        return []
+
+    n_st = len(stations)
+
+    # ---- Phase B: compute raw angles ----
+    raw_angles = np.zeros(n_st, dtype=np.float64)
+    for k, st in enumerate(stations):
+        if st["is_interreach"]:
+            aspect = faces.polygon_aspects.get(st["poly_idx"])
+            if aspect is None or not np.isfinite(aspect[0]):
+                raw_angles[k] = float(
+                    np.arctan2(st["local_dir"][1], st["local_dir"][0])
+                )
+                continue
+            strip_dir = np.array([-aspect[1], aspect[0]], dtype=np.float64)
+            if float(np.dot(strip_dir, st["local_dir"])) < 0:
+                strip_dir = -strip_dir
+            raw_angles[k] = float(np.arctan2(strip_dir[1], strip_dir[0]))
+        else:
+            raw_angles[k] = float(np.arctan2(st["local_dir"][1], st["local_dir"][0]))
+
+    # ---- Phase C: seed identification + interpolation (exterior only) ----
+    angles = raw_angles.copy()
+
+    # Identify seeds: boundary interreach stations and exterior reach centers
+    seed_positions: list[int] = []
+    seed_angles: list[float] = []
+
+    for k in range(n_st):
+        is_seed = False
+        # (a) Last interreach before an exterior run
+        if (
+            stations[k]["is_interreach"]
+            and k + 1 < n_st
+            and not stations[k + 1]["is_interreach"]
+        ):
+            is_seed = True
+        # (b) First interreach after an exterior run
+        if (
+            stations[k]["is_interreach"]
+            and k - 1 >= 0
+            and not stations[k - 1]["is_interreach"]
+        ):
+            is_seed = True
+        # (c) Exterior reach center
+        if not stations[k]["is_interreach"] and stations[k]["is_reach_center"]:
+            is_seed = True
+        if is_seed:
+            seed_positions.append(k)
+            seed_angles.append(float(raw_angles[k]))
+
+    if seed_positions:
+        # Shorter-arc unwrap
+        for j in range(1, len(seed_angles)):
+            diff = seed_angles[j] - seed_angles[j - 1]
+            if diff > np.pi:
+                seed_angles[j] -= 2 * np.pi
+            elif diff < -np.pi:
+                seed_angles[j] += 2 * np.pi
+
+        # Interpolate only exterior stations between seeds
+        # Hold before first seed
+        for k in range(0, seed_positions[0]):
+            if not stations[k]["is_interreach"]:
+                angles[k] = seed_angles[0]
+
+        # Interpolate between consecutive seeds
+        for j in range(len(seed_positions) - 1):
+            p0, p1 = seed_positions[j], seed_positions[j + 1]
+            a0, a1 = seed_angles[j], seed_angles[j + 1]
+            span = p1 - p0
+            if span <= 0:
+                continue
+            for k in range(p0, p1 + 1):
+                if not stations[k]["is_interreach"]:
+                    frac = (k - p0) / span
+                    angles[k] = a0 + frac * (a1 - a0)
+
+        # Hold after last seed
+        for k in range(seed_positions[-1], n_st):
+            if not stations[k]["is_interreach"]:
+                angles[k] = seed_angles[-1]
+
+    # ---- Phase D: generate strip geometry (center-out) ----
+    # Pass 1: compute max-extent strips per station
+    max_strips: list[LineString | None] = [None] * n_st
+    for k, st in enumerate(stations):
+        direction = np.array([np.cos(angles[k]), np.sin(angles[k])], dtype=np.float64)
+        anchor_xy = st["anchor_xy"]
+
+        if st["is_interreach"]:
+            poly = faces.polygons[st["poly_idx"]]
+            end_xy = anchor_xy + max_strip_len_m * direction
+            ray = LineString([tuple(anchor_xy), tuple(end_xy)])
+            ix = ray.intersection(poly)
+            if ix.is_empty:
+                continue
+            if ix.geom_type == "MultiLineString":
+                anchor_pt = Point(anchor_xy)
+                ix = min(ix.geoms, key=lambda g: g.distance(anchor_pt))
+            if ix.geom_type != "LineString":
+                continue
+            strip = _truncate_one_sided(
+                ix, st["rid"], obstacle_geoms, obstacle_rids, reach_tree
+            )
+        else:
+            strip = _ridge_stop_ray(
+                anchor_xy,
+                direction,
+                dem_interp,
+                max_strip_len_m,
+                ridge_prominence_m,
+                descend_stop_m,
+            )
+            if strip is not None:
+                strip = _truncate_one_sided(
+                    strip, st["rid"], obstacle_geoms, obstacle_rids, reach_tree
+                )
+
+        if strip is not None and strip.length >= 1e-3:
+            max_strips[k] = strip
+
+    # Pass 2: center-out placement with intra-chain truncation
+    final_strips: list[LineString | None] = [None] * n_st
+    center = n_st // 2
+    placed: list[int] = []
+
+    def _place(idx: int) -> None:
+        s = max_strips[idx]
+        if s is None:
+            return
+        # Truncate against previously-placed strips in this chain-side
+        if placed:
+            anchor_xy = stations[idx]["anchor_xy"]
+            max_d = float(s.length)
+            best_d = max_d
+            for pi in placed:
+                other = final_strips[pi]
+                if other is None:
+                    continue
+                ix = s.intersection(other)
+                if ix.is_empty:
+                    continue
+                for pt in _intersection_points(ix):
+                    d = float(np.hypot(pt[0] - anchor_xy[0], pt[1] - anchor_xy[1]))
+                    if 1e-6 < d < best_d:
+                        best_d = d
+            if best_d < max_d:
+                best_d = max(best_d - 0.1, 0.0)
+            if best_d <= 1e-3:
+                return
+            if best_d < max_d - 1e-3:
+                s = substring(s, 0.0, best_d)
+                if not isinstance(s, LineString) or s.length < 1e-3:
+                    return
+        final_strips[idx] = s
+
+    _place(center)
+    placed.append(center)
+    up = center - 1
+    dn = center + 1
+    while up >= 0 or dn < n_st:
+        if up >= 0:
+            _place(up)
+            placed.append(up)
+            up -= 1
+        if dn < n_st:
+            _place(dn)
+            placed.append(dn)
+            dn += 1
+
+    # Build output rows
+    rows: list[dict] = []
+    for k, st in enumerate(stations):
+        strip = final_strips[k]
+        if strip is None:
+            continue
+        rows.append(
+            {
+                "reach_id": st["rid"],
+                "station_id": st["station_id"],
+                "side": side_label,
+                "strip_type": "interreach" if st["is_interreach"] else "side",
+                "poly_id": st["poly_idx"] if st["poly_idx"] is not None else -1,
+                "anchor_x": float(st["anchor_xy"][0]),
+                "anchor_y": float(st["anchor_xy"][1]),
+                "length_m": float(strip.length),
+                "geometry": strip,
+            }
+        )
+    return rows
+
+
 def generate_network_strips(
     snapped_gdf: gpd.GeoDataFrame,
     frame_gdf: gpd.GeoDataFrame,
@@ -939,10 +1343,10 @@ def generate_network_strips(
 ) -> gpd.GeoDataFrame:
     """Generate all strips for every (reach, station, side).
 
-    Inter-reach sides (facing a polygon) get aspect-normal strips clipped to
-    the polygon boundary. Exterior sides get ridge-stop strips along the
-    local frame normal. All strips are truncated at the first non-self
-    snapped-reach crossing.
+    Reaches are partitioned into maximal non-branching chains.  For each
+    chain-side, angles are blended via seed-and-interpolate (interreach
+    boundary seeds + exterior reach-center seeds) and strips are placed
+    center-out with intra-chain truncation.
     """
     from shapely import STRtree
 
@@ -958,104 +1362,35 @@ def generate_network_strips(
             obstacle_rids.append(int(row["reach_id"]))
     reach_tree = STRtree(obstacle_geoms) if obstacle_geoms else None
 
-    # Pre-index frame geometries
+    # Pre-index geometries by reach_id
     frame_by_rid: dict[int, LineString] = {}
     for _, row in frame_gdf.iterrows():
         frame_by_rid[int(row["reach_id"])] = row.geometry
+    snap_by_rid: dict[int, LineString] = {}
+    for _, row in snapped_gdf.iterrows():
+        g = row.geometry
+        if g is not None and not g.is_empty:
+            snap_by_rid[int(row["reach_id"])] = g
 
+    chains = _build_reach_chains(snapped_gdf)
     rows: list[dict] = []
-
-    for _, srow in snapped_gdf.iterrows():
-        rid = int(srow["reach_id"])
-        snap_geom = srow.geometry
-        if snap_geom is None or snap_geom.is_empty:
-            continue
-        frame_geom = frame_by_rid.get(rid)
-        if frame_geom is None or frame_geom.is_empty:
-            continue
-
-        total = float(snap_geom.length)
-        s_vals = np.arange(strip_spacing_m * 0.5, total + 1e-6, strip_spacing_m)
-        if len(s_vals) == 0:
-            continue
-
-        for i, s in enumerate(s_vals):
-            anchor_pt = snap_geom.interpolate(float(s))
-            anchor_xy = np.array([anchor_pt.x, anchor_pt.y], dtype=np.float64)
-
-            # Tangent from the smoothed frame (more stable than snapped)
-            frame_s = float(frame_geom.project(anchor_pt))
-            eps = min(1.0, frame_geom.length * 0.01)
-            p0 = frame_geom.interpolate(max(frame_s - eps, 0.0))
-            p1 = frame_geom.interpolate(min(frame_s + eps, frame_geom.length))
-            tx, ty = p1.x - p0.x, p1.y - p0.y
-            tn = float(np.hypot(tx, ty))
-            if tn < 1e-9:
-                continue
-            tx /= tn
-            ty /= tn
-            left_normal = np.array([-ty, tx], dtype=np.float64)
-
-            for side_label, sign in [("left", 1.0), ("right", -1.0)]:
-                local_dir = sign * left_normal
-                poly_idx = faces.reach_side_map.get((rid, side_label))
-
-                if poly_idx is not None:
-                    # --- Inter-reach: polygon-aspect strip ---
-                    poly = faces.polygons[poly_idx]
-                    aspect = faces.polygon_aspects.get(poly_idx)
-                    if aspect is None or not np.isfinite(aspect[0]):
-                        continue
-                    strip_dir = np.array([-aspect[1], aspect[0]], dtype=np.float64)
-                    if float(np.dot(strip_dir, local_dir)) < 0:
-                        strip_dir = -strip_dir
-                    end_xy = anchor_xy + max_strip_len_m * strip_dir
-                    ray = LineString([tuple(anchor_xy), tuple(end_xy)])
-                    ix = ray.intersection(poly)
-                    if ix.is_empty:
-                        continue
-                    if ix.geom_type == "MultiLineString":
-                        ix = min(ix.geoms, key=lambda g: g.distance(anchor_pt))
-                    if ix.geom_type != "LineString":
-                        continue
-                    strip = _truncate_one_sided(
-                        ix, rid, obstacle_geoms, obstacle_rids, reach_tree
-                    )
-                    if strip is None or strip.length < 1e-3:
-                        continue
-                    strip_type = "interreach"
-                else:
-                    # --- Exterior: ridge-stop along local normal ---
-                    strip = _ridge_stop_ray(
-                        anchor_xy,
-                        local_dir,
-                        dem_interp,
-                        max_strip_len_m,
-                        ridge_prominence_m,
-                        descend_stop_m,
-                    )
-                    if strip is None:
-                        continue
-                    strip = _truncate_one_sided(
-                        strip, rid, obstacle_geoms, obstacle_rids, reach_tree
-                    )
-                    if strip is None or strip.length < 1e-3:
-                        continue
-                    strip_type = "side"
-
-                rows.append(
-                    {
-                        "reach_id": rid,
-                        "station_id": i,
-                        "side": side_label,
-                        "strip_type": strip_type,
-                        "poly_id": poly_idx if poly_idx is not None else -1,
-                        "anchor_x": float(anchor_xy[0]),
-                        "anchor_y": float(anchor_xy[1]),
-                        "length_m": float(strip.length),
-                        "geometry": strip,
-                    }
-                )
+    for chain in chains:
+        for side_label in ("left", "right"):
+            rows += _generate_chain_side_strips(
+                chain,
+                side_label,
+                faces,
+                frame_by_rid,
+                snap_by_rid,
+                dem_interp,
+                obstacle_geoms,
+                obstacle_rids,
+                reach_tree,
+                strip_spacing_m,
+                max_strip_len_m,
+                ridge_prominence_m,
+                descend_stop_m,
+            )
 
     return (
         gpd.GeoDataFrame(rows, geometry="geometry", crs=snapped_gdf.crs)
@@ -1157,6 +1492,21 @@ def attach_strip_elevations(
             endpoint_elev[ir_idx[valid]] = elev
 
     strips["endpoint_elev_m"] = endpoint_elev
+
+    # Smooth elevations along each (reach, side) to remove DEM noise
+    from scipy.ndimage import gaussian_filter1d
+
+    smooth_sigma = 5.0  # stations (~100m at 20m spacing)
+    for col in ("base_elev_m", "endpoint_elev_m"):
+        vals = strips[col].values.copy()
+        for _, grp in strips.groupby(["reach_id", "side"]):
+            if len(grp) < 3:
+                continue
+            idx = grp.sort_values("station_id").index
+            raw = vals[idx]
+            vals[idx] = gaussian_filter1d(raw, sigma=smooth_sigma, mode="nearest")
+        strips[col] = vals
+
     return strips
 
 
