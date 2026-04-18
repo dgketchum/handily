@@ -70,6 +70,9 @@ OPEN_EDGE_ENDPOINT_TOL_M = 5.0
 OPEN_EDGE_MIN_STABLE_LEN_M = 100.0
 OPEN_EDGE_JUNCTION_TOL_M = 1.0
 OPEN_EDGE_TOUCH_TOL_M = 1.0
+OPEN_EDGE_TAIL_HIT_TOL_M = 50.0
+OPEN_EDGE_TAIL_MIN_CLUSTER_LEN = 3
+OPEN_EDGE_TAIL_MAX_GAP_ROWS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -1192,6 +1195,141 @@ def _protected_interreach_polygon_ids(faces: NetworkFaces) -> set[int]:
     }
 
 
+def _wedge_strip_type(
+    s0: gpd.GeoSeries | dict,
+    s1: gpd.GeoSeries | dict,
+    protected_poly_ids: set[int],
+    transition_spans: dict[tuple[int, str], tuple[int, int]] | None = None,
+) -> tuple[str, int]:
+    t0 = str(s0["strip_type"])
+    t1 = str(s1["strip_type"])
+    p0 = int(s0["poly_id"])
+    p1 = int(s1["poly_id"])
+    if transition_spans is not None:
+        rid = int(s0["reach_id"])
+        side_label = str(s0["side"])
+        start_sid = int(s0["station_id"])
+        end_sid = int(s1["station_id"])
+        span = transition_spans.get((rid, side_label))
+        if span is not None:
+            span_start, span_end = span
+            if start_sid >= span_start and end_sid <= span_end:
+                poly_id = max(p0, p1)
+                if poly_id not in protected_poly_ids:
+                    return "transition", -1
+    if t0 == t1:
+        return t0, p0
+    mixed = {t0, t1}
+    if mixed == {"interreach", "side"}:
+        poly_id = max(p0, p1)
+        if poly_id in protected_poly_ids:
+            return "interreach", poly_id
+        return "transition", -1
+    return t0, p0
+
+
+def _build_transition_spans(
+    strips: gpd.GeoDataFrame,
+    faces: NetworkFaces | None,
+    snapped_gdf: gpd.GeoDataFrame | None,
+) -> dict[tuple[int, str], tuple[int, int]]:
+    if faces is None or snapped_gdf is None:
+        return {}
+
+    from shapely import STRtree
+
+    protected_poly_ids = _protected_interreach_polygon_ids(faces)
+    obstacle_geoms: list[LineString] = []
+    obstacle_rids: list[int] = []
+    for _, row in snapped_gdf.iterrows():
+        g = row.geometry
+        if g is None or g.is_empty:
+            continue
+        obstacle_geoms.append(g)
+        obstacle_rids.append(int(row["reach_id"]))
+    reach_tree = STRtree(obstacle_geoms) if obstacle_geoms else None
+
+    spans: dict[tuple[int, str], tuple[int, int]] = {}
+    for (rid, side_label), grp in strips.groupby(["reach_id", "side"]):
+        grp = grp.sort_values("station_id").reset_index(drop=True)
+        if len(grp) < 2:
+            continue
+
+        # Find the last interreach -> side boundary on this reach-side.
+        boundary_idx = None
+        for j in range(len(grp) - 1):
+            if (
+                str(grp.iloc[j]["strip_type"]) == "interreach"
+                and str(grp.iloc[j + 1]["strip_type"]) == "side"
+            ):
+                boundary_idx = j
+        if boundary_idx is None:
+            continue
+
+        poly_id = int(grp.iloc[boundary_idx]["poly_id"])
+        if poly_id < 0 or poly_id in protected_poly_ids:
+            continue
+
+        inter = grp.iloc[: boundary_idx + 1].copy()
+        if inter.empty:
+            continue
+
+        hit_rids: list[int | None] = []
+        for _, row in inter.iterrows():
+            geom = row.geometry
+            end_pt = Point(geom.coords[-1][:2]) if geom is not None and not geom.is_empty else None
+            hit = None
+            if end_pt is not None:
+                hit = _nearest_nonself_endpoint_reach(
+                    end_pt,
+                    int(rid),
+                    obstacle_geoms,
+                    obstacle_rids,
+                    reach_tree,
+                    OPEN_EDGE_TAIL_HIT_TOL_M,
+                )
+            hit_rids.append(hit)
+
+        non_null_hits = [h for h in hit_rids if h is not None]
+        if not non_null_hits:
+            continue
+        dominant_hit = Counter(non_null_hits).most_common(1)[0][0]
+
+        rows = inter.reset_index(drop=True)
+        clusters: list[tuple[int, int]] = []
+        start = None
+        for i, hit in enumerate(hit_rids):
+            if hit == dominant_hit:
+                if start is None:
+                    start = i
+            else:
+                if start is not None:
+                    clusters.append((start, i - 1))
+                    start = None
+        if start is not None:
+            clusters.append((start, len(hit_rids) - 1))
+
+        clusters = [c for c in clusters if (c[1] - c[0] + 1) >= OPEN_EDGE_TAIL_MIN_CLUSTER_LEN]
+        if not clusters:
+            continue
+
+        merged = [clusters[-1]]
+        for c0, c1 in reversed(clusters[:-1]):
+            next0, _ = merged[0]
+            gap_rows = next0 - c1 - 1
+            if gap_rows <= OPEN_EDGE_TAIL_MAX_GAP_ROWS:
+                merged[0] = (c0, merged[0][1])
+            else:
+                break
+
+        span_start_idx, _ = merged[0]
+        span_start_sid = int(rows.iloc[span_start_idx]["station_id"])
+        span_end_sid = int(grp.iloc[boundary_idx + 1]["station_id"])
+        spans[(int(rid), str(side_label))] = (span_start_sid, span_end_sid)
+
+    return spans
+
+
 def _frame_endpoint_xy(line: LineString, which: str) -> np.ndarray:
     coords = np.array(line.coords, dtype=np.float64)
     if which == "start":
@@ -2259,6 +2397,27 @@ def attach_strip_elevations(
     # Smooth elevations along each (reach, side) to remove DEM noise
     from scipy.ndimage import gaussian_filter1d
 
+    def _nan_gaussian_smooth_1d(values: np.ndarray, sigma: float) -> np.ndarray:
+        arr = np.asarray(values, dtype=np.float64)
+        if arr.size < 3 or sigma <= 0:
+            return arr.copy()
+
+        valid = np.isfinite(arr)
+        if not valid.any():
+            return arr.copy()
+        if valid.all():
+            return gaussian_filter1d(arr, sigma=sigma, mode="nearest")
+
+        vals = np.where(valid, arr, 0.0)
+        wts = valid.astype(np.float64)
+        vals_smooth = gaussian_filter1d(vals, sigma=sigma, mode="nearest")
+        wts_smooth = gaussian_filter1d(wts, sigma=sigma, mode="nearest")
+
+        out = np.full_like(arr, np.nan)
+        ok = wts_smooth > 1e-12
+        out[ok] = vals_smooth[ok] / wts_smooth[ok]
+        return out
+
     smooth_sigma = 5.0  # stations (~100m at 20m spacing)
     for col in ("base_elev_m", "endpoint_elev_m"):
         vals = strips[col].values.copy()
@@ -2267,7 +2426,7 @@ def attach_strip_elevations(
                 continue
             idx = grp.sort_values("station_id").index
             raw = vals[idx]
-            vals[idx] = gaussian_filter1d(raw, sigma=smooth_sigma, mode="nearest")
+            vals[idx] = _nan_gaussian_smooth_1d(raw, sigma=smooth_sigma)
         strips[col] = vals
 
     return strips
@@ -2275,18 +2434,27 @@ def attach_strip_elevations(
 
 def build_wedge_polygons(
     strips: gpd.GeoDataFrame,
+    faces: NetworkFaces | None = None,
+    snapped_gdf: gpd.GeoDataFrame | None = None,
 ) -> gpd.GeoDataFrame:
     """Build quadrilateral wedge polygons from consecutive same-(reach, side)
     strip pairs. Each wedge carries the four corner elevations needed for
     bilinear water-surface interpolation.
     """
     wedges: list[dict] = []
+    protected_poly_ids = (
+        _protected_interreach_polygon_ids(faces) if faces is not None else set()
+    )
+    transition_spans = _build_transition_spans(strips, faces, snapped_gdf)
     for (rid, side), grp in strips.groupby(["reach_id", "side"]):
         grp = grp.sort_values("station_id").reset_index(drop=True)
         n = len(grp)
         for j in range(n - 1):
             s0 = grp.iloc[j]
             s1 = grp.iloc[j + 1]
+            strip_type, wedge_poly_id = _wedge_strip_type(
+                s0, s1, protected_poly_ids, transition_spans
+            )
             a0 = (float(s0["anchor_x"]), float(s0["anchor_y"]))
             a1 = (float(s1["anchor_x"]), float(s1["anchor_y"]))
             e0 = tuple(s0.geometry.coords[-1][:2])
@@ -2304,8 +2472,8 @@ def build_wedge_polygons(
                     "side": str(side),
                     "station_start": int(s0["station_id"]),
                     "station_end": int(s1["station_id"]),
-                    "strip_type": str(s0["strip_type"]),
-                    "poly_id": int(s0["poly_id"]),
+                    "strip_type": str(strip_type),
+                    "poly_id": int(wedge_poly_id),
                     "base_elev_0": float(s0["base_elev_m"]),
                     "base_elev_1": float(s1["base_elev_m"]),
                     "ep_elev_0": float(s0["endpoint_elev_m"]),
@@ -3060,7 +3228,7 @@ def main() -> None:
 
     # --- Wedge construction ---
     print("\n== Building wedge polygons ==")
-    wedges = build_wedge_polygons(strips)
+    wedges = build_wedge_polygons(strips, faces, snapped_gdf)
     print(f"  wedges: {len(wedges)}")
     wedges.to_file(OUT_DIR / "network_wedges.fgb", driver="FlatGeobuf")
     print(f"  wrote {OUT_DIR / 'network_wedges.fgb'}")

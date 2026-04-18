@@ -12,6 +12,8 @@ from handily.rem_experimental import (
     _find_open_edge_polygon_ids,
     _is_two_sided_paired_polygon,
     _protected_interreach_polygon_ids,
+    _wedge_strip_type,
+    attach_strip_elevations,
 )
 
 
@@ -99,3 +101,93 @@ def test_protected_interreach_polygon_ids_only_keeps_two_sided_faces() -> None:
     )
 
     assert _protected_interreach_polygon_ids(faces) == {1, 10}
+
+
+def test_wedge_strip_type_marks_open_mixed_pairs_as_transition() -> None:
+    s0 = {"strip_type": "interreach", "poly_id": 10}
+    s1 = {"strip_type": "side", "poly_id": -1}
+
+    assert _wedge_strip_type(s0, s1, protected_poly_ids={1}) == ("transition", -1)
+    assert _wedge_strip_type(s0, s1, protected_poly_ids={10}) == ("interreach", 10)
+
+
+def test_wedge_strip_type_uses_transition_span_for_interreach_pairs() -> None:
+    s0 = {
+        "reach_id": 4,
+        "side": "left",
+        "station_id": 18,
+        "strip_type": "interreach",
+        "poly_id": 10,
+    }
+    s1 = {
+        "reach_id": 4,
+        "side": "left",
+        "station_id": 19,
+        "strip_type": "interreach",
+        "poly_id": 10,
+    }
+
+    assert _wedge_strip_type(
+        s0,
+        s1,
+        protected_poly_ids={1},
+        transition_spans={(4, "left"): (18, 44)},
+    ) == ("transition", -1)
+
+
+def test_attach_strip_elevations_smooths_base_elevations_without_nan_bleed() -> None:
+    dem = xr.DataArray(
+        np.array(
+            [
+                [10.0, 11.0, 12.0],
+                [10.0, 11.0, 12.0],
+                [10.0, 11.0, 12.0],
+            ],
+            dtype=np.float64,
+        ),
+        coords={"y": np.array([0.0, 1.0, 2.0]), "x": np.array([0.0, 1.0, 2.0])},
+        dims=("y", "x"),
+    )
+    strips = gpd.GeoDataFrame(
+        [
+            {
+                "reach_id": 4,
+                "station_id": 0,
+                "side": "left",
+                "strip_type": "side",
+                "poly_id": -1,
+                "anchor_x": 0.5,
+                "anchor_y": 1.0,
+                "geometry": LineString([(0.5, 1.0), (0.5, 2.0)]),
+            },
+            {
+                "reach_id": 4,
+                "station_id": 1,
+                "side": "left",
+                "strip_type": "side",
+                "poly_id": -1,
+                "anchor_x": 10.0,
+                "anchor_y": 1.0,
+                "geometry": LineString([(10.0, 1.0), (10.0, 2.0)]),
+            },
+            {
+                "reach_id": 4,
+                "station_id": 2,
+                "side": "left",
+                "strip_type": "side",
+                "poly_id": -1,
+                "anchor_x": 1.5,
+                "anchor_y": 1.0,
+                "geometry": LineString([(1.5, 1.0), (1.5, 2.0)]),
+            },
+        ],
+        geometry="geometry",
+        crs="EPSG:5070",
+    )
+    snapped = gpd.GeoDataFrame(columns=["reach_id", "geometry"], geometry="geometry", crs="EPSG:5070")
+
+    out = attach_strip_elevations(strips, snapped, dem).sort_values("station_id")
+
+    assert np.isfinite(out.iloc[0]["base_elev_m"])
+    assert np.isfinite(out.iloc[2]["base_elev_m"])
+    assert np.isfinite(out.iloc[1]["base_elev_m"])
