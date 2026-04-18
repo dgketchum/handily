@@ -66,10 +66,10 @@ RESNAP_W_PRIOR = 0.15
 RESNAP_W_TRANSITION = 1.0
 RESNAP_SMOOTHING_M = 100.0
 
-OPEN_EDGE_WEST_REACHES = (4, 11, 25, 26)
-OPEN_EDGE_WEST_SIDE = "left"
 OPEN_EDGE_ENDPOINT_TOL_M = 5.0
 OPEN_EDGE_MIN_STABLE_LEN_M = 100.0
+OPEN_EDGE_JUNCTION_TOL_M = 1.0
+OPEN_EDGE_TOUCH_TOL_M = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -1079,6 +1079,27 @@ class _OverrideChainStation:
     is_seed: bool
 
 
+@dataclass
+class _OpenEdgeAnchorCandidate:
+    poly_id: int
+    side_label: str
+    reach_id: int
+    station_id: int
+    open_end: str
+    unstable_run_len: int
+    row: dict
+
+
+@dataclass
+class _OpenEdgeFamilyPlan:
+    poly_id: int
+    side_label: str
+    chain_order: list[tuple[int, bool]]
+    anchor_reach_id: int
+    anchor_station_id: int
+    score: tuple[int, float, float, int]
+
+
 def _west_normal(tangent: np.ndarray) -> np.ndarray:
     left = np.array([-tangent[1], tangent[0]], dtype=np.float64)
     return left if left[0] < 0.0 else -left
@@ -1121,58 +1142,131 @@ def _truncate_against_strip_blockers(
     return trunc if isinstance(trunc, LineString) and trunc.length > 1e-3 else None
 
 
-def _order_target_chain(
-    target_reaches: tuple[int, ...],
+def _dem_boundary(dem_da: xr.DataArray) -> LineString:
+    xmin = float(dem_da.x.values.min())
+    xmax = float(dem_da.x.values.max())
+    ymin = float(dem_da.y.values.min())
+    ymax = float(dem_da.y.values.max())
+    return Polygon(
+        [(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)]
+    ).boundary
+
+
+def _find_open_edge_polygon_ids(
+    faces: NetworkFaces,
+    dem_da: xr.DataArray,
+    touch_tol_m: float = OPEN_EDGE_TOUCH_TOL_M,
+) -> set[int]:
+    open_poly_ids: set[int] = set()
+    dem_boundary = _dem_boundary(dem_da)
+    for poly_id, poly in enumerate(faces.polygons):
+        if poly is None or poly.is_empty:
+            continue
+        probe = poly.buffer(touch_tol_m)
+        if probe.intersects(dem_boundary):
+            open_poly_ids.add(poly_id)
+            continue
+        if any(probe.intersects(edge) for edge in faces.closure_edges):
+            open_poly_ids.add(poly_id)
+    return open_poly_ids
+
+
+def _frame_endpoint_xy(line: LineString, which: str) -> np.ndarray:
+    coords = np.array(line.coords, dtype=np.float64)
+    if which == "start":
+        return coords[0, :2].copy()
+    return coords[-1, :2].copy()
+
+
+def _frame_endpoint_tangent(line: LineString, which: str) -> np.ndarray:
+    total = float(line.length)
+    if total <= 1e-6:
+        return np.array([1.0, 0.0], dtype=np.float64)
+    eps = min(5.0, total * 0.05)
+    if which == "start":
+        p0 = line.interpolate(0.0)
+        p1 = line.interpolate(min(eps, total))
+    else:
+        p0 = line.interpolate(max(total - eps, 0.0))
+        p1 = line.interpolate(total)
+    vec = np.array([p1.x - p0.x, p1.y - p0.y], dtype=np.float64)
+    nrm = float(np.hypot(vec[0], vec[1]))
+    if nrm <= 1e-9:
+        return np.array([1.0, 0.0], dtype=np.float64)
+    return vec / nrm
+
+
+def _build_polygon_side_graph(
+    reach_ids: set[int],
     frame_by_rid: dict[int, LineString],
-    junction_tol_m: float = 1.0,
-) -> list[tuple[int, bool]]:
-    remaining = [rid for rid in target_reaches if rid in frame_by_rid]
-    if not remaining:
-        return []
+    junction_tol_m: float = OPEN_EDGE_JUNCTION_TOL_M,
+) -> dict[int, dict[str, list[tuple[int, str]]]]:
+    graph: dict[int, dict[str, list[tuple[int, str]]]] = {
+        int(rid): {"start": [], "end": []} for rid in reach_ids if rid in frame_by_rid
+    }
+    rids = sorted(graph)
+    if not rids:
+        return graph
+    endpoints = {
+        rid: {
+            "start": _frame_endpoint_xy(frame_by_rid[rid], "start"),
+            "end": _frame_endpoint_xy(frame_by_rid[rid], "end"),
+        }
+        for rid in rids
+    }
+    for i, rid_a in enumerate(rids):
+        for rid_b in rids[i + 1 :]:
+            for side_a in ("start", "end"):
+                xy_a = endpoints[rid_a][side_a]
+                for side_b in ("start", "end"):
+                    xy_b = endpoints[rid_b][side_b]
+                    if float(np.hypot(xy_a[0] - xy_b[0], xy_a[1] - xy_b[1])) <= junction_tol_m:
+                        graph[rid_a][side_a].append((rid_b, side_b))
+                        graph[rid_b][side_b].append((rid_a, side_a))
+    return graph
 
-    def _reach_endpoints(line: LineString) -> tuple[np.ndarray, np.ndarray]:
-        coords = np.array(line.coords, dtype=np.float64)
-        return coords[0, :2].copy(), coords[-1, :2].copy()
 
-    def _close(a: np.ndarray, b: np.ndarray) -> bool:
-        return float(np.hypot(a[0] - b[0], a[1] - b[1])) <= junction_tol_m
+def _graph_components(
+    graph: dict[int, dict[str, list[tuple[int, str]]]],
+) -> list[set[int]]:
+    remaining = set(graph)
+    comps: list[set[int]] = []
+    while remaining:
+        seed = remaining.pop()
+        stack = [seed]
+        comp = {seed}
+        while stack:
+            rid = stack.pop()
+            neighbors = {
+                nbr for side in ("start", "end") for nbr, _ in graph[rid][side]
+            }
+            for nbr in neighbors:
+                if nbr not in remaining:
+                    continue
+                remaining.remove(nbr)
+                comp.add(nbr)
+                stack.append(nbr)
+        comps.append(comp)
+    return comps
 
-    start = remaining.pop(0)
-    s_xy, e_xy = _reach_endpoints(frame_by_rid[start])
-    chain: list[tuple[int, bool]] = [(start, False)]
-    free_start_xy = s_xy
-    free_end_xy = e_xy
 
-    extended = True
-    while extended and remaining:
-        extended = False
-        for rid in list(remaining):
-            fs, fe = _reach_endpoints(frame_by_rid[rid])
-            if _close(free_end_xy, fs):
-                chain.append((rid, False))
-                free_end_xy = fe
-                remaining.remove(rid)
-                extended = True
-                break
-            if _close(free_end_xy, fe):
-                chain.append((rid, True))
-                free_end_xy = fs
-                remaining.remove(rid)
-                extended = True
-                break
-            if _close(free_start_xy, fe):
-                chain.insert(0, (rid, False))
-                free_start_xy = fs
-                remaining.remove(rid)
-                extended = True
-                break
-            if _close(free_start_xy, fs):
-                chain.insert(0, (rid, True))
-                free_start_xy = fe
-                remaining.remove(rid)
-                extended = True
-                break
-    return chain
+def _reach_length(reach_id: int, snap_by_rid: dict[int, LineString]) -> float:
+    geom = snap_by_rid.get(int(reach_id))
+    return float(geom.length) if geom is not None and not geom.is_empty else 0.0
+
+
+def _travel_exit_dir(frame_by_rid: dict[int, LineString], reach_id: int, reversed_flag: bool) -> np.ndarray:
+    line = frame_by_rid[int(reach_id)]
+    if reversed_flag:
+        return -_frame_endpoint_tangent(line, "start")
+    return _frame_endpoint_tangent(line, "end")
+
+
+def _travel_entry_dir(frame_by_rid: dict[int, LineString], reach_id: int, reversed_flag: bool) -> np.ndarray:
+    line = frame_by_rid[int(reach_id)]
+    if reversed_flag:
+        return -_frame_endpoint_tangent(line, "end")
+    return _frame_endpoint_tangent(line, "start")
 
 
 def _build_override_chain_stations(
@@ -1265,8 +1359,9 @@ def _nearest_nonself_endpoint_reach(
     return best_rid
 
 
-def _find_last_stable_open_edge_anchor(
+def _find_open_edge_anchor_candidates(
     strips: gpd.GeoDataFrame,
+    poly_id: int,
     reach_id: int,
     side_label: str,
     obstacle_geoms: list[LineString],
@@ -1275,14 +1370,14 @@ def _find_last_stable_open_edge_anchor(
     max_strip_len_m: float,
     min_len_m: float,
     endpoint_tol_m: float,
-) -> dict | None:
+) -> list[_OpenEdgeAnchorCandidate]:
     sub = strips[
         (strips["reach_id"] == int(reach_id))
         & (strips["side"] == str(side_label))
         & (strips["strip_type"] == "interreach")
     ].sort_values("station_id")
     if sub.empty:
-        return None
+        return []
 
     rows = []
     for _, row in sub.iterrows():
@@ -1314,23 +1409,146 @@ def _find_last_stable_open_edge_anchor(
             }
         )
     if not rows:
-        return None
+        return []
 
-    lookahead = 3
-    for i in range(len(rows) - 1, -1, -1):
-        if not rows[i]["is_stable"]:
-            continue
-        tail = rows[i + 1 : i + 1 + lookahead]
-        if tail and all(not r["is_stable"] for r in tail):
-            return rows[i]["row"]
-    for i in range(len(rows) - 1, -1, -1):
-        if rows[i]["is_stable"]:
-            return rows[i]["row"]
-    return None
+    candidates: list[_OpenEdgeAnchorCandidate] = []
+
+    low = 0
+    while low < len(rows) and not rows[low]["is_stable"]:
+        low += 1
+    if 0 < low < len(rows):
+        candidates.append(
+            _OpenEdgeAnchorCandidate(
+                poly_id=int(poly_id),
+                side_label=str(side_label),
+                reach_id=int(reach_id),
+                station_id=int(rows[low]["station_id"]),
+                open_end="start",
+                unstable_run_len=int(low),
+                row=rows[low]["row"],
+            )
+        )
+
+    high = len(rows) - 1
+    while high >= 0 and not rows[high]["is_stable"]:
+        high -= 1
+    if 0 <= high < len(rows) - 1:
+        candidates.append(
+            _OpenEdgeAnchorCandidate(
+                poly_id=int(poly_id),
+                side_label=str(side_label),
+                reach_id=int(reach_id),
+                station_id=int(rows[high]["station_id"]),
+                open_end="end",
+                unstable_run_len=int(len(rows) - 1 - high),
+                row=rows[high]["row"],
+            )
+        )
+
+    return candidates
 
 
-def _build_open_edge_override_rows(
+def _best_family_chain_from_anchor(
+    candidate: _OpenEdgeAnchorCandidate,
+    component_reach_ids: set[int],
+    graph: dict[int, dict[str, list[tuple[int, str]]]],
+    frame_by_rid: dict[int, LineString],
+    snap_by_rid: dict[int, LineString],
+) -> tuple[list[tuple[int, bool]], tuple[int, float, float, int]]:
+    anchor_rev = candidate.open_end == "start"
+    anchor_exit_side = "start" if anchor_rev else "end"
+
+    def _dfs(
+        rid: int,
+        reversed_flag: bool,
+        visited: set[int],
+    ) -> tuple[list[tuple[int, bool]], tuple[int, float, float, int]]:
+        base_score = (1, _reach_length(rid, snap_by_rid), 0.0, 0)
+        best_path = [(int(rid), bool(reversed_flag))]
+        best_score = base_score
+        exit_side = "start" if reversed_flag else "end"
+        curr_exit_dir = _travel_exit_dir(frame_by_rid, rid, reversed_flag)
+        for nbr, nbr_side in graph.get(int(rid), {}).get(exit_side, []):
+            if nbr not in component_reach_ids or nbr in visited:
+                continue
+            nbr_rev = nbr_side == "end"
+            nbr_entry_dir = _travel_entry_dir(frame_by_rid, nbr, nbr_rev)
+            continuity = float(np.dot(curr_exit_dir, nbr_entry_dir))
+            child_path, child_score = _dfs(nbr, nbr_rev, visited | {nbr})
+            score = (
+                1 + child_score[0],
+                _reach_length(rid, snap_by_rid) + child_score[1],
+                continuity + child_score[2],
+                candidate.unstable_run_len,
+            )
+            if score > best_score:
+                best_score = score
+                best_path = [(int(rid), bool(reversed_flag))] + child_path
+        return best_path, best_score
+
+    if candidate.reach_id not in component_reach_ids:
+        return [], (0, 0.0, 0.0, candidate.unstable_run_len)
+    if candidate.reach_id not in graph:
+        return [], (0, 0.0, 0.0, candidate.unstable_run_len)
+    path, score = _dfs(candidate.reach_id, anchor_rev, {candidate.reach_id})
+    return path, score
+
+
+def _select_best_open_edge_family(
     strips: gpd.GeoDataFrame,
+    poly_id: int,
+    side_label: str,
+    component_reach_ids: set[int],
+    graph: dict[int, dict[str, list[tuple[int, str]]]],
+    frame_by_rid: dict[int, LineString],
+    snap_by_rid: dict[int, LineString],
+    obstacle_geoms: list[LineString],
+    obstacle_rids: list[int],
+    reach_tree,
+    max_strip_len_m: float,
+    min_len_m: float,
+    endpoint_tol_m: float,
+) -> _OpenEdgeFamilyPlan | None:
+    best_plan: _OpenEdgeFamilyPlan | None = None
+    for rid in sorted(component_reach_ids):
+        candidates = _find_open_edge_anchor_candidates(
+            strips,
+            poly_id,
+            rid,
+            side_label,
+            obstacle_geoms,
+            obstacle_rids,
+            reach_tree,
+            max_strip_len_m=max_strip_len_m,
+            min_len_m=min_len_m,
+            endpoint_tol_m=endpoint_tol_m,
+        )
+        for candidate in candidates:
+            chain_order, score = _best_family_chain_from_anchor(
+                candidate,
+                component_reach_ids,
+                graph,
+                frame_by_rid,
+                snap_by_rid,
+            )
+            if len(chain_order) < 2:
+                continue
+            plan = _OpenEdgeFamilyPlan(
+                poly_id=int(poly_id),
+                side_label=str(side_label),
+                chain_order=chain_order,
+                anchor_reach_id=int(candidate.reach_id),
+                anchor_station_id=int(candidate.station_id),
+                score=score,
+            )
+            if best_plan is None or plan.score > best_plan.score:
+                best_plan = plan
+    return best_plan
+
+
+def _build_family_override_rows(
+    strips: gpd.GeoDataFrame,
+    family: _OpenEdgeFamilyPlan,
     frame_by_rid: dict[int, LineString],
     snap_by_rid: dict[int, LineString],
     dem_interp: RegularGridInterpolator,
@@ -1341,23 +1559,16 @@ def _build_open_edge_override_rows(
     max_strip_len_m: float,
     ridge_prominence_m: float,
     descend_stop_m: float,
-    target_reaches: tuple[int, ...] = OPEN_EDGE_WEST_REACHES,
-    side_label: str = OPEN_EDGE_WEST_SIDE,
-) -> tuple[list[dict], int] | None:
-    anchor_row = _find_last_stable_open_edge_anchor(
-        strips,
-        reach_id=int(target_reaches[0]),
-        side_label=side_label,
-        obstacle_geoms=obstacle_geoms,
-        obstacle_rids=obstacle_rids,
-        reach_tree=reach_tree,
-        max_strip_len_m=max_strip_len_m,
-        min_len_m=OPEN_EDGE_MIN_STABLE_LEN_M,
-        endpoint_tol_m=OPEN_EDGE_ENDPOINT_TOL_M,
-    )
-    if anchor_row is None:
+) -> tuple[list[dict], set[tuple[int, int, str]]] | None:
+    side_label = family.side_label
+    anchor_rows = strips[
+        (strips["reach_id"] == int(family.anchor_reach_id))
+        & (strips["side"] == side_label)
+        & (strips["station_id"] == int(family.anchor_station_id))
+    ]
+    if anchor_rows.empty:
         return None
-
+    anchor_row = anchor_rows.iloc[0].to_dict()
     anchor_geom = anchor_row["geometry"]
     anchor_coords = np.array(anchor_geom.coords, dtype=np.float64)
     anchor_vec = anchor_coords[-1, :2] - anchor_coords[0, :2]
@@ -1365,25 +1576,20 @@ def _build_open_edge_override_rows(
     if anchor_norm <= 1e-9:
         return None
     anchor_angle = float(np.arctan2(anchor_vec[1], anchor_vec[0]))
-    anchor_station_id = int(anchor_row["station_id"])
-
-    chain_order = _order_target_chain(target_reaches, frame_by_rid)
-    if [rid for rid, _ in chain_order] != list(target_reaches):
-        return None
 
     chain = _build_override_chain_stations(
-        chain_order,
+        family.chain_order,
         frame_by_rid,
         snap_by_rid,
         dem_interp,
         strip_spacing_m,
-        seed_reaches=set(target_reaches[1:]),
+        seed_reaches={rid for rid, _ in family.chain_order[1:]},
     )
     if not chain:
         return None
 
     pos_by_key = {(st.reach_id, st.station_id): i for i, st in enumerate(chain)}
-    anchor_pos = pos_by_key.get((int(target_reaches[0]), anchor_station_id))
+    anchor_pos = pos_by_key.get((int(family.anchor_reach_id), int(family.anchor_station_id)))
     if anchor_pos is None:
         return None
 
@@ -1415,13 +1621,21 @@ def _build_open_edge_override_rows(
     p_last, a_last, _ = anchor_specs[-1]
     angles[p_last:] = a_last
 
+    override_keys = {
+        (int(st.reach_id), int(st.station_id), str(side_label))
+        for pos, st in enumerate(chain)
+        if pos > anchor_pos
+    }
+    if not override_keys:
+        return None
+
     preserved_blockers: list[LineString] = []
     protected = strips[
         (strips["side"] == side_label)
-        & (
-            ((strips["reach_id"] == int(target_reaches[0])) & (strips["station_id"] <= anchor_station_id))
-            | (~strips["reach_id"].isin(list(target_reaches)))
-        )
+        & (~strips.apply(
+            lambda r: (int(r["reach_id"]), int(r["station_id"]), str(r["side"])) in override_keys,
+            axis=1,
+        ))
     ]
     for _, row in protected.iterrows():
         geom = row.geometry
@@ -1471,13 +1685,15 @@ def _build_open_edge_override_rows(
             }
         )
         blockers.append(strip)
-    return rows, anchor_station_id
+    return rows, override_keys
 
 
 def _apply_open_edge_strip_overrides(
     strips: gpd.GeoDataFrame,
+    faces: NetworkFaces,
     frame_by_rid: dict[int, LineString],
     snap_by_rid: dict[int, LineString],
+    dem_da: xr.DataArray,
     dem_interp: RegularGridInterpolator,
     obstacle_geoms: list[LineString],
     obstacle_rids: list[int],
@@ -1487,36 +1703,80 @@ def _apply_open_edge_strip_overrides(
     ridge_prominence_m: float,
     descend_stop_m: float,
 ) -> gpd.GeoDataFrame:
-    built = _build_open_edge_override_rows(
-        strips,
-        frame_by_rid,
-        snap_by_rid,
-        dem_interp,
-        obstacle_geoms,
-        obstacle_rids,
-        reach_tree,
-        strip_spacing_m,
-        max_strip_len_m,
-        ridge_prominence_m,
-        descend_stop_m,
-    )
-    if built is None:
+    open_poly_ids = _find_open_edge_polygon_ids(faces, dem_da)
+    if not open_poly_ids:
         return strips
 
-    override_rows, anchor_station_id = built
-    if not override_rows:
+    all_override_rows: list[dict] = []
+    all_override_keys: set[tuple[int, int, str]] = set()
+
+    for poly_id in sorted(open_poly_ids):
+        side_to_reaches: dict[str, set[int]] = {}
+        for (rid, side_label), pidx in faces.reach_side_map.items():
+            if pidx != poly_id:
+                continue
+            side_to_reaches.setdefault(str(side_label), set()).add(int(rid))
+
+        for side_label, reach_ids in sorted(side_to_reaches.items()):
+            if len(reach_ids) < 2:
+                continue
+            graph = _build_polygon_side_graph(
+                reach_ids,
+                frame_by_rid,
+                junction_tol_m=OPEN_EDGE_JUNCTION_TOL_M,
+            )
+            for component in _graph_components(graph):
+                if len(component) < 2:
+                    continue
+                family = _select_best_open_edge_family(
+                    strips,
+                    int(poly_id),
+                    side_label,
+                    component,
+                    graph,
+                    frame_by_rid,
+                    snap_by_rid,
+                    obstacle_geoms,
+                    obstacle_rids,
+                    reach_tree,
+                    max_strip_len_m=max_strip_len_m,
+                    min_len_m=OPEN_EDGE_MIN_STABLE_LEN_M,
+                    endpoint_tol_m=OPEN_EDGE_ENDPOINT_TOL_M,
+                )
+                if family is None:
+                    continue
+                built = _build_family_override_rows(
+                    strips,
+                    family,
+                    frame_by_rid,
+                    snap_by_rid,
+                    dem_interp,
+                    obstacle_geoms,
+                    obstacle_rids,
+                    reach_tree,
+                    strip_spacing_m,
+                    max_strip_len_m,
+                    ridge_prominence_m,
+                    descend_stop_m,
+                )
+                if built is None:
+                    continue
+                override_rows, override_keys = built
+                if not override_rows:
+                    continue
+                all_override_rows.extend(override_rows)
+                all_override_keys |= override_keys
+
+    if not all_override_rows:
         return strips
 
-    keep_mask = ~(
-        (strips["side"] == OPEN_EDGE_WEST_SIDE)
-        & (
-            ((strips["reach_id"] == OPEN_EDGE_WEST_REACHES[0]) & (strips["station_id"] > anchor_station_id))
-            | (strips["reach_id"].isin(list(OPEN_EDGE_WEST_REACHES[1:])))
-        )
+    keep_mask = ~strips.apply(
+        lambda r: (int(r["reach_id"]), int(r["station_id"]), str(r["side"])) in all_override_keys,
+        axis=1,
     )
     preserved_rows = strips.loc[keep_mask].to_dict("records")
     return gpd.GeoDataFrame(
-        preserved_rows + override_rows,
+        preserved_rows + all_override_rows,
         geometry="geometry",
         crs=strips.crs,
     )
@@ -1873,8 +2133,10 @@ def generate_network_strips(
         return strips
     return _apply_open_edge_strip_overrides(
         strips,
+        faces,
         frame_by_rid,
         snap_by_rid,
+        dem_da,
         dem_interp,
         obstacle_geoms,
         obstacle_rids,
