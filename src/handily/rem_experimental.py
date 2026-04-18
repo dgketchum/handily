@@ -1171,6 +1171,12 @@ def _find_open_edge_polygon_ids(
     return open_poly_ids
 
 
+def _is_two_sided_paired_polygon(side_to_reaches: dict[str, set[int]]) -> bool:
+    left = side_to_reaches.get("left", set())
+    right = side_to_reaches.get("right", set())
+    return bool(left) and bool(right)
+
+
 def _frame_endpoint_xy(line: LineString, which: str) -> np.ndarray:
     coords = np.array(line.coords, dtype=np.float64)
     if which == "start":
@@ -1716,6 +1722,11 @@ def _apply_open_edge_strip_overrides(
             if pidx != poly_id:
                 continue
             side_to_reaches.setdefault(str(side_label), set()).add(int(rid))
+
+        # If an open polygon has both left- and right-side membership, treat it
+        # as a paired interreach face and leave the baseline strips untouched.
+        if _is_two_sided_paired_polygon(side_to_reaches):
+            continue
 
         for side_label, reach_ids in sorted(side_to_reaches.items()):
             if len(reach_ids) < 2:
