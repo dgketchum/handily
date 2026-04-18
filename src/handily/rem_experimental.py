@@ -1177,6 +1177,21 @@ def _is_two_sided_paired_polygon(side_to_reaches: dict[str, set[int]]) -> bool:
     return bool(left) and bool(right)
 
 
+def _protected_interreach_polygon_ids(faces: NetworkFaces) -> set[int]:
+    side_membership: dict[int, dict[str, set[int]]] = {}
+    for (rid, side_label), poly_id in faces.reach_side_map.items():
+        if poly_id is None or int(poly_id) < 0:
+            continue
+        side_membership.setdefault(int(poly_id), {}).setdefault(str(side_label), set()).add(
+            int(rid)
+        )
+    return {
+        poly_id
+        for poly_id, side_to_reaches in side_membership.items()
+        if _is_two_sided_paired_polygon(side_to_reaches)
+    }
+
+
 def _frame_endpoint_xy(line: LineString, which: str) -> np.ndarray:
     coords = np.array(line.coords, dtype=np.float64)
     if which == "start":
@@ -2445,7 +2460,11 @@ def rasterize_water_surface(
 
     # --- Phase 1: interreach — burn cross sections, Gaussian fill ---
     if faces is not None:
-        ir_strips = strips[strips["strip_type"] == "interreach"]
+        protected_poly_ids = _protected_interreach_polygon_ids(faces)
+        ir_strips = strips[
+            (strips["strip_type"] == "interreach")
+            & (strips["poly_id"].isin(sorted(protected_poly_ids)))
+        ]
         if not ir_strips.empty:
             # Burn all interreach strips into a sparse raster
             ir_sparse = np.full((ny, nx), np.nan, dtype=np.float64)
