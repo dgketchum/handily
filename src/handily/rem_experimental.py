@@ -66,6 +66,11 @@ RESNAP_W_PRIOR = 0.15
 RESNAP_W_TRANSITION = 1.0
 RESNAP_SMOOTHING_M = 100.0
 
+OPEN_EDGE_WEST_REACHES = (4, 11, 25, 26)
+OPEN_EDGE_WEST_SIDE = "left"
+OPEN_EDGE_ENDPOINT_TOL_M = 5.0
+OPEN_EDGE_MIN_STABLE_LEN_M = 100.0
+
 
 # ---------------------------------------------------------------------------
 # Geometry helpers
@@ -1062,6 +1067,461 @@ def _build_reach_chains(
     return chains
 
 
+@dataclass
+class _OverrideChainStation:
+    reach_id: int
+    station_id: int
+    chain_pos: int
+    s_m_reach: float
+    base_xy: np.ndarray
+    tangent: np.ndarray
+    base_elev_m: float
+    is_seed: bool
+
+
+def _west_normal(tangent: np.ndarray) -> np.ndarray:
+    left = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+    return left if left[0] < 0.0 else -left
+
+
+def _short_arc_interp(a0: float, a1: float, frac: float) -> float:
+    diff = a1 - a0
+    if diff > np.pi:
+        diff -= 2.0 * np.pi
+    elif diff < -np.pi:
+        diff += 2.0 * np.pi
+    return a0 + frac * diff
+
+
+def _truncate_against_strip_blockers(
+    strip: LineString,
+    anchor_xy: np.ndarray,
+    blockers: list[LineString],
+    margin_m: float = 0.1,
+) -> LineString | None:
+    max_d = float(strip.length)
+    best_d = max_d
+    for other in blockers:
+        if other is None or other.is_empty:
+            continue
+        ix = strip.intersection(other)
+        if ix.is_empty:
+            continue
+        for px, py in _intersection_points(ix):
+            d = float(np.hypot(px - anchor_xy[0], py - anchor_xy[1]))
+            if 1e-6 < d < best_d:
+                best_d = d
+    if best_d < max_d:
+        best_d = max(best_d - margin_m, 0.0)
+    if best_d <= 1e-3:
+        return None
+    if best_d >= max_d - 1e-3:
+        return strip
+    trunc = substring(strip, 0.0, best_d)
+    return trunc if isinstance(trunc, LineString) and trunc.length > 1e-3 else None
+
+
+def _order_target_chain(
+    target_reaches: tuple[int, ...],
+    frame_by_rid: dict[int, LineString],
+    junction_tol_m: float = 1.0,
+) -> list[tuple[int, bool]]:
+    remaining = [rid for rid in target_reaches if rid in frame_by_rid]
+    if not remaining:
+        return []
+
+    def _reach_endpoints(line: LineString) -> tuple[np.ndarray, np.ndarray]:
+        coords = np.array(line.coords, dtype=np.float64)
+        return coords[0, :2].copy(), coords[-1, :2].copy()
+
+    def _close(a: np.ndarray, b: np.ndarray) -> bool:
+        return float(np.hypot(a[0] - b[0], a[1] - b[1])) <= junction_tol_m
+
+    start = remaining.pop(0)
+    s_xy, e_xy = _reach_endpoints(frame_by_rid[start])
+    chain: list[tuple[int, bool]] = [(start, False)]
+    free_start_xy = s_xy
+    free_end_xy = e_xy
+
+    extended = True
+    while extended and remaining:
+        extended = False
+        for rid in list(remaining):
+            fs, fe = _reach_endpoints(frame_by_rid[rid])
+            if _close(free_end_xy, fs):
+                chain.append((rid, False))
+                free_end_xy = fe
+                remaining.remove(rid)
+                extended = True
+                break
+            if _close(free_end_xy, fe):
+                chain.append((rid, True))
+                free_end_xy = fs
+                remaining.remove(rid)
+                extended = True
+                break
+            if _close(free_start_xy, fe):
+                chain.insert(0, (rid, False))
+                free_start_xy = fs
+                remaining.remove(rid)
+                extended = True
+                break
+            if _close(free_start_xy, fs):
+                chain.insert(0, (rid, True))
+                free_start_xy = fe
+                remaining.remove(rid)
+                extended = True
+                break
+    return chain
+
+
+def _build_override_chain_stations(
+    chain_order: list[tuple[int, bool]],
+    frame_by_rid: dict[int, LineString],
+    snap_by_rid: dict[int, LineString],
+    dem_interp: RegularGridInterpolator,
+    strip_spacing_m: float,
+    seed_reaches: set[int],
+) -> list[_OverrideChainStation]:
+    stations: list[_OverrideChainStation] = []
+    chain_pos = 0
+    for rid, reversed_flag in chain_order:
+        snap_geom = snap_by_rid.get(rid)
+        frame_geom = frame_by_rid.get(rid)
+        if snap_geom is None or snap_geom.is_empty:
+            continue
+        if frame_geom is None or frame_geom.is_empty:
+            continue
+
+        total = float(snap_geom.length)
+        s_vals = np.arange(strip_spacing_m * 0.5, total + 1e-6, strip_spacing_m)
+        if len(s_vals) == 0:
+            continue
+
+        n_stations = len(s_vals)
+        center_idx = n_stations // 2
+        native_idx = list(range(n_stations))
+        if reversed_flag:
+            native_idx = native_idx[::-1]
+
+        for native_i in native_idx:
+            s = float(s_vals[native_i])
+            anchor_pt = snap_geom.interpolate(s)
+            anchor_xy = np.array([anchor_pt.x, anchor_pt.y], dtype=np.float64)
+
+            frame_s = float(frame_geom.project(anchor_pt))
+            eps = min(1.0, frame_geom.length * 0.01)
+            p0 = frame_geom.interpolate(max(frame_s - eps, 0.0))
+            p1 = frame_geom.interpolate(min(frame_s + eps, frame_geom.length))
+            tangent = np.array([p1.x - p0.x, p1.y - p0.y], dtype=np.float64)
+            tn = float(np.hypot(tangent[0], tangent[1]))
+            if tn < 1e-9:
+                continue
+            tangent /= tn
+            if reversed_flag:
+                tangent = -tangent
+
+            base_elev = dem_interp(np.array([[anchor_xy[1], anchor_xy[0]]], dtype=np.float64))
+            elev = float(base_elev[0]) if np.isfinite(base_elev[0]) else float("nan")
+            stations.append(
+                _OverrideChainStation(
+                    reach_id=int(rid),
+                    station_id=int(native_i),
+                    chain_pos=chain_pos,
+                    s_m_reach=float(s),
+                    base_xy=anchor_xy,
+                    tangent=tangent,
+                    base_elev_m=elev,
+                    is_seed=(rid in seed_reaches and native_i == center_idx),
+                )
+            )
+            chain_pos += 1
+    return stations
+
+
+def _nearest_nonself_endpoint_reach(
+    endpoint: Point,
+    anchor_rid: int,
+    obstacle_geoms: list[LineString],
+    obstacle_rids: list[int],
+    reach_tree,
+    tol_m: float,
+) -> int | None:
+    candidates = (
+        reach_tree.query(endpoint.buffer(tol_m))
+        if reach_tree is not None
+        else range(len(obstacle_geoms))
+    )
+    best_rid: int | None = None
+    best_d = float("inf")
+    for idx in candidates:
+        rid = obstacle_rids[idx]
+        if rid == anchor_rid:
+            continue
+        d = endpoint.distance(obstacle_geoms[idx])
+        if d <= tol_m and d < best_d:
+            best_d = d
+            best_rid = rid
+    return best_rid
+
+
+def _find_last_stable_open_edge_anchor(
+    strips: gpd.GeoDataFrame,
+    reach_id: int,
+    side_label: str,
+    obstacle_geoms: list[LineString],
+    obstacle_rids: list[int],
+    reach_tree,
+    max_strip_len_m: float,
+    min_len_m: float,
+    endpoint_tol_m: float,
+) -> dict | None:
+    sub = strips[
+        (strips["reach_id"] == int(reach_id))
+        & (strips["side"] == str(side_label))
+        & (strips["strip_type"] == "interreach")
+    ].sort_values("station_id")
+    if sub.empty:
+        return None
+
+    rows = []
+    for _, row in sub.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        end_pt = Point(geom.coords[-1][:2])
+        hit_rid = _nearest_nonself_endpoint_reach(
+            end_pt,
+            int(reach_id),
+            obstacle_geoms,
+            obstacle_rids,
+            reach_tree,
+            endpoint_tol_m,
+        )
+        length_m = float(row["length_m"])
+        is_stable = (
+            hit_rid is not None
+            and length_m >= min_len_m
+            and length_m < 0.95 * max_strip_len_m
+        )
+        rows.append(
+            {
+                "row": row.to_dict(),
+                "station_id": int(row["station_id"]),
+                "length_m": length_m,
+                "hit_rid": hit_rid,
+                "is_stable": is_stable,
+            }
+        )
+    if not rows:
+        return None
+
+    lookahead = 3
+    for i in range(len(rows) - 1, -1, -1):
+        if not rows[i]["is_stable"]:
+            continue
+        tail = rows[i + 1 : i + 1 + lookahead]
+        if tail and all(not r["is_stable"] for r in tail):
+            return rows[i]["row"]
+    for i in range(len(rows) - 1, -1, -1):
+        if rows[i]["is_stable"]:
+            return rows[i]["row"]
+    return None
+
+
+def _build_open_edge_override_rows(
+    strips: gpd.GeoDataFrame,
+    frame_by_rid: dict[int, LineString],
+    snap_by_rid: dict[int, LineString],
+    dem_interp: RegularGridInterpolator,
+    obstacle_geoms: list[LineString],
+    obstacle_rids: list[int],
+    reach_tree,
+    strip_spacing_m: float,
+    max_strip_len_m: float,
+    ridge_prominence_m: float,
+    descend_stop_m: float,
+    target_reaches: tuple[int, ...] = OPEN_EDGE_WEST_REACHES,
+    side_label: str = OPEN_EDGE_WEST_SIDE,
+) -> tuple[list[dict], int] | None:
+    anchor_row = _find_last_stable_open_edge_anchor(
+        strips,
+        reach_id=int(target_reaches[0]),
+        side_label=side_label,
+        obstacle_geoms=obstacle_geoms,
+        obstacle_rids=obstacle_rids,
+        reach_tree=reach_tree,
+        max_strip_len_m=max_strip_len_m,
+        min_len_m=OPEN_EDGE_MIN_STABLE_LEN_M,
+        endpoint_tol_m=OPEN_EDGE_ENDPOINT_TOL_M,
+    )
+    if anchor_row is None:
+        return None
+
+    anchor_geom = anchor_row["geometry"]
+    anchor_coords = np.array(anchor_geom.coords, dtype=np.float64)
+    anchor_vec = anchor_coords[-1, :2] - anchor_coords[0, :2]
+    anchor_norm = float(np.hypot(anchor_vec[0], anchor_vec[1]))
+    if anchor_norm <= 1e-9:
+        return None
+    anchor_angle = float(np.arctan2(anchor_vec[1], anchor_vec[0]))
+    anchor_station_id = int(anchor_row["station_id"])
+
+    chain_order = _order_target_chain(target_reaches, frame_by_rid)
+    if [rid for rid, _ in chain_order] != list(target_reaches):
+        return None
+
+    chain = _build_override_chain_stations(
+        chain_order,
+        frame_by_rid,
+        snap_by_rid,
+        dem_interp,
+        strip_spacing_m,
+        seed_reaches=set(target_reaches[1:]),
+    )
+    if not chain:
+        return None
+
+    pos_by_key = {(st.reach_id, st.station_id): i for i, st in enumerate(chain)}
+    anchor_pos = pos_by_key.get((int(target_reaches[0]), anchor_station_id))
+    if anchor_pos is None:
+        return None
+
+    anchor_specs: list[tuple[int, float, str]] = [
+        (anchor_pos, anchor_angle, "interreach_anchor")
+    ]
+    for pos, st in enumerate(chain):
+        if st.is_seed:
+            nrm = _west_normal(st.tangent)
+            ang = float(np.arctan2(nrm[1], nrm[0]))
+            anchor_specs.append((pos, ang, "reach_seed"))
+    anchor_specs.sort(key=lambda x: x[0])
+    if len(anchor_specs) < 2:
+        return None
+
+    angles = np.full(len(chain), np.nan, dtype=np.float64)
+    anchor_kind = [""] * len(chain)
+    for pos, _, kind in anchor_specs:
+        anchor_kind[pos] = kind
+    for j in range(len(anchor_specs) - 1):
+        p0, a0, _ = anchor_specs[j]
+        p1, a1, _ = anchor_specs[j + 1]
+        span = p1 - p0
+        if span <= 0:
+            continue
+        for p in range(p0, p1 + 1):
+            frac = (p - p0) / span
+            angles[p] = _short_arc_interp(a0, a1, frac)
+    p_last, a_last, _ = anchor_specs[-1]
+    angles[p_last:] = a_last
+
+    preserved_blockers: list[LineString] = []
+    protected = strips[
+        (strips["side"] == side_label)
+        & (
+            ((strips["reach_id"] == int(target_reaches[0])) & (strips["station_id"] <= anchor_station_id))
+            | (~strips["reach_id"].isin(list(target_reaches)))
+        )
+    ]
+    for _, row in protected.iterrows():
+        geom = row.geometry
+        if geom is not None and not geom.is_empty:
+            preserved_blockers.append(geom)
+
+    blockers = list(preserved_blockers)
+    rows: list[dict] = []
+    for pos in range(anchor_pos + 1, len(chain)):
+        st = chain[pos]
+        angle = angles[pos]
+        if not np.isfinite(angle):
+            continue
+        direction = np.array([np.cos(angle), np.sin(angle)], dtype=np.float64)
+        strip = _ridge_stop_ray(
+            st.base_xy,
+            direction,
+            dem_interp,
+            max_strip_len_m,
+            ridge_prominence_m,
+            descend_stop_m,
+        )
+        if strip is None:
+            continue
+        strip = _truncate_one_sided(
+            strip, st.reach_id, obstacle_geoms, obstacle_rids, reach_tree
+        )
+        if strip is None or strip.length < 1e-3:
+            continue
+        strip = _truncate_against_strip_blockers(strip, st.base_xy, blockers)
+        if strip is None or strip.length < 1e-3:
+            continue
+        rows.append(
+            {
+                "reach_id": int(st.reach_id),
+                "station_id": int(st.station_id),
+                "side": side_label,
+                "strip_type": "side",
+                "poly_id": -1,
+                "anchor_x": float(st.base_xy[0]),
+                "anchor_y": float(st.base_xy[1]),
+                "length_m": float(strip.length),
+                "angle_deg": float(np.degrees(angle)),
+                "is_seed": bool(st.is_seed),
+                "anchor_kind": anchor_kind[pos],
+                "geometry": strip,
+            }
+        )
+        blockers.append(strip)
+    return rows, anchor_station_id
+
+
+def _apply_open_edge_strip_overrides(
+    strips: gpd.GeoDataFrame,
+    frame_by_rid: dict[int, LineString],
+    snap_by_rid: dict[int, LineString],
+    dem_interp: RegularGridInterpolator,
+    obstacle_geoms: list[LineString],
+    obstacle_rids: list[int],
+    reach_tree,
+    strip_spacing_m: float,
+    max_strip_len_m: float,
+    ridge_prominence_m: float,
+    descend_stop_m: float,
+) -> gpd.GeoDataFrame:
+    built = _build_open_edge_override_rows(
+        strips,
+        frame_by_rid,
+        snap_by_rid,
+        dem_interp,
+        obstacle_geoms,
+        obstacle_rids,
+        reach_tree,
+        strip_spacing_m,
+        max_strip_len_m,
+        ridge_prominence_m,
+        descend_stop_m,
+    )
+    if built is None:
+        return strips
+
+    override_rows, anchor_station_id = built
+    if not override_rows:
+        return strips
+
+    keep_mask = ~(
+        (strips["side"] == OPEN_EDGE_WEST_SIDE)
+        & (
+            ((strips["reach_id"] == OPEN_EDGE_WEST_REACHES[0]) & (strips["station_id"] > anchor_station_id))
+            | (strips["reach_id"].isin(list(OPEN_EDGE_WEST_REACHES[1:])))
+        )
+    )
+    preserved_rows = strips.loc[keep_mask].to_dict("records")
+    return gpd.GeoDataFrame(
+        preserved_rows + override_rows,
+        geometry="geometry",
+        crs=strips.crs,
+    )
+
+
 def _generate_chain_side_strips(
     chain: list[tuple[int, bool]],
     side_label: str,
@@ -1392,7 +1852,7 @@ def generate_network_strips(
                 descend_stop_m,
             )
 
-    return (
+    strips = (
         gpd.GeoDataFrame(rows, geometry="geometry", crs=snapped_gdf.crs)
         if rows
         else gpd.GeoDataFrame(
@@ -1408,6 +1868,21 @@ def generate_network_strips(
             geometry="geometry",
             crs=snapped_gdf.crs,
         )
+    )
+    if strips.empty:
+        return strips
+    return _apply_open_edge_strip_overrides(
+        strips,
+        frame_by_rid,
+        snap_by_rid,
+        dem_interp,
+        obstacle_geoms,
+        obstacle_rids,
+        reach_tree,
+        strip_spacing_m,
+        max_strip_len_m,
+        ridge_prominence_m,
+        descend_stop_m,
     )
 
 
@@ -2275,6 +2750,13 @@ def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     strips.to_file(OUT_DIR / "network_cross_sections.fgb", driver="FlatGeobuf")
     print(f"  wrote {OUT_DIR / 'network_cross_sections.fgb'}")
+    if "is_seed" in strips.columns:
+        seed_mask = strips["is_seed"].eq(True)
+        if seed_mask.any():
+            strips.loc[seed_mask].copy().to_file(
+                OUT_DIR / "network_seeds.fgb", driver="FlatGeobuf"
+            )
+            print(f"  wrote {OUT_DIR / 'network_seeds.fgb'}")
 
     # --- Elevation attachment ---
     print("\n== Attaching strip elevations ==")
