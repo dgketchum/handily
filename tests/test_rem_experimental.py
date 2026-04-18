@@ -10,6 +10,7 @@ from handily.rem_experimental import (
     _OpenEdgeAnchorCandidate,
     _best_family_chain_from_anchor,
     _find_open_edge_polygon_ids,
+    _is_two_sided_paired_polygon,
 )
 
 
@@ -73,3 +74,8 @@ def test_best_family_chain_from_anchor_prefers_longest_continuation_path() -> No
     assert [rid for rid, _ in chain_order] == [4, 11, 25, 26]
     assert score[0] == 4
 
+
+def test_is_two_sided_paired_polygon_requires_both_labels() -> None:
+    assert _is_two_sided_paired_polygon({"left": {4, 11}, "right": {15}})
+    assert not _is_two_sided_paired_polygon({"left": {4, 11}})
+    assert not _is_two_sided_paired_polygon({"right": {15}})
