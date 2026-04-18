@@ -11,6 +11,7 @@ from handily.rem_experimental import (
     _best_family_chain_from_anchor,
     _find_open_edge_polygon_ids,
     _is_two_sided_paired_polygon,
+    _protected_interreach_polygon_ids,
 )
 
 
@@ -79,3 +80,22 @@ def test_is_two_sided_paired_polygon_requires_both_labels() -> None:
     assert _is_two_sided_paired_polygon({"left": {4, 11}, "right": {15}})
     assert not _is_two_sided_paired_polygon({"left": {4, 11}})
     assert not _is_two_sided_paired_polygon({"right": {15}})
+
+
+def test_protected_interreach_polygon_ids_only_keeps_two_sided_faces() -> None:
+    faces = NetworkFaces(
+        polygons=[],
+        closure_edges=[],
+        reach_side_map={
+            (4, "left"): 10,
+            (11, "left"): 10,
+            (15, "right"): 10,
+            (18, "left"): 1,
+            (19, "right"): 1,
+            (25, "left"): 22,
+        },
+        polygon_aspects={},
+        min_area_m2=100.0,
+    )
+
+    assert _protected_interreach_polygon_ids(faces) == {1, 10}
