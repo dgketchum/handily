@@ -46,7 +46,9 @@ def test_estimate_reach_seed_strength_uses_support_override():
     streams = _toy_streams()
     ndvi = _grid(np.full((3, 5), -0.1, dtype=np.float64))
     support = _grid(np.zeros((3, 5), dtype=np.float64))
+    # Fill both cols so interior samples (excluding endpoints) exceed 0.5
     support.values[2, 0] = 1.0
+    support.values[2, 1] = 1.0
     seeded = estimate_reach_seed_strength(
         streams,
         ndvi,
