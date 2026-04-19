@@ -1,6 +1,6 @@
 **FAC Algorithm**
 
-This note describes the current best FAC-based REM workflow in [`rem_fac.py`](/home/dgketchum/code/handily/src/handily/rem_fac.py) and the follow-on water-surface relaxation in [`rem_surface_relax.py`](/home/dgketchum/code/handily/src/handily/rem_surface_relax.py).
+This note describes the current best FAC-based REM workflow in [`rem_fac.py`](/home/dgketchum/code/handily/src/handily/rem_fac.py), the topology weighting in [`rem_fac_topology.py`](/home/dgketchum/code/handily/src/handily/rem_fac_topology.py), and the follow-on water-surface relaxation in [`rem_surface_relax.py`](/home/dgketchum/code/handily/src/handily/rem_surface_relax.py).
 
 The core idea is:
 
@@ -8,7 +8,7 @@ The core idea is:
 - orient cross sections normal to the aspect of a heavily smoothed DEM
 - linearly interpolate water-surface elevation along each cross section from its two ends
 - burn those sections to a `20 m` raster and fill the gaps quickly
-- then relax that water surface upward at evidence-supported snapped thalwegs, while allowing dry low-NDVI areas to sag away from implausibly shallow prior REM
+- then relax that water surface upward at evidence-supported snapped thalwegs, while allowing upper dry reaches to sag away from the last downstream wet reaches through a topology-weighted prior pinning field
 
 **Inputs**
 
@@ -20,7 +20,7 @@ The core idea is:
   - e.g. `/data/ssd2/handily/nv/aoi_0773/experimental_full/resnapped.fgb`
 - evidence-based water mask for hard support:
   - e.g. `/data/ssd2/handily/nv/aoi_0773/water_mask_rf.tif`
-- NAIP image for NDVI-derived soft pinning:
+- NAIP image for NDVI-derived wet-seed detection:
   - e.g. `/data/ssd2/handily/nv/aoi_0773/naip/ortho_1-1_hm_s_nv007_2022_1.tif`
 
 **Stage 1: Build The Orientation Field**
@@ -150,24 +150,35 @@ These are the only pixels where the relaxed solution is allowed to reach:
 
 Everything else must stay above that by at least a small clearance.
 
-**Stage 9: Add Soft NDVI Pinning To The Prior**
+**Stage 9: Build Topology-Derived Prior Pin Weights**
 
-The current best formulation does not use NDVI as a hard clearance target.
+The current best formulation no longer uses local pixel NDVI directly as the pin-weight field.
 
 Instead:
 
 1. Compute raw NAIP NDVI on the `20 m` grid with [`compute_naip_ndvi_match()`](/home/dgketchum/code/handily/src/handily/rem_surface_relax.py#L63).
-2. Convert NDVI to a soft prior-pin weight with [`ndvi_to_prior_pin_weight()`](/home/dgketchum/code/handily/src/handily/rem_surface_relax.py#L287).
+2. Build FAC topology and orient reaches upstream-to-downstream from smoothed-DEM endpoint elevations:
+   - [`build_fac_topology()`](/home/dgketchum/code/handily/src/handily/rem_fac_topology.py)
+3. Estimate wet seed strength per FAC reach from:
+   - high NDVI along the reach
+   - hard support overlap as an override
+   - [`estimate_reach_seed_strength()`](/home/dgketchum/code/handily/src/handily/rem_fac_topology.py)
+4. Propagate that wet influence upstream with exponential decay in:
+   - network distance
+   - elevation gain
+   - Strahler-scaled persistence
+   - [`propagate_upstream_wet_influence()`](/home/dgketchum/code/handily/src/handily/rem_fac_topology.py)
+5. Rasterize the resulting reach weights back to the `20 m` grid:
+   - [`rasterize_reach_weights_max()`](/home/dgketchum/code/handily/src/handily/rem_fac_topology.py)
 
 Interpretation:
 
-- high NDVI:
-  - stronger pinning to the prior shallow water surface
-- low NDVI:
-  - weaker pinning to the prior
-  - easier for the solver to let the surface sag downward
+- lower wet reaches defend shallow groundwater strongly
+- their influence persists upstream for some distance
+- that influence decays quickly with elevation gain onto dry benches
+- the final raster is a reach-topology pinning field, not a local NDVI blur
 
-This keeps NDVI as guidance, not as a discontinuous ceiling.
+This is the right abstraction for the current problem.
 
 **Stage 10: Relax The Water Surface**
 
@@ -183,17 +194,17 @@ Constraints:
   - `REM >= min_clearance_off_support`
   - currently `0.1 m`
 - soft prior preservation:
-  - stronger where NDVI is high
-  - weaker where NDVI is low
+  - stronger where topology-derived wet influence is high
+  - weaker where reaches are far and high above the last wet downstream seed
 - smoothness:
   - controlled by `smoothness_weight`
 
 This is the conceptual model:
 
 - the FAC water surface is the prior
-- wet green areas resist change
-- dry low-NDVI areas can sag more
-- the sag is imposed by the membrane solve, not by blurring NDVI
+- wet lower reaches resist change
+- upper dry benches lose that support with network distance and elevation gain
+- the sag is imposed by the membrane solve, not by a hard local ceiling
 
 **Outputs**
 
@@ -210,10 +221,11 @@ The current workflow writes:
   - `fac_normals_idw_fill_20m.tif`
 - relaxation inputs:
   - `fac_normals_naip_ndvi_20m.tif`
-  - `fac_normals_ndvi_prior_pin_weight_20m.tif`
+  - `fac_topology_pin_streams.fgb`
+  - `fac_topology_pin_weight_20m.tif`
 - final relaxed products:
-  - `fac_normals_idw_fill_ws_20m_relaxed_ndvi_pin.tif`
-  - `fac_normals_idw_fill_rem_20m_from_ws_relax_ndvi_pin.tif`
+  - `fac_normals_idw_fill_ws_20m_relaxed_fac_topology.tif`
+  - `fac_normals_idw_fill_rem_20m_from_ws_relax_fac_topology.tif`
 
 **Current Best Standpoint**
 
@@ -223,7 +235,7 @@ The best current FAC REM path is:
 2. sparse line burn to `20 m`
 3. fast IDW water-surface fill
 4. hard thalweg support from snapped reaches + evidence mask
-5. raw-NDVI soft prior pinning
+5. topology-derived prior pinning from wet lower reaches
 6. continuous water-surface relaxation with a tunable smoothness weight
 
-That keeps the geometric realism of the dense FAC scaffold while letting implausibly shallow prior REM sag continuously away from dry low-NDVI ground.
+That keeps the geometric realism of the dense FAC scaffold while letting implausibly shallow prior REM sag continuously away from dry upper reaches that are far and high above the last defended wet reach.
