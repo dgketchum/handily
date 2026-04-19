@@ -34,7 +34,9 @@ def _match_transform(match_da: xr.DataArray) -> Affine:
     dy = float(np.median(np.diff(y)))
     if not np.isfinite(dx) or not np.isfinite(dy):
         raise ValueError("invalid match_da coordinate spacing")
-    return Affine.translation(float(x[0] - dx / 2.0), float(y[0] - dy / 2.0)) * Affine.scale(dx, dy)
+    return Affine.translation(
+        float(x[0] - dx / 2.0), float(y[0] - dy / 2.0)
+    ) * Affine.scale(dx, dy)
 
 
 def _build_raster_interp(da: xr.DataArray) -> RegularGridInterpolator:
@@ -49,7 +51,11 @@ def _build_raster_interp(da: xr.DataArray) -> RegularGridInterpolator:
 
 def _line_s_values(total_m: float, spacing_m: float) -> np.ndarray:
     if total_m <= spacing_m:
-        return np.array([0.0, total_m], dtype=np.float64) if total_m > 1e-6 else np.array([0.0], dtype=np.float64)
+        return (
+            np.array([0.0, total_m], dtype=np.float64)
+            if total_m > 1e-6
+            else np.array([0.0], dtype=np.float64)
+        )
     vals = np.arange(0.0, total_m, spacing_m, dtype=np.float64)
     if vals.size == 0 or vals[-1] < total_m - 1e-6:
         vals = np.append(vals, total_m)
@@ -60,9 +66,14 @@ def _quantize_node(x: float, y: float, precision: int) -> tuple[float, float]:
     return (round(float(x), precision), round(float(y), precision))
 
 
-def _sample_line_values(line, interp: RegularGridInterpolator, spacing_m: float) -> np.ndarray:
+def _sample_line_values(
+    line, interp: RegularGridInterpolator, spacing_m: float
+) -> np.ndarray:
     s_vals = _line_s_values(float(line.length), float(spacing_m))
-    pts = np.array([[line.interpolate(float(s)).y, line.interpolate(float(s)).x] for s in s_vals], dtype=np.float64)
+    pts = np.array(
+        [[line.interpolate(float(s)).y, line.interpolate(float(s)).x] for s in s_vals],
+        dtype=np.float64,
+    )
     return np.asarray(interp(pts), dtype=np.float64)
 
 
@@ -84,8 +95,12 @@ def build_fac_topology(
     for row in streams_gdf.itertuples(index=False):
         geom = row.geometry
         coords = list(geom.coords)
-        z0 = float(elev_interp(np.array([[coords[0][1], coords[0][0]]], dtype=np.float64))[0])
-        z1 = float(elev_interp(np.array([[coords[-1][1], coords[-1][0]]], dtype=np.float64))[0])
+        z0 = float(
+            elev_interp(np.array([[coords[0][1], coords[0][0]]], dtype=np.float64))[0]
+        )
+        z1 = float(
+            elev_interp(np.array([[coords[-1][1], coords[-1][0]]], dtype=np.float64))[0]
+        )
         reverse = np.isfinite(z0) and np.isfinite(z1) and (z1 > z0)
         if reverse:
             geom = type(geom)(coords[::-1])
@@ -99,11 +114,17 @@ def build_fac_topology(
         starts_at.setdefault(up_node, []).append(stream_id)
         ends_at.setdefault(down_node, []).append(stream_id)
         length_m = float(getattr(row, "length_m", geom.length))
-        relief_m = float(max(z_up - z_down, 0.0)) if np.isfinite(z_up) and np.isfinite(z_down) else np.nan
+        relief_m = (
+            float(max(z_up - z_down, 0.0))
+            if np.isfinite(z_up) and np.isfinite(z_down)
+            else np.nan
+        )
         rows.append(
             {
                 "stream_id": stream_id,
-                "strahler": int(getattr(row, "strahler", 0)) if getattr(row, "strahler", None) is not None else 0,
+                "strahler": int(getattr(row, "strahler", 0))
+                if getattr(row, "strahler", None) is not None
+                else 0,
                 "length_m": length_m,
                 "up_elev_m": z_up,
                 "down_elev_m": z_down,
@@ -128,10 +149,16 @@ def build_fac_topology(
                 downstream[u].append(d)
                 upstream[d].append(u)
 
-    streams = gpd.GeoDataFrame(rows, geometry="geometry", crs=streams_gdf.crs).sort_values("stream_id").reset_index(drop=True)
+    streams = (
+        gpd.GeoDataFrame(rows, geometry="geometry", crs=streams_gdf.crs)
+        .sort_values("stream_id")
+        .reset_index(drop=True)
+    )
     downstream_t = {int(k): tuple(sorted(set(v))) for k, v in downstream.items()}
     upstream_t = {int(k): tuple(sorted(set(v))) for k, v in upstream.items()}
-    return FacTopologyResult(streams=streams, downstream=downstream_t, upstream=upstream_t)
+    return FacTopologyResult(
+        streams=streams, downstream=downstream_t, upstream=upstream_t
+    )
 
 
 def estimate_reach_seed_strength(
@@ -151,11 +178,14 @@ def estimate_reach_seed_strength(
     if ndvi_scale <= 0.0:
         raise ValueError("ndvi_scale must be > 0")
     ndvi_interp = _build_raster_interp(ndvi_da)
-    support_interp = _build_raster_interp(support_da) if support_da is not None else None
+    support_interp = (
+        _build_raster_interp(support_da) if support_da is not None else None
+    )
 
     out = streams_gdf.copy()
     ndvi_p = np.full(len(out), np.nan, dtype=np.float64)
     support_hit = np.zeros(len(out), dtype=bool)
+    support_fraction = np.zeros(len(out), dtype=np.float64)
     seed = np.zeros(len(out), dtype=np.float64)
 
     for i, row in enumerate(out.itertuples(index=False)):
@@ -170,7 +200,27 @@ def estimate_reach_seed_strength(
         seed_val = float(seed_ndvi)
         if support_interp is not None:
             svals = _sample_line_values(row.geometry, support_interp, sample_spacing_m)
-            hit = bool(np.any(np.isfinite(svals) & (svals > 0.5)))
+            # Drop first and last samples (endpoints) to avoid leaking
+            # support across shared confluence/reach-break vertices.
+            # For very short reaches (≤ 2 samples), sample the midpoint
+            # instead — it is never shared with a neighbor.
+            if len(svals) > 2:
+                svals_interior = svals[1:-1]
+            else:
+                mid_pt = row.geometry.interpolate(0.5, normalized=True)
+                mid_val = support_interp(np.array([[mid_pt.y, mid_pt.x]]))[0]
+                svals_interior = np.array([mid_val], dtype=np.float64)
+            svals_valid = svals_interior[np.isfinite(svals_interior)]
+            # Full-line samples still used for hit detection (soft anchor)
+            svals_all = svals[np.isfinite(svals)]
+            if len(svals_valid) > 0:
+                frac = float(np.sum(svals_valid > 0.5)) / len(svals_valid)
+                support_fraction[i] = frac
+                hit = frac > 0.0
+            elif len(svals_all) > 0:
+                hit = bool(np.any(svals_all > 0.5))
+            else:
+                hit = False
             support_hit[i] = hit
             if hit:
                 seed_val = max(seed_val, float(support_override))
@@ -178,6 +228,7 @@ def estimate_reach_seed_strength(
 
     out["seed_ndvi_q"] = ndvi_p
     out["seed_support_hit"] = support_hit
+    out["seed_support_fraction"] = support_fraction
     out["seed_strength"] = seed
     return out
 
@@ -197,7 +248,10 @@ def propagate_upstream_wet_influence(
 
     streams = topology.streams.copy()
     by_id = {int(r.stream_id): r for r in streams.itertuples(index=False)}
-    seed_strength = {int(r.stream_id): float(getattr(r, "seed_strength", 0.0)) for r in streams.itertuples(index=False)}
+    seed_strength = {
+        int(r.stream_id): float(getattr(r, "seed_strength", 0.0))
+        for r in streams.itertuples(index=False)
+    }
     memo: dict[int, tuple[float, int, float, float]] = {}
     visiting: set[int] = set()
 
@@ -205,7 +259,12 @@ def propagate_upstream_wet_influence(
         if stream_id in memo:
             return memo[stream_id]
         if stream_id in visiting:
-            return (seed_strength.get(stream_id, 0.0), stream_id if seed_strength.get(stream_id, 0.0) > 0 else -1, 0.0, 0.0)
+            return (
+                seed_strength.get(stream_id, 0.0),
+                stream_id if seed_strength.get(stream_id, 0.0) > 0 else -1,
+                0.0,
+                0.0,
+            )
         visiting.add(stream_id)
         row = by_id[stream_id]
         best_weight = seed_strength.get(stream_id, 0.0)
@@ -213,11 +272,18 @@ def propagate_upstream_wet_influence(
         best_dist = 0.0 if best_seed >= 0 else np.nan
         best_gain = 0.0 if best_seed >= 0 else np.nan
 
-        Ld_eff = float(distance_scale_m) * (1.0 + float(strahler_distance_scale) * max(int(getattr(row, "strahler", 0)) - 1, 0))
+        Ld_eff = float(distance_scale_m) * (
+            1.0
+            + float(strahler_distance_scale)
+            * max(int(getattr(row, "strahler", 0)) - 1, 0)
+        )
         relief = float(getattr(row, "relief_m", np.nan))
         if not np.isfinite(relief):
             relief = 0.0
-        decay = np.exp(-float(getattr(row, "length_m", 0.0)) / Ld_eff - relief / float(elevation_scale_m))
+        decay = np.exp(
+            -float(getattr(row, "length_m", 0.0)) / Ld_eff
+            - relief / float(elevation_scale_m)
+        )
 
         for down_id in topology.downstream.get(stream_id, ()):
             down_w, down_seed, down_dist, down_gain = solve(int(down_id))
@@ -273,10 +339,21 @@ def rasterize_reach_weights_max(
             continue
         line = row.geometry
         s_vals = _line_s_values(float(line.length), step)
-        pts = np.array([[line.interpolate(float(s)).x, line.interpolate(float(s)).y] for s in s_vals], dtype=np.float64)
+        pts = np.array(
+            [
+                [line.interpolate(float(s)).x, line.interpolate(float(s)).y]
+                for s in s_vals
+            ],
+            dtype=np.float64,
+        )
         cols = np.round((pts[:, 0] - x[0]) / dx).astype(np.intp)
         rows = np.round((y[0] - pts[:, 1]) / dy).astype(np.intp)
-        valid = (rows >= 0) & (rows < out_arr.shape[0]) & (cols >= 0) & (cols < out_arr.shape[1])
+        valid = (
+            (rows >= 0)
+            & (rows < out_arr.shape[0])
+            & (cols >= 0)
+            & (cols < out_arr.shape[1])
+        )
         if not np.any(valid):
             continue
         rr = rows[valid]

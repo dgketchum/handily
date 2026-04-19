@@ -15,7 +15,6 @@ ownership/rasterization workflow.
 from __future__ import annotations
 
 import argparse
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -32,7 +31,7 @@ from scipy.ndimage import distance_transform_edt, gaussian_filter
 from scipy.signal import fftconvolve
 from shapely import STRtree
 from shapely import from_wkb
-from shapely.geometry import LineString, Point, Polygon, shape
+from shapely.geometry import LineString, Polygon, shape
 from shapely.ops import unary_union
 
 DEFAULT_DEM = Path("/data/ssd2/handily/nv/aoi_0773/dem_bounds_1m.tif")
@@ -104,7 +103,9 @@ def _build_raster_interp(arr: np.ndarray, x_vals: np.ndarray, y_vals: np.ndarray
     if yy[0] > yy[-1]:
         yy = yy[::-1]
         aa = aa[::-1, :]
-    return RegularGridInterpolator((yy, x_vals.astype(np.float64)), aa, bounds_error=False, fill_value=np.nan)
+    return RegularGridInterpolator(
+        (yy, x_vals.astype(np.float64)), aa, bounds_error=False, fill_value=np.nan
+    )
 
 
 def _burn_section_to_accumulators(
@@ -194,7 +195,11 @@ def _derive_aoi_polygon_from_dem(dem_da: xr.DataArray, coarse_res_m: float) -> P
     x_vals = coarse.x.values.astype(np.float64)
     y_vals = coarse.y.values.astype(np.float64)
     transform = _coord_transform(x_vals, y_vals)
-    polys = [shape(g) for g, val in shapes(arr, mask=arr > 0, transform=transform) if int(val) == 1]
+    polys = [
+        shape(g)
+        for g, val in shapes(arr, mask=arr > 0, transform=transform)
+        if int(val) == 1
+    ]
     if not polys:
         raise ValueError("Failed to derive AOI polygon from DEM footprint")
     aoi = unary_union(polys)
@@ -283,7 +288,11 @@ def _intersection_points(geom) -> list[tuple[float, float]]:
 def _station_s_values(line: LineString, spacing_m: float) -> np.ndarray:
     total = float(line.length)
     if total <= spacing_m:
-        return np.array([0.0, total], dtype=np.float64) if total > 1e-6 else np.array([0.0], dtype=np.float64)
+        return (
+            np.array([0.0, total], dtype=np.float64)
+            if total > 1e-6
+            else np.array([0.0], dtype=np.float64)
+        )
     vals = np.arange(0.0, total, spacing_m, dtype=np.float64)
     if vals.size == 0 or vals[-1] < total - 1e-6:
         vals = np.append(vals, total)
@@ -446,7 +455,9 @@ def _generate_strip_rows_for_chunk(
                 normal = np.array([np.nan, np.nan], dtype=np.float64)
                 orient_src = "tangent_fallback"
             if not np.isfinite(normal[0]):
-                normal = _normalize(np.array([-tangent[1], tangent[0]], dtype=np.float64))
+                normal = _normalize(
+                    np.array([-tangent[1], tangent[0]], dtype=np.float64)
+                )
                 slope_mag = np.nan
             if not np.isfinite(normal[0]):
                 continue
@@ -487,7 +498,9 @@ def _generate_strip_rows_for_chunk(
                     endpoint_xy = boundary_xy
                     target_reach_id = -1
 
-                angle_deg = float((np.degrees(np.arctan2(base_dir[1], base_dir[0])) + 360.0) % 360.0)
+                angle_deg = float(
+                    (np.degrees(np.arctan2(base_dir[1], base_dir[0])) + 360.0) % 360.0
+                )
                 out.append(
                     {
                         "reach_id": int(rec["reach_id"]),
@@ -548,6 +561,68 @@ def _attach_fac_strip_elevations(
     strips = strips.copy()
     strips["base_elev_m"] = base_elev
     strips["endpoint_elev_m"] = endpoint_elev
+    return strips
+
+
+def _attach_fac_strip_head_elevations(
+    strips: gpd.GeoDataFrame,
+    heads_gdf: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Override strip base/endpoint elevations with solved channel heads.
+
+    Strips must already have DEM-based elevations (from generate_fac_strips).
+    Values are only overridden where the head lookup succeeds; DEM values
+    are preserved as fallback.
+    """
+    if strips.empty:
+        return strips
+
+    strips = strips.copy()
+
+    head_by_stream = dict(
+        zip(
+            heads_gdf["stream_id"].astype(int),
+            heads_gdf["channel_head_m"].astype(np.float64),
+        )
+    )
+    head_by_reach: dict[int, float] = {}
+    if "reach_id" in heads_gdf.columns:
+        head_by_reach = dict(
+            zip(
+                heads_gdf["reach_id"].astype(int),
+                heads_gdf["channel_head_m"].astype(np.float64),
+            )
+        )
+
+    # Override base elevation with source reach's solved head
+    base_heads = np.array(
+        [head_by_stream.get(int(sid), np.nan) for sid in strips["stream_id"]],
+        dtype=np.float64,
+    )
+    has_base = np.isfinite(base_heads)
+    if has_base.any():
+        strips.loc[has_base, "base_elev_m"] = base_heads[has_base]
+
+    # Override interreach endpoint with target reach's solved head
+    interreach = strips["hit_type"].eq("interreach").to_numpy()
+    if interreach.any() and head_by_reach:
+        ep_heads = np.array(
+            [
+                head_by_reach.get(int(rid), np.nan)
+                for rid in strips.loc[interreach, "target_reach_id"]
+            ],
+            dtype=np.float64,
+        )
+        has_ep = np.isfinite(ep_heads)
+        idx_ir = strips.index[interreach]
+        if has_ep.any():
+            strips.loc[idx_ir[has_ep], "endpoint_elev_m"] = ep_heads[has_ep]
+
+    # Edge strips: endpoint = base
+    edge = strips["hit_type"].eq("edge").to_numpy()
+    if edge.any():
+        strips.loc[edge, "endpoint_elev_m"] = strips.loc[edge, "base_elev_m"].values
+
     return strips
 
 
@@ -613,7 +688,9 @@ def generate_fac_strips(
         )
     else:
         chunk_size = max(1, int(np.ceil(len(records) / (workers * 4))))
-        chunks = [records[i : i + chunk_size] for i in range(0, len(records), chunk_size)]
+        chunks = [
+            records[i : i + chunk_size] for i in range(0, len(records), chunk_size)
+        ]
         stream_wkbs = [geom.wkb for geom in stream_geoms]
         with ProcessPoolExecutor(
             max_workers=workers,
@@ -653,7 +730,9 @@ def generate_fac_strips(
 
     strips = gpd.GeoDataFrame(rows, geometry="geometry", crs=work.crs)
     if not strips.empty:
-        strips = strips.sort_values(["reach_id", "side", "station_id"]).reset_index(drop=True)
+        strips = strips.sort_values(["reach_id", "side", "station_id"]).reset_index(
+            drop=True
+        )
     return _attach_fac_strip_elevations(strips, dem_da)
 
 
@@ -669,7 +748,9 @@ def build_fac_wedges(strips: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             s1 = grp.iloc[i + 1]
             if str(s0["hit_type"]) != str(s1["hit_type"]):
                 continue
-            if str(s0["hit_type"]) == "interreach" and int(s0["target_reach_id"]) != int(s1["target_reach_id"]):
+            if str(s0["hit_type"]) == "interreach" and int(
+                s0["target_reach_id"]
+            ) != int(s1["target_reach_id"]):
                 continue
 
             quad = Polygon(
@@ -934,21 +1015,39 @@ def fill_sparse_sections_idw(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="FAC-based aspect-normal strip prototype")
+    parser = argparse.ArgumentParser(
+        description="FAC-based aspect-normal strip prototype"
+    )
     parser.add_argument("--dem-path", type=Path, default=DEFAULT_DEM)
     parser.add_argument("--streams-path", type=Path, default=DEFAULT_STREAMS)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--coarse-res-m", type=float, default=DEFAULT_COARSE_RES_M)
     parser.add_argument("--smooth-sigma-m", type=float, default=DEFAULT_SMOOTH_SIGMA_M)
-    parser.add_argument("--station-spacing-m", type=float, default=DEFAULT_STATION_SPACING_M)
+    parser.add_argument(
+        "--station-spacing-m", type=float, default=DEFAULT_STATION_SPACING_M
+    )
     parser.add_argument("--tangent-step-m", type=float, default=DEFAULT_TANGENT_STEP_M)
     parser.add_argument("--min-hit-dist-m", type=float, default=DEFAULT_MIN_HIT_DIST_M)
     parser.add_argument("--min-strahler", type=int, default=0)
     parser.add_argument("--burn-res-m", type=float, default=DEFAULT_BURN_RES_M)
-    parser.add_argument("--gaussian-sigma-px", type=float, default=DEFAULT_GAUSSIAN_SIGMA_PX)
+    parser.add_argument(
+        "--gaussian-sigma-px", type=float, default=DEFAULT_GAUSSIAN_SIGMA_PX
+    )
     parser.add_argument("--idw-radius-m", type=float, default=DEFAULT_IDW_RADIUS_M)
     parser.add_argument("--idw-power", type=float, default=DEFAULT_IDW_POWER)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument(
+        "--naip-path",
+        type=Path,
+        default=None,
+        help="NAIP raster for head solve (enables longitudinal head solve)",
+    )
+    parser.add_argument(
+        "--support-path",
+        type=Path,
+        default=None,
+        help="Pre-built support raster for head solve",
+    )
     return parser.parse_args(argv)
 
 
@@ -966,7 +1065,9 @@ def main(argv: list[str] | None = None) -> None:
         streams = streams.loc[streams["strahler"] >= args.min_strahler].copy()
     if "reach_id" not in streams.columns:
         streams["reach_id"] = np.arange(len(streams), dtype=np.int64)
-    streams = streams.loc[streams.geometry.notnull() & ~streams.geometry.is_empty].copy()
+    streams = streams.loc[
+        streams.geometry.notnull() & ~streams.geometry.is_empty
+    ].copy()
     streams = streams.sort_values("reach_id").reset_index(drop=True)
     print(f"  streams: {len(streams)}")
 
@@ -977,7 +1078,9 @@ def main(argv: list[str] | None = None) -> None:
         smooth_sigma_m=args.smooth_sigma_m,
     )
     streams.to_file(args.out_dir / "fac_normals_streams.fgb", driver="FlatGeobuf")
-    gpd.GeoDataFrame([{"geometry": field.aoi_polygon}], geometry="geometry", crs=streams.crs).to_file(
+    gpd.GeoDataFrame(
+        [{"geometry": field.aoi_polygon}], geometry="geometry", crs=streams.crs
+    ).to_file(
         args.out_dir / "fac_normals_aoi.fgb",
         driver="FlatGeobuf",
     )
@@ -999,6 +1102,36 @@ def main(argv: list[str] | None = None) -> None:
         f"{int((strips['hit_type'] == 'edge').sum())} edge)"
     )
 
+    if args.naip_path is not None:
+        from handily.rem_fac_head import build_channel_heads
+        from handily.rem_surface_relax import compute_naip_ndvi_match
+
+        print("Running channel-head longitudinal solve")
+        t0 = perf_counter()
+        _x, _y = _axes_from_bounds(tuple(dem_da.rio.bounds()), args.burn_res_m)
+        _dem20 = sample_dem_to_grid(dem_da, _x, _y)
+        ndvi_da = compute_naip_ndvi_match(str(args.naip_path), _dem20)
+
+        support_da = None
+        if args.support_path is not None and args.support_path.exists():
+            support_da = rioxarray.open_rasterio(args.support_path).squeeze(
+                "band", drop=True
+            )
+            support_da = support_da.rio.set_spatial_dims(x_dim="x", y_dim="y")
+
+        heads = build_channel_heads(
+            streams, field.smoothed_dem, ndvi_da, support_da=support_da
+        )
+        heads.to_file(args.out_dir / "fac_channel_heads.fgb", driver="FlatGeobuf")
+        strips = _attach_fac_strip_head_elevations(strips, heads)
+        dt = perf_counter() - t0
+        depth = heads["head_depth_m"]
+        print(
+            f"  {len(heads)} reaches solved in {dt:.1f}s, "
+            f"head depth: min={depth.min():.2f} mean={depth.mean():.2f} "
+            f"max={depth.max():.2f} m"
+        )
+
     print("Building wedge polygons")
     wedges = build_fac_wedges(strips)
     print(f"  wedges: {len(wedges)}")
@@ -1013,7 +1146,9 @@ def main(argv: list[str] | None = None) -> None:
     dt = perf_counter() - t0
     burned = int(np.isfinite(sparse_ws_da.values).sum())
     total = int(sparse_ws_da.values.size)
-    max_count = float(np.nanmax(sparse_count_da.values)) if sparse_count_da.values.size else 0.0
+    max_count = (
+        float(np.nanmax(sparse_count_da.values)) if sparse_count_da.values.size else 0.0
+    )
     print(
         f"  sparse burn: {burned}/{total} pixels "
         f"({100.0 * burned / max(total, 1):.1f}%), "
@@ -1035,7 +1170,9 @@ def main(argv: list[str] | None = None) -> None:
     dt = perf_counter() - t0
     filled = int(np.isfinite(filled_ws_da.values).sum())
     total = int(filled_ws_da.values.size)
-    max_dist = float(np.nanmax(nearest_dist_da.values)) if nearest_dist_da.values.size else 0.0
+    max_dist = (
+        float(np.nanmax(nearest_dist_da.values)) if nearest_dist_da.values.size else 0.0
+    )
     print(
         f"  nearest fill: {filled}/{total} pixels "
         f"({100.0 * filled / max(total, 1):.1f}%), "
@@ -1082,13 +1219,19 @@ def main(argv: list[str] | None = None) -> None:
     strips.to_file(args.out_dir / "fac_normals_cross_sections.fgb", driver="FlatGeobuf")
     wedges.to_file(args.out_dir / "fac_normals_wedges.fgb", driver="FlatGeobuf")
     sparse_ws_da.rio.to_raster(args.out_dir / "fac_normals_sparse_sections_20m.tif")
-    sparse_count_da.rio.to_raster(args.out_dir / "fac_normals_sparse_sections_count_20m.tif")
+    sparse_count_da.rio.to_raster(
+        args.out_dir / "fac_normals_sparse_sections_count_20m.tif"
+    )
     dem20_da.rio.to_raster(args.out_dir / "fac_normals_dem_20m.tif")
     filled_ws_da.rio.to_raster(args.out_dir / "fac_normals_nearest_fill_20m.tif")
-    nearest_dist_da.rio.to_raster(args.out_dir / "fac_normals_nearest_fill_distance_20m.tif")
+    nearest_dist_da.rio.to_raster(
+        args.out_dir / "fac_normals_nearest_fill_distance_20m.tif"
+    )
     rem20_da.rio.to_raster(args.out_dir / "fac_normals_rem_20m.tif")
     gaussian_ws_da.rio.to_raster(args.out_dir / "fac_normals_gaussian_fill_20m.tif")
-    gaussian_rem_da.rio.to_raster(args.out_dir / "fac_normals_gaussian_fill_rem_20m.tif")
+    gaussian_rem_da.rio.to_raster(
+        args.out_dir / "fac_normals_gaussian_fill_rem_20m.tif"
+    )
     idw_ws_da.rio.to_raster(args.out_dir / "fac_normals_idw_fill_20m.tif")
     idw_rem_da.rio.to_raster(args.out_dir / "fac_normals_idw_fill_rem_20m.tif")
     print(f"Wrote outputs to {args.out_dir}")
