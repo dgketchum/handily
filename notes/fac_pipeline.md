@@ -78,24 +78,34 @@ water evidence mask + resnapped thalwegs
   -> support mask
 ```
 
-**NDVI Guidance Path**
+**Topology Guidance Path**
 
-Current best guidance path uses raw NDVI only as soft prior pinning.
+Current best guidance path uses raw NDVI only to identify wet seed reaches, then propagates that influence upstream through the FAC network.
 
 Call sequence:
 
 1. Compute NAIP NDVI on the `20 m` grid:
    - [`compute_naip_ndvi_match()`](/home/dgketchum/code/handily/src/handily/rem_surface_relax.py#L63)
-2. Convert NDVI to a soft prior-pin weight:
-   - [`ndvi_to_prior_pin_weight()`](/home/dgketchum/code/handily/src/handily/rem_surface_relax.py#L287)
+2. Build oriented FAC topology from shared endpoints and smoothed-DEM endpoint elevations:
+   - [`build_fac_topology()`](/home/dgketchum/code/handily/src/handily/rem_fac_topology.py)
+3. Estimate wet seed strength per FAC reach from NDVI and hard support:
+   - [`estimate_reach_seed_strength()`](/home/dgketchum/code/handily/src/handily/rem_fac_topology.py)
+4. Propagate wet influence upstream with exponential distance/elevation decay:
+   - [`propagate_upstream_wet_influence()`](/home/dgketchum/code/handily/src/handily/rem_fac_topology.py)
+5. Rasterize the resulting reach weights to the `20 m` grid:
+   - [`rasterize_reach_weights_max()`](/home/dgketchum/code/handily/src/handily/rem_fac_topology.py)
 
 High-level flow:
 
 ```text
 NAIP
   -> compute_naip_ndvi_match
-  -> ndvi_to_prior_pin_weight
-  -> prior pin-weight raster
+FAC streams + smoothed DEM + support
+  -> build_fac_topology
+  -> estimate_reach_seed_strength
+  -> propagate_upstream_wet_influence
+  -> rasterize_reach_weights_max
+  -> topology prior pin-weight raster
 ```
 
 **Relaxation Path**
@@ -110,7 +120,7 @@ Inputs:
   - usually `fac_normals_idw_fill_20m.tif`
 - DEM at `20 m`
 - hard support mask
-- NDVI-derived prior pin-weight raster
+- topology-derived prior pin-weight raster
 
 Then:
 
@@ -124,7 +134,7 @@ High-level flow:
 prior water surface
 + DEM_20m
 + hard support
-+ NDVI prior pin weights
++ topology prior pin weights
   -> relax_water_surface_ndvi_pins
   -> relaxed water surface
   -> rem_from_water_surface
@@ -155,9 +165,13 @@ water evidence mask + resnapped thalwegs
 
 NAIP
   -> compute_naip_ndvi_match
-  -> ndvi_to_prior_pin_weight
+FAC streams + smoothed DEM + support
+  -> build_fac_topology
+  -> estimate_reach_seed_strength
+  -> propagate_upstream_wet_influence
+  -> rasterize_reach_weights_max
 
-prior water surface + DEM_20m + support + NDVI pin weights
+prior water surface + DEM_20m + support + topology pin weights
   -> relax_water_surface_ndvi_pins
   -> relaxed water surface
   -> rem_from_water_surface
@@ -173,10 +187,15 @@ The main tunable boundary between “geometry” and “hydrology” is:
   - sparse raster prior
 - `rem_surface_relax.py`
   - evidence support
-  - NDVI guidance
+  - continuous relaxation using a pin-weight raster
   - continuous sag / relaxation
+- `rem_fac_topology.py`
+  - reach graph orientation
+  - wet seed detection
+  - upstream decay of wet influence
 
 That separation is useful and should be kept:
 
 - geometry can evolve independently
-- the relaxed water-surface solve can be tuned without rebuilding the FAC strip logic
+- topology can be tuned without rebuilding the FAC geometry
+- the relaxed water-surface solve can be tuned without rebuilding either the FAC geometry or the graph logic
