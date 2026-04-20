@@ -1079,37 +1079,97 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="FAC-based aspect-normal strip prototype"
     )
-    parser.add_argument("--dem-path", type=Path, default=DEFAULT_DEM)
-    parser.add_argument("--streams-path", type=Path, default=DEFAULT_STREAMS)
-    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--coarse-res-m", type=float, default=DEFAULT_COARSE_RES_M)
-    parser.add_argument("--smooth-sigma-m", type=float, default=DEFAULT_SMOOTH_SIGMA_M)
     parser.add_argument(
-        "--station-spacing-m", type=float, default=DEFAULT_STATION_SPACING_M
-    )
-    parser.add_argument("--tangent-step-m", type=float, default=DEFAULT_TANGENT_STEP_M)
-    parser.add_argument("--min-hit-dist-m", type=float, default=DEFAULT_MIN_HIT_DIST_M)
-    parser.add_argument("--min-strahler", type=int, default=0)
-    parser.add_argument("--burn-res-m", type=float, default=DEFAULT_BURN_RES_M)
-    parser.add_argument(
-        "--gaussian-sigma-px", type=float, default=DEFAULT_GAUSSIAN_SIGMA_PX
-    )
-    parser.add_argument("--idw-radius-m", type=float, default=DEFAULT_IDW_RADIUS_M)
-    parser.add_argument("--idw-power", type=float, default=DEFAULT_IDW_POWER)
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
-    parser.add_argument(
-        "--naip-path",
+        "--config",
         type=Path,
         default=None,
-        help="NAIP raster for head solve (enables longitudinal head solve)",
+        help="TOML config file (sets all defaults; CLI flags override)",
     )
-    parser.add_argument(
-        "--support-path",
-        type=Path,
-        default=None,
-        help="Pre-built support raster for head solve",
-    )
-    return parser.parse_args(argv)
+    parser.add_argument("--dem-path", type=Path, default=None)
+    parser.add_argument("--streams-path", type=Path, default=None)
+    parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument("--coarse-res-m", type=float, default=None)
+    parser.add_argument("--smooth-sigma-m", type=float, default=None)
+    parser.add_argument("--station-spacing-m", type=float, default=None)
+    parser.add_argument("--tangent-step-m", type=float, default=None)
+    parser.add_argument("--min-hit-dist-m", type=float, default=None)
+    parser.add_argument("--min-strahler", type=int, default=None)
+    parser.add_argument("--burn-res-m", type=float, default=None)
+    parser.add_argument("--idw-radius-m", type=float, default=None)
+    parser.add_argument("--idw-power", type=float, default=None)
+    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--naip-path", type=Path, default=None)
+    parser.add_argument("--support-path", type=Path, default=None)
+    cli = parser.parse_args(argv)
+
+    if cli.config is not None:
+        from handily.rem_fac_config import FacRemConfig
+
+        cfg = FacRemConfig.from_toml(cli.config)
+        # Config provides defaults; CLI flags override.
+        if cli.dem_path is None:
+            cli.dem_path = Path(cfg.dem_path)
+        if cli.streams_path is None:
+            cli.streams_path = Path(cfg.streams_path)
+        if cli.out_dir is None:
+            cli.out_dir = Path(cfg.out_dir)
+        if cli.naip_path is None and cfg.naip_path is not None:
+            cli.naip_path = Path(cfg.naip_path)
+        if cli.support_path is None and cfg.support_path is not None:
+            cli.support_path = Path(cfg.support_path)
+        if cli.coarse_res_m is None:
+            cli.coarse_res_m = cfg.coarse_res_m
+        if cli.smooth_sigma_m is None:
+            cli.smooth_sigma_m = cfg.smooth_sigma_m
+        if cli.station_spacing_m is None:
+            cli.station_spacing_m = cfg.station_spacing_m
+        if cli.tangent_step_m is None:
+            cli.tangent_step_m = cfg.tangent_step_m
+        if cli.min_hit_dist_m is None:
+            cli.min_hit_dist_m = cfg.min_hit_dist_m
+        if cli.min_strahler is None:
+            cli.min_strahler = cfg.min_strahler
+        if cli.burn_res_m is None:
+            cli.burn_res_m = cfg.burn_res_m
+        if cli.idw_radius_m is None:
+            cli.idw_radius_m = cfg.idw_radius_m
+        if cli.idw_power is None:
+            cli.idw_power = cfg.idw_power
+        if cli.workers is None:
+            cli.workers = cfg.workers
+        # Stash head-solve kwargs from config for main() to use.
+        cli.head_solve_kwargs = cfg.head_solve_kwargs()
+    else:
+        # No config — use hardcoded module defaults for paths/geometry.
+        if cli.dem_path is None:
+            cli.dem_path = DEFAULT_DEM
+        if cli.streams_path is None:
+            cli.streams_path = DEFAULT_STREAMS
+        if cli.out_dir is None:
+            cli.out_dir = DEFAULT_OUT_DIR
+        if cli.coarse_res_m is None:
+            cli.coarse_res_m = DEFAULT_COARSE_RES_M
+        if cli.smooth_sigma_m is None:
+            cli.smooth_sigma_m = DEFAULT_SMOOTH_SIGMA_M
+        if cli.station_spacing_m is None:
+            cli.station_spacing_m = DEFAULT_STATION_SPACING_M
+        if cli.tangent_step_m is None:
+            cli.tangent_step_m = DEFAULT_TANGENT_STEP_M
+        if cli.min_hit_dist_m is None:
+            cli.min_hit_dist_m = DEFAULT_MIN_HIT_DIST_M
+        if cli.min_strahler is None:
+            cli.min_strahler = 0
+        if cli.burn_res_m is None:
+            cli.burn_res_m = DEFAULT_BURN_RES_M
+        if cli.idw_radius_m is None:
+            cli.idw_radius_m = DEFAULT_IDW_RADIUS_M
+        if cli.idw_power is None:
+            cli.idw_power = DEFAULT_IDW_POWER
+        if cli.workers is None:
+            cli.workers = DEFAULT_WORKERS
+        cli.head_solve_kwargs = {}
+
+    return cli
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1182,7 +1242,13 @@ def main(argv: list[str] | None = None) -> None:
             )
             support_da = support_da.rio.set_spatial_dims(x_dim="x", y_dim="y")
 
-        heads = build_channel_heads(streams, _dem20, ndvi_da, support_da=support_da)
+        heads = build_channel_heads(
+            streams,
+            _dem20,
+            ndvi_da,
+            support_da=support_da,
+            **args.head_solve_kwargs,
+        )
         heads.to_file(args.out_dir / "fac_channel_heads.fgb", driver="FlatGeobuf")
         strips_depth = _attach_fac_strip_head_depth_offset(strips, heads)
         dt = perf_counter() - t0
