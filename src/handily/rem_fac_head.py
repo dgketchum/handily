@@ -3,6 +3,11 @@
 Solves per-reach water-surface elevation on the directed FAC graph before
 the cross-section raster workflow, so that dry headwater channels detach
 from the bed rather than producing near-zero REM in the prior.
+
+Uses a residual-depth formulation: solves for additional sag ``r`` below
+a local per-reach ceiling ``h_upper``, then recovers head as
+``h = h_upper - r``.  This keeps terrain-elevation terms local and makes
+graph smoothness operate on extra depth, not absolute hydraulic head.
 """
 
 from __future__ import annotations
@@ -23,41 +28,79 @@ from handily.rem_fac_topology import (
 LOGGER = logging.getLogger("handily.rem_fac_head")
 
 
+def _build_residual_targets(
+    streams: gpd.GeoDataFrame,
+    *,
+    distance_scale_m: float = 1500.0,
+    elevation_scale_m: float = 25.0,
+    alpha_d: float = 0.75,
+    alpha_z: float = 1.0,
+    gamma: float = 1.5,
+    rmax_min_m: float = 2.0,
+    rmax_max_m: float = 40.0,
+) -> gpd.GeoDataFrame:
+    """Derive per-reach sag targets and bounds from propagated wet influence."""
+    out = streams.copy()
+
+    w_wet = out["topo_pin_weight"].values.astype(np.float64)
+    dist = out["topo_dist_to_seed_m"].values.astype(np.float64)
+    gain = out["topo_gain_to_seed_m"].values.astype(np.float64)
+
+    dry = 1.0 - w_wet
+    f_d = 1.0 - np.exp(-dist / max(distance_scale_m, 1.0))
+    f_z = 1.0 - np.exp(-gain / max(elevation_scale_m, 1.0))
+
+    g = np.clip(np.maximum(dry, np.maximum(alpha_d * f_d, alpha_z * f_z)), 0.0, 1.0)
+
+    r_max = rmax_min_m + (rmax_max_m - rmax_min_m) * g
+    r_target = r_max * np.power(g, gamma)
+
+    out["sag_driver"] = g
+    out["r_target_m"] = r_target
+    out["r_max_m"] = r_max
+
+    return out
+
+
 def solve_channel_heads(
     topology: FacTopologyResult,
     *,
     d_min_off_support_m: float = 0.5,
-    wet_anchor_strength: float = 1.0,
-    smoothness_weight: float = 1.0,
-    max_hydraulic_slope: float = 0.002,
     support_fraction_threshold: float = 0.25,
-    max_iter: int = 200,
+    target_weight_base: float = 2.0,
+    zero_weight_base: float = 2.0,
+    smoothness_weight: float = 1.0,
+    neighbor_length_floor_m: float = 200.0,
+    max_hydraulic_slope: float = 0.002,
+    max_iter: int = 500,
     tol: float = 0.01,
 ) -> gpd.GeoDataFrame:
-    """Solve per-reach channel-head elevation via iterative projected relaxation.
+    """Solve per-reach channel-head elevation via residual-depth relaxation.
 
-    Each reach gets a solved water-surface elevation ``h`` that:
+    Solves for ``r_i >= 0`` (additional sag below a local ceiling) then
+    recovers ``h_i = h_upper_i - r_i``.
 
-    - is hard-pinned to the bed on reaches where the fraction of support
-      samples exceeds ``support_fraction_threshold``
-    - pins softly near the bed where propagated wet influence is strong
-    - rises upstream more slowly than the bed, controlled by
-      ``max_hydraulic_slope``
-    - stays smooth along the network via the smoothness term
-
-    Off-support reaches use anchor-scaled clearance:
-    ``h <= z_mid - d_min * (1 - w_wet)``, so reaches with strong
-    propagated wet influence can sit near the bed while dry reaches are
-    pushed below.
-
-    Uses ``topo_pin_weight`` (propagated upstream wet influence) when
-    available, falling back to raw ``seed_strength``.
+    Hard-pinned reaches (``seed_support_fraction >= threshold``) get
+    ``r = 0``.  Other reaches are pulled toward ``r_target`` (derived
+    from dryness / distance / elevation gain) while being smoothed along
+    the network in residual space.
     """
     streams = topology.streams
     n = len(streams)
+    empty_cols = (
+        "bed_elev_m",
+        "h_upper_m",
+        "r_target_m",
+        "r_max_m",
+        "channel_head_m",
+        "head_depth_m",
+        "target_weight",
+        "zero_weight",
+        "hard_pin",
+    )
     if n == 0:
         out = streams.copy()
-        for col in ("channel_head_m", "head_depth_m", "bed_elev_m"):
+        for col in empty_cols:
             out[col] = np.array([], dtype=np.float64)
         return out
 
@@ -67,8 +110,6 @@ def solve_channel_heads(
     z_mid = (z_up + z_down) / 2.0
     length_m = streams["length_m"].values.astype(np.float64)
 
-    # Mark reaches with non-finite bed elevations as invalid — these
-    # sampled nodata or border garbage from the DEM.
     valid = np.isfinite(z_mid)
     n_invalid = int((~valid).sum())
     if n_invalid > 0:
@@ -76,15 +117,12 @@ def solve_channel_heads(
             "  %d / %d reaches have non-finite z_mid, excluded", n_invalid, n
         )
 
-    # Prefer propagated weight (distance/elevation decay from wet seeds)
-    if "topo_pin_weight" in streams.columns:
-        w_wet = streams["topo_pin_weight"].values.astype(np.float64)
-    else:
-        w_wet = streams["seed_strength"].values.astype(np.float64)
+    w_wet = (
+        streams["topo_pin_weight"].values.astype(np.float64)
+        if "topo_pin_weight" in streams.columns
+        else streams["seed_strength"].values.astype(np.float64)
+    )
 
-    # Hard-pin reaches with substantial support evidence.
-    # Uses fractional coverage to avoid over-pinning from a single pixel
-    # at a confluence or reach break.
     if "seed_support_fraction" in streams.columns:
         hard_pin = streams["seed_support_fraction"].values >= float(
             support_fraction_threshold
@@ -94,9 +132,29 @@ def solve_channel_heads(
     else:
         hard_pin = np.zeros(n, dtype=bool)
 
-    id_to_idx = {int(sid): i for i, sid in enumerate(stream_ids)}
+    # --- local ceiling and targets ---
+    d_min = float(d_min_off_support_m)
+    h_upper = np.where(hard_pin, z_mid, z_mid - d_min)
 
-    # Pre-compute neighbor indices and connection lengths (valid reaches only)
+    r_target = (
+        streams["r_target_m"].values.astype(np.float64)
+        if "r_target_m" in streams.columns
+        else np.full(n, d_min, dtype=np.float64)
+    )
+    r_max = (
+        streams["r_max_m"].values.astype(np.float64)
+        if "r_max_m" in streams.columns
+        else np.full(n, 2.0 * d_min, dtype=np.float64)
+    )
+
+    # --- weights ---
+    w_target = target_weight_base * np.power(1.0 - w_wet, 1.0)
+    w_zero = zero_weight_base * w_wet
+    w_smooth = float(smoothness_weight)
+    L0 = float(neighbor_length_floor_m)
+
+    # --- neighbor graph ---
+    id_to_idx = {int(sid): i for i, sid in enumerate(stream_ids)}
     ds_nbrs: list[list[tuple[int, float]]] = [[] for _ in range(n)]
     us_nbrs: list[list[tuple[int, float]]] = [[] for _ in range(n)]
     for i, sid in enumerate(stream_ids):
@@ -109,24 +167,16 @@ def solve_channel_heads(
                 ds_nbrs[i].append((j, L))
                 us_nbrs[j].append((i, L))
 
-    # Process downstream-first (ascending bed elevation)
-    order = np.argsort(z_mid)
-
-    # Anchor-scaled upper bound: wet reaches can sit at the bed,
-    # dry reaches are pushed below by d_min.
-    d_min = float(d_min_off_support_m)
-    h_upper = z_mid - d_min * (1.0 - w_wet)
-
-    # Initialize: hard-pinned at bed, others at upper bound, invalid = NaN
-    h = h_upper.copy()
-    h[hard_pin] = z_mid[hard_pin]
-    h[~valid] = np.nan
+    # --- initialize residual ---
+    r = np.clip(r_target.copy(), 0.0, r_max)
+    r[hard_pin] = 0.0
+    r[~valid] = np.nan
 
     s_max = float(max_hydraulic_slope)
-    w_anchor = float(wet_anchor_strength)
-    w_smooth = float(smoothness_weight)
     n_hard = int(hard_pin.sum())
     LOGGER.info("  %d / %d reaches hard-pinned by support", n_hard, n)
+
+    order = np.argsort(z_mid)
 
     for iteration in range(int(max_iter)):
         max_change = 0.0
@@ -135,39 +185,30 @@ def solve_channel_heads(
             if hard_pin[i] or not valid[i]:
                 continue
 
-            # Weighted target: anchor pulls toward the local upper bound
-            # (bed minus clearance), smoothness pulls toward neighbors.
-            # Anchor weight is constant so dry reaches aren't dominated
-            # by network smoothing; wet/dry distinction is already encoded
-            # in h_upper via the clearance term.
-            w_a = w_anchor
-            num = w_a * h_upper[i]
-            den = w_a
+            num = w_target[i] * r_target[i] + w_zero[i] * 0.0
+            den = w_target[i] + w_zero[i]
 
             for j, L in ds_nbrs[i]:
-                w_s = w_smooth / max(L, 1.0)
-                num += w_s * h[j]
-                den += w_s
+                w_ij = w_smooth / max(L, L0)
+                num += w_ij * r[j]
+                den += w_ij
             for j, L in us_nbrs[i]:
-                w_s = w_smooth / max(L, 1.0)
-                num += w_s * h[j]
-                den += w_s
+                w_ij = w_smooth / max(L, L0)
+                num += w_ij * r[j]
+                den += w_ij
 
-            h_new = num / den if den > 1e-12 else h[i]
+            r_new = num / den if den > 1e-12 else r[i]
 
-            # Upper bound: anchor-scaled clearance
-            h_new = min(h_new, h_upper[i])
-
-            # Max hydraulic slope: h can't rise faster than s_max per
-            # unit length relative to downstream neighbors
+            # Max hydraulic slope in recovered-head space:
+            # h_i - h_j <= s_max * L  =>  r_i >= r_j + h_upper_i - h_upper_j - s_max * L
             for j, L in ds_nbrs[i]:
-                h_new = min(h_new, h[j] + s_max * L)
+                r_floor = r[j] + h_upper[i] - h_upper[j] - s_max * L
+                r_new = max(r_new, r_floor)
 
-            # Hard ceiling at the bed
-            h_new = min(h_new, z_mid[i])
+            r_new = max(0.0, min(r_new, r_max[i]))
 
-            max_change = max(max_change, abs(h_new - h[i]))
-            h[i] = h_new
+            max_change = max(max_change, abs(r_new - r[i]))
+            r[i] = r_new
 
         if iteration % 50 == 0 or max_change < float(tol):
             LOGGER.info("  iteration %d: max_change=%.4f m", iteration + 1, max_change)
@@ -181,10 +222,18 @@ def solve_channel_heads(
             max_change,
         )
 
+    h = h_upper - r
+
     out = streams.copy()
+    out["bed_elev_m"] = z_mid
+    out["h_upper_m"] = h_upper
+    out["r_target_m"] = r_target
+    out["r_max_m"] = r_max
     out["channel_head_m"] = h
     out["head_depth_m"] = z_mid - h
-    out["bed_elev_m"] = z_mid
+    out["target_weight"] = w_target
+    out["zero_weight"] = w_zero
+    out["hard_pin"] = hard_pin
     return out
 
 
@@ -204,22 +253,24 @@ def build_channel_heads(
     elevation_scale_m: float = 25.0,
     strahler_distance_scale: float = 0.5,
     d_min_off_support_m: float = 0.5,
-    wet_anchor_strength: float = 1.0,
-    smoothness_weight: float = 1.0,
-    max_hydraulic_slope: float = 0.002,
     support_fraction_threshold: float = 0.25,
-    max_iter: int = 200,
+    target_weight_base: float = 2.0,
+    zero_weight_base: float = 2.0,
+    smoothness_weight: float = 1.0,
+    neighbor_length_floor_m: float = 200.0,
+    max_hydraulic_slope: float = 0.002,
+    alpha_d: float = 0.75,
+    alpha_z: float = 1.0,
+    gamma: float = 1.5,
+    rmax_min_m: float = 2.0,
+    rmax_max_m: float = 40.0,
+    max_iter: int = 500,
     tol: float = 0.01,
 ) -> gpd.GeoDataFrame:
-    """End-to-end: topology, wet anchors, upstream propagation, graph solve.
-
-    Returns a GeoDataFrame with the original reach geometries plus solved
-    ``channel_head_m``, ``head_depth_m``, and diagnostics.
-    """
+    """End-to-end: topology, wet anchors, upstream propagation, sag targets, graph solve."""
     LOGGER.info("Building FAC topology (%d reaches)", len(streams_gdf))
     topo = build_fac_topology(streams_gdf, elev_da, node_precision=node_precision)
 
-    # Preserve reach_id from input (topology build drops it)
     if "reach_id" in streams_gdf.columns:
         sid_to_rid = dict(
             zip(
@@ -252,14 +303,28 @@ def build_channel_heads(
         strahler_distance_scale=strahler_distance_scale,
     )
 
-    LOGGER.info("Solving channel heads")
+    LOGGER.info("Building residual sag targets")
+    topo.streams = _build_residual_targets(
+        topo.streams,
+        distance_scale_m=distance_scale_m,
+        elevation_scale_m=elevation_scale_m,
+        alpha_d=alpha_d,
+        alpha_z=alpha_z,
+        gamma=gamma,
+        rmax_min_m=rmax_min_m,
+        rmax_max_m=rmax_max_m,
+    )
+
+    LOGGER.info("Solving channel heads (residual-depth)")
     return solve_channel_heads(
         topo,
         d_min_off_support_m=d_min_off_support_m,
-        wet_anchor_strength=wet_anchor_strength,
-        smoothness_weight=smoothness_weight,
-        max_hydraulic_slope=max_hydraulic_slope,
         support_fraction_threshold=support_fraction_threshold,
+        target_weight_base=target_weight_base,
+        zero_weight_base=zero_weight_base,
+        smoothness_weight=smoothness_weight,
+        neighbor_length_floor_m=neighbor_length_floor_m,
+        max_hydraulic_slope=max_hydraulic_slope,
         max_iter=max_iter,
         tol=tol,
     )
