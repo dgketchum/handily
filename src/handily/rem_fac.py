@@ -626,6 +626,67 @@ def _attach_fac_strip_head_elevations(
     return strips
 
 
+def _attach_fac_strip_head_depth_offset(
+    strips: gpd.GeoDataFrame,
+    heads_gdf: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Lower strip base/endpoint elevations by solved head_depth_m.
+
+    Instead of overriding DEM elevations with an absolute channel_head_m
+    (which causes sawtooth REM on long reaches), this applies head_depth_m
+    as a constant depth offset below the original DEM-sampled base.  The
+    water surface then follows the bed slope at constant depth per reach.
+    """
+    if strips.empty:
+        return strips
+
+    strips = strips.copy()
+
+    depth_by_stream = dict(
+        zip(
+            heads_gdf["stream_id"].astype(int),
+            heads_gdf["head_depth_m"].astype(np.float64),
+        )
+    )
+    depth_by_reach: dict[int, float] = {}
+    if "reach_id" in heads_gdf.columns:
+        depth_by_reach = dict(
+            zip(
+                heads_gdf["reach_id"].astype(int),
+                heads_gdf["head_depth_m"].astype(np.float64),
+            )
+        )
+
+    # Lower base elevation by source reach's depth
+    base_depths = np.array(
+        [depth_by_stream.get(int(sid), 0.0) for sid in strips["stream_id"]],
+        dtype=np.float64,
+    )
+    strips["base_elev_m"] = strips["base_elev_m"].values - base_depths
+
+    # Lower interreach endpoint by target reach's depth
+    interreach = strips["hit_type"].eq("interreach").to_numpy()
+    if interreach.any() and depth_by_reach:
+        ep_depths = np.array(
+            [
+                depth_by_reach.get(int(rid), 0.0)
+                for rid in strips.loc[interreach, "target_reach_id"]
+            ],
+            dtype=np.float64,
+        )
+        idx_ir = strips.index[interreach]
+        strips.loc[idx_ir, "endpoint_elev_m"] = (
+            strips.loc[idx_ir, "endpoint_elev_m"].values - ep_depths
+        )
+
+    # Edge strips: endpoint = base
+    edge = strips["hit_type"].eq("edge").to_numpy()
+    if edge.any():
+        strips.loc[edge, "endpoint_elev_m"] = strips.loc[edge, "base_elev_m"].values
+
+    return strips
+
+
 def generate_fac_strips(
     streams_gdf: gpd.GeoDataFrame,
     dem_da: xr.DataArray,
@@ -1123,7 +1184,7 @@ def main(argv: list[str] | None = None) -> None:
 
         heads = build_channel_heads(streams, _dem20, ndvi_da, support_da=support_da)
         heads.to_file(args.out_dir / "fac_channel_heads.fgb", driver="FlatGeobuf")
-        strips = _attach_fac_strip_head_elevations(strips, heads)
+        strips_depth = _attach_fac_strip_head_depth_offset(strips, heads)
         dt = perf_counter() - t0
         depth = heads["head_depth_m"]
         print(
@@ -1131,110 +1192,50 @@ def main(argv: list[str] | None = None) -> None:
             f"head depth: min={depth.min():.2f} mean={depth.mean():.2f} "
             f"max={depth.max():.2f} m"
         )
+    else:
+        strips_depth = None
 
-    print("Building wedge polygons")
-    wedges = build_fac_wedges(strips)
-    print(f"  wedges: {len(wedges)}")
+    # --- Depth-offset REM (head_depth as constant offset below local bed) ---
+    if strips_depth is not None:
+        print(f"Burning depth-offset sparse raster at {args.burn_res_m:.1f} m")
+        t0 = perf_counter()
+        sparse_hd_da, sparse_hd_count = rasterize_sparse_sections_20m(
+            strips_depth,
+            dem_da,
+            res_m=args.burn_res_m,
+        )
+        dt = perf_counter() - t0
+        burned = int(np.isfinite(sparse_hd_da.values).sum())
+        total = int(sparse_hd_da.values.size)
+        print(
+            f"  sparse burn: {burned}/{total} pixels "
+            f"({100.0 * burned / max(total, 1):.1f}%), {dt:.2f}s"
+        )
 
-    print(f"Burning sparse section raster at {args.burn_res_m:.1f} m")
-    t0 = perf_counter()
-    sparse_ws_da, sparse_count_da = rasterize_sparse_sections_20m(
-        strips,
-        dem_da,
-        res_m=args.burn_res_m,
-    )
-    dt = perf_counter() - t0
-    burned = int(np.isfinite(sparse_ws_da.values).sum())
-    total = int(sparse_ws_da.values.size)
-    max_count = (
-        float(np.nanmax(sparse_count_da.values)) if sparse_count_da.values.size else 0.0
-    )
-    print(
-        f"  sparse burn: {burned}/{total} pixels "
-        f"({100.0 * burned / max(total, 1):.1f}%), "
-        f"max overlap count={max_count:.0f}, "
-        f"{dt:.2f}s",
-    )
+        print("IDW-filling depth-offset raster")
+        t0 = perf_counter()
+        dem20_da = sample_dem_to_grid(
+            dem_da,
+            sparse_hd_da.x.values.astype(np.float64),
+            sparse_hd_da.y.values.astype(np.float64),
+        )
+        hd_idw_ws_da, hd_idw_rem_da = fill_sparse_sections_idw(
+            sparse_hd_da,
+            sparse_hd_count,
+            dem20_da,
+            radius_m=args.idw_radius_m,
+            power=args.idw_power,
+        )
+        dt = perf_counter() - t0
+        hd_filled = int(np.isfinite(hd_idw_ws_da.values).sum())
+        print(f"  idw fill: {hd_filled}/{total} pixels, {dt:.2f}s")
 
-    print("Nearest-filling sparse raster")
-    t0 = perf_counter()
-    dem20_da = sample_dem_to_grid(
-        dem_da,
-        sparse_ws_da.x.values.astype(np.float64),
-        sparse_ws_da.y.values.astype(np.float64),
-    )
-    filled_ws_da, nearest_dist_da, rem20_da = fill_sparse_sections_nearest(
-        sparse_ws_da,
-        dem20_da,
-    )
-    dt = perf_counter() - t0
-    filled = int(np.isfinite(filled_ws_da.values).sum())
-    total = int(filled_ws_da.values.size)
-    max_dist = (
-        float(np.nanmax(nearest_dist_da.values)) if nearest_dist_da.values.size else 0.0
-    )
-    print(
-        f"  nearest fill: {filled}/{total} pixels "
-        f"({100.0 * filled / max(total, 1):.1f}%), "
-        f"max source distance={max_dist:.1f} m, "
-        f"{dt:.2f}s",
-    )
+        sparse_hd_da.rio.to_raster(args.out_dir / "fac_head_depth_sparse_20m.tif")
+        hd_idw_ws_da.rio.to_raster(args.out_dir / "fac_head_depth_idw_fill_20m.tif")
+        hd_idw_rem_da.rio.to_raster(args.out_dir / "fac_head_depth_rem_20m.tif")
+        print("Wrote fac_head_depth_rem_20m.tif")
 
-    print(f"Gaussian-filling sparse raster (sigma={args.gaussian_sigma_px:.1f} px)")
-    t0 = perf_counter()
-    gaussian_ws_da, gaussian_rem_da = fill_sparse_sections_gaussian(
-        sparse_ws_da,
-        sparse_count_da,
-        dem20_da,
-        sigma_px=args.gaussian_sigma_px,
-    )
-    dt = perf_counter() - t0
-    gaussian_filled = int(np.isfinite(gaussian_ws_da.values).sum())
-    print(
-        f"  gaussian fill: {gaussian_filled}/{total} pixels "
-        f"({100.0 * gaussian_filled / max(total, 1):.1f}%), "
-        f"{dt:.2f}s",
-    )
-
-    print(
-        f"IDW-filling sparse raster (radius={args.idw_radius_m:.1f} m, "
-        f"power={args.idw_power:.1f})"
-    )
-    t0 = perf_counter()
-    idw_ws_da, idw_rem_da = fill_sparse_sections_idw(
-        sparse_ws_da,
-        sparse_count_da,
-        dem20_da,
-        radius_m=args.idw_radius_m,
-        power=args.idw_power,
-    )
-    dt = perf_counter() - t0
-    idw_filled = int(np.isfinite(idw_ws_da.values).sum())
-    print(
-        f"  idw fill: {idw_filled}/{total} pixels "
-        f"({100.0 * idw_filled / max(total, 1):.1f}%), "
-        f"{dt:.2f}s",
-    )
-
-    strips.to_file(args.out_dir / "fac_normals_cross_sections.fgb", driver="FlatGeobuf")
-    wedges.to_file(args.out_dir / "fac_normals_wedges.fgb", driver="FlatGeobuf")
-    sparse_ws_da.rio.to_raster(args.out_dir / "fac_normals_sparse_sections_20m.tif")
-    sparse_count_da.rio.to_raster(
-        args.out_dir / "fac_normals_sparse_sections_count_20m.tif"
-    )
-    dem20_da.rio.to_raster(args.out_dir / "fac_normals_dem_20m.tif")
-    filled_ws_da.rio.to_raster(args.out_dir / "fac_normals_nearest_fill_20m.tif")
-    nearest_dist_da.rio.to_raster(
-        args.out_dir / "fac_normals_nearest_fill_distance_20m.tif"
-    )
-    rem20_da.rio.to_raster(args.out_dir / "fac_normals_rem_20m.tif")
-    gaussian_ws_da.rio.to_raster(args.out_dir / "fac_normals_gaussian_fill_20m.tif")
-    gaussian_rem_da.rio.to_raster(
-        args.out_dir / "fac_normals_gaussian_fill_rem_20m.tif"
-    )
-    idw_ws_da.rio.to_raster(args.out_dir / "fac_normals_idw_fill_20m.tif")
-    idw_rem_da.rio.to_raster(args.out_dir / "fac_normals_idw_fill_rem_20m.tif")
-    print(f"Wrote outputs to {args.out_dir}")
+    print(f"Done — outputs in {args.out_dir}")
 
 
 if __name__ == "__main__":
