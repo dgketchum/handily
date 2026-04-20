@@ -1058,6 +1058,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Loading DEM: {args.dem_path}")
     dem_da = rioxarray.open_rasterio(args.dem_path).squeeze("band", drop=True)
     dem_da = dem_da.rio.set_spatial_dims(x_dim="x", y_dim="y")
+    # Mask fill-value sentinels (e.g. -999999) that lack nodata metadata.
+    dem_da = dem_da.where(dem_da > -1e5)
 
     print(f"Loading FAC streams: {args.streams_path}")
     streams = gpd.read_file(args.streams_path)
@@ -1119,9 +1121,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             support_da = support_da.rio.set_spatial_dims(x_dim="x", y_dim="y")
 
-        heads = build_channel_heads(
-            streams, field.smoothed_dem, ndvi_da, support_da=support_da
-        )
+        heads = build_channel_heads(streams, _dem20, ndvi_da, support_da=support_da)
         heads.to_file(args.out_dir / "fac_channel_heads.fgb", driver="FlatGeobuf")
         strips = _attach_fac_strip_head_elevations(strips, heads)
         dt = perf_counter() - t0
