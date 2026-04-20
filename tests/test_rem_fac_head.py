@@ -150,6 +150,44 @@ def test_short_reach_gets_soft_anchor_not_hard_pin():
     assert by_id.loc[3, "seed_strength"] == 1.0
 
 
+def test_short_reach_shared_endpoint_pixel_not_hard_pinned():
+    """A sub-pixel reach with support only at its shared endpoint must not be hard-pinned."""
+    geoms = [
+        LineString([(0.5, 0.5), (1.5, 0.5)]),
+        LineString([(1.5, 0.5), (2.5, 0.5)]),
+        # 0.3 m reach — shorter than a grid pixel
+        LineString([(2.5, 0.5), (2.8, 0.5)]),
+    ]
+    streams = gpd.GeoDataFrame(
+        {
+            "stream_id": [1, 2, 3],
+            "reach_id": [10, 20, 30],
+            "strahler": [1, 1, 2],
+            "length_m": [1.0, 1.0, 0.3],
+            "geometry": geoms,
+        },
+        geometry="geometry",
+        crs="EPSG:5070",
+    )
+    elev = _sloped_elev()
+    topo = build_fac_topology(streams, elev)
+
+    ndvi = _grid(np.full((3, 5), 0.0, dtype=np.float64))
+    # Support ONLY at col 2 (x=2.5) — the shared vertex between reaches 2 and 3.
+    # The short reach's midpoint (x=2.65) falls in the same pixel.
+    support = _grid(np.zeros((3, 5), dtype=np.float64))
+    support.values[2, 2] = 1.0
+
+    topo.streams = estimate_reach_seed_strength(
+        topo.streams, ndvi, support_da=support, sample_spacing_m=0.5
+    )
+    by_id = topo.streams.set_index("stream_id")
+    # fraction must be 0 — short reach has no interior samples
+    assert by_id.loc[3, "seed_support_fraction"] == 0.0
+    # reach 2 also must not be hard-pinned (endpoint excluded)
+    assert by_id.loc[2, "seed_support_fraction"] == 0.0
+
+
 def test_solve_channel_heads_hard_pin_resists_neighbor_smoothing():
     """Hard-pinned reaches must stay at bed even with strong smoothing."""
     topo = _seeded_topo(support_reach=3)
