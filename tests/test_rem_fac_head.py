@@ -111,8 +111,8 @@ def test_support_at_shared_endpoint_does_not_hard_pin_neighbor():
     assert fracs.loc[3] == 0.0, f"reach 3 fraction {fracs.loc[3]} should be 0"
 
 
-def test_short_supported_reach_can_be_hard_pinned():
-    """A reach shorter than sample_spacing should still get fraction > 0 via midpoint."""
+def test_short_reach_gets_soft_anchor_not_hard_pin():
+    """A sub-spacing reach cannot be hard-pinned — fraction stays 0, hit is soft."""
     geoms = [
         LineString([(0.5, 0.5), (1.5, 0.5)]),
         LineString([(1.5, 0.5), (2.5, 0.5)]),
@@ -134,7 +134,7 @@ def test_short_supported_reach_can_be_hard_pinned():
     topo = build_fac_topology(streams, elev)
 
     ndvi = _grid(np.full((3, 5), 0.0, dtype=np.float64))
-    # Fill support across cols 2-3 so the midpoint of reach 3 is covered
+    # Fill support across cols 2-3 covering reach 3's endpoints
     support = _grid(np.zeros((3, 5), dtype=np.float64))
     support.values[2, 2] = 1.0
     support.values[2, 3] = 1.0
@@ -142,8 +142,12 @@ def test_short_supported_reach_can_be_hard_pinned():
     topo.streams = estimate_reach_seed_strength(
         topo.streams, ndvi, support_da=support, sample_spacing_m=0.5
     )
-    fracs = topo.streams.set_index("stream_id")["seed_support_fraction"]
-    assert fracs.loc[3] > 0.0, f"short reach fraction {fracs.loc[3]} should be > 0"
+    by_id = topo.streams.set_index("stream_id")
+    # No interior samples → fraction stays 0 → not hard-pinnable
+    assert by_id.loc[3, "seed_support_fraction"] == 0.0
+    # But full-line hit still fires → soft anchor via seed_strength override
+    assert bool(by_id.loc[3, "seed_support_hit"]) is True
+    assert by_id.loc[3, "seed_strength"] == 1.0
 
 
 def test_solve_channel_heads_hard_pin_resists_neighbor_smoothing():
@@ -168,15 +172,6 @@ def test_solve_channel_heads_dry_headwaters_detach():
     # All dry -> topo_pin_weight near zero -> clearance near d_min
     # (tiny residual sigmoid weight reduces clearance slightly from 0.5)
     assert (by_id["head_depth_m"] >= 0.45).all()
-
-
-def test_solve_channel_heads_monotonicity():
-    """Solved h should not decrease upstream (h_up >= h_down)."""
-    topo = _seeded_topo(support_reach=None)
-    heads = solve_channel_heads(topo, d_min_off_support_m=0.5)
-    by_id = heads.set_index("stream_id")
-    assert by_id.loc[1, "channel_head_m"] >= by_id.loc[2, "channel_head_m"]
-    assert by_id.loc[2, "channel_head_m"] >= by_id.loc[3, "channel_head_m"]
 
 
 def test_solve_channel_heads_max_slope():

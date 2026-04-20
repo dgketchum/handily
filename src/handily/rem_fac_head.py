@@ -67,6 +67,15 @@ def solve_channel_heads(
     z_mid = (z_up + z_down) / 2.0
     length_m = streams["length_m"].values.astype(np.float64)
 
+    # Mark reaches with non-finite bed elevations as invalid — these
+    # sampled nodata or border garbage from the DEM.
+    valid = np.isfinite(z_mid)
+    n_invalid = int((~valid).sum())
+    if n_invalid > 0:
+        LOGGER.warning(
+            "  %d / %d reaches have non-finite z_mid, excluded", n_invalid, n
+        )
+
     # Prefer propagated weight (distance/elevation decay from wet seeds)
     if "topo_pin_weight" in streams.columns:
         w_wet = streams["topo_pin_weight"].values.astype(np.float64)
@@ -87,13 +96,15 @@ def solve_channel_heads(
 
     id_to_idx = {int(sid): i for i, sid in enumerate(stream_ids)}
 
-    # Pre-compute neighbor indices and connection lengths
+    # Pre-compute neighbor indices and connection lengths (valid reaches only)
     ds_nbrs: list[list[tuple[int, float]]] = [[] for _ in range(n)]
     us_nbrs: list[list[tuple[int, float]]] = [[] for _ in range(n)]
     for i, sid in enumerate(stream_ids):
+        if not valid[i]:
+            continue
         for ds_id in topology.downstream.get(int(sid), ()):
             j = id_to_idx.get(int(ds_id))
-            if j is not None:
+            if j is not None and valid[j]:
                 L = (length_m[i] + length_m[j]) / 2.0
                 ds_nbrs[i].append((j, L))
                 us_nbrs[j].append((i, L))
@@ -106,9 +117,10 @@ def solve_channel_heads(
     d_min = float(d_min_off_support_m)
     h_upper = z_mid - d_min * (1.0 - w_wet)
 
-    # Initialize: hard-pinned at bed, others at upper bound
+    # Initialize: hard-pinned at bed, others at upper bound, invalid = NaN
     h = h_upper.copy()
     h[hard_pin] = z_mid[hard_pin]
+    h[~valid] = np.nan
 
     s_max = float(max_hydraulic_slope)
     w_anchor = float(wet_anchor_strength)
@@ -120,13 +132,16 @@ def solve_channel_heads(
         max_change = 0.0
 
         for i in order:
-            if hard_pin[i]:
+            if hard_pin[i] or not valid[i]:
                 continue
 
-            # Weighted target: anchor pulls toward bed, smoothness toward
-            # neighbors
-            w_a = w_anchor * float(w_wet[i])
-            num = w_a * z_mid[i]
+            # Weighted target: anchor pulls toward the local upper bound
+            # (bed minus clearance), smoothness pulls toward neighbors.
+            # Anchor weight is constant so dry reaches aren't dominated
+            # by network smoothing; wet/dry distinction is already encoded
+            # in h_upper via the clearance term.
+            w_a = w_anchor
+            num = w_a * h_upper[i]
             den = w_a
 
             for j, L in ds_nbrs[i]:
@@ -143,11 +158,8 @@ def solve_channel_heads(
             # Upper bound: anchor-scaled clearance
             h_new = min(h_new, h_upper[i])
 
-            # Monotonicity: h >= all downstream neighbors
-            for j, _ in ds_nbrs[i]:
-                h_new = max(h_new, h[j])
-
-            # Max hydraulic slope
+            # Max hydraulic slope: h can't rise faster than s_max per
+            # unit length relative to downstream neighbors
             for j, L in ds_nbrs[i]:
                 h_new = min(h_new, h[j] + s_max * L)
 

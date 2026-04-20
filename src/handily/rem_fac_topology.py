@@ -202,16 +202,15 @@ def estimate_reach_seed_strength(
             svals = _sample_line_values(row.geometry, support_interp, sample_spacing_m)
             # Drop first and last samples (endpoints) to avoid leaking
             # support across shared confluence/reach-break vertices.
-            # For very short reaches (≤ 2 samples), sample the midpoint
-            # instead — it is never shared with a neighbor.
-            if len(svals) > 2:
-                svals_interior = svals[1:-1]
-            else:
-                mid_pt = row.geometry.interpolate(0.5, normalized=True)
-                mid_val = support_interp(np.array([[mid_pt.y, mid_pt.x]]))[0]
-                svals_interior = np.array([mid_val], dtype=np.float64)
+            # Reaches with ≤ 2 samples (shorter than sample_spacing) have
+            # no true interior points, so seed_support_fraction stays 0 —
+            # they are too short to assess support independently and must
+            # not be hard-pinned. They can still get a soft anchor via
+            # seed_support_hit from the full-line fallback.
+            svals_interior = (
+                svals[1:-1] if len(svals) > 2 else np.array([], dtype=svals.dtype)
+            )
             svals_valid = svals_interior[np.isfinite(svals_interior)]
-            # Full-line samples still used for hit detection (soft anchor)
             svals_all = svals[np.isfinite(svals)]
             if len(svals_valid) > 0:
                 frac = float(np.sum(svals_valid > 0.5)) / len(svals_valid)
