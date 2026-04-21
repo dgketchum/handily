@@ -28,8 +28,12 @@ logging.basicConfig(
 
 def main():
     parser = argparse.ArgumentParser(description="Build regional FAC stream network")
-    parser.add_argument("--wbd-path", required=True, help="Path to WBDHU6 shapefile")
-    parser.add_argument("--huc6", required=True, help="HUC6 code (e.g. 160401)")
+    parser.add_argument("--wbd-path", required=True, help="Path to WBD shapefile")
+    huc_group = parser.add_mutually_exclusive_group(required=True)
+    huc_group.add_argument("--huc6", help="HUC6 code (e.g. 160401)")
+    huc_group.add_argument(
+        "--huc8", nargs="+", help="One or more HUC8 codes (e.g. 10020004 10020002)"
+    )
     parser.add_argument("--out-dir", required=True, help="Output directory")
     parser.add_argument(
         "--threshold", type=int, default=5000, help="FAC cell threshold"
@@ -40,12 +44,21 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load basin boundary
-    huc6_gdf = gpd.read_file(args.wbd_path)
-    basin = huc6_gdf[huc6_gdf["huc6"] == args.huc6]
-    if basin.empty:
-        raise ValueError(f"HUC6 {args.huc6} not found in {args.wbd_path}")
-    print(f"Basin: {basin['name'].iloc[0]} ({args.huc6})")
+    # Load basin boundary — supports HUC6 or HUC8 (union of multiple)
+    wbd_gdf = gpd.read_file(args.wbd_path)
+    if args.huc6:
+        basin = wbd_gdf[wbd_gdf["huc6"] == args.huc6]
+        if basin.empty:
+            raise ValueError(f"HUC6 {args.huc6} not found in {args.wbd_path}")
+        label = f"{basin['name'].iloc[0]} ({args.huc6})"
+    else:
+        col = "huc8" if "huc8" in wbd_gdf.columns else "HUC8"
+        basin = wbd_gdf[wbd_gdf[col].isin(args.huc8)]
+        if basin.empty:
+            raise ValueError(f"HUC8 {args.huc8} not found in {args.wbd_path}")
+        names = ", ".join(basin["name"].unique())
+        label = f"{names} ({'+'.join(args.huc8)})"
+    print(f"Basin: {label}")
 
     # Bbox in WGS84 for tile selection
     basin_4326 = basin.to_crs(epsg=4326)
