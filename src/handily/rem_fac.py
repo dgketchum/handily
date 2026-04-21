@@ -24,6 +24,7 @@ import geopandas as gpd
 import numpy as np
 import rioxarray
 import xarray as xr
+from rasterio.enums import Resampling as RioResampling
 from rasterio.features import shapes
 from rasterio.transform import Affine
 from scipy.interpolate import RegularGridInterpolator
@@ -108,19 +109,18 @@ def _build_raster_interp(arr: np.ndarray, x_vals: np.ndarray, y_vals: np.ndarray
     )
 
 
-def _burn_section_to_accumulators(
+def _sample_section_pixels(
     section_geom: LineString,
     base_elev: float,
     endpoint_elev: float,
-    sum_wz: np.ndarray,
-    sum_w: np.ndarray,
     x_vals: np.ndarray,
     y_vals: np.ndarray,
-) -> None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Return (rows, cols, elevs) for pixels along a strip."""
     line_coords = np.array(section_geom.coords, dtype=np.float64)[:, :2]
     n_verts = len(line_coords)
     if n_verts < 2:
-        return
+        return None
     seg_dx = np.diff(line_coords[:, 0])
     seg_dy = np.diff(line_coords[:, 1])
     seg_len = np.sqrt(seg_dx**2 + seg_dy**2)
@@ -129,7 +129,7 @@ def _burn_section_to_accumulators(
     np.cumsum(seg_len, out=cum_len[1:])
     total = float(cum_len[-1])
     if total < 1e-6:
-        return
+        return None
 
     res_x = abs(float(x_vals[1] - x_vals[0]))
     res_y = abs(float(y_vals[1] - y_vals[0]))
@@ -151,12 +151,31 @@ def _burn_section_to_accumulators(
 
     cols = np.round((sx - x_vals[0]) / res_x).astype(np.intp)
     rows = np.round((y_vals[0] - sy) / res_y).astype(np.intp)
-    ny, nx = sum_w.shape
+    ny = len(y_vals)
+    nx = len(x_vals)
     valid = (rows >= 0) & (rows < ny) & (cols >= 0) & (cols < nx) & np.isfinite(elevs)
     if not np.any(valid):
+        return None
+    return rows[valid], cols[valid], elevs[valid]
+
+
+def _burn_section_to_accumulators(
+    section_geom: LineString,
+    base_elev: float,
+    endpoint_elev: float,
+    sum_wz: np.ndarray,
+    sum_w: np.ndarray,
+    x_vals: np.ndarray,
+    y_vals: np.ndarray,
+) -> None:
+    result = _sample_section_pixels(
+        section_geom, base_elev, endpoint_elev, x_vals, y_vals
+    )
+    if result is None:
         return
-    np.add.at(sum_wz, (rows[valid], cols[valid]), elevs[valid])
-    np.add.at(sum_w, (rows[valid], cols[valid]), 1.0)
+    rows, cols, elevs = result
+    np.add.at(sum_wz, (rows, cols), elevs)
+    np.add.at(sum_w, (rows, cols), 1.0)
 
 
 def _nan_gaussian_2d(arr: np.ndarray, sigma_px: float) -> np.ndarray:
@@ -420,6 +439,7 @@ def _generate_strip_rows_for_chunk(
     station_spacing_m: float,
     tangent_step_m: float,
     min_hit_dist_m: float,
+    halo_n: int = 0,
 ) -> list[dict]:
     assert _WORKER_STATE is not None
     out: list[dict] = []
@@ -432,11 +452,14 @@ def _generate_strip_rows_for_chunk(
     stream_geoms = _WORKER_STATE["stream_geoms"]
     stream_ids = _WORKER_STATE["stream_ids"]
 
+    halo_half_len = station_spacing_m * 8.0
+
     for rec in records:
         line = rec["geometry"]
         if line is None or line.is_empty or float(line.length) <= 1e-6:
             continue
         s_vals = _station_s_values(line, station_spacing_m)
+        n_on_stream = len(s_vals)
         for station_id, s_m in enumerate(s_vals):
             base_pt = line.interpolate(float(s_m))
             base_xy = np.array([float(base_pt.x), float(base_pt.y)], dtype=np.float64)
@@ -520,6 +543,58 @@ def _generate_strip_rows_for_chunk(
                         "orientation_source": orient_src,
                         "slope_mag": slope_mag,
                         "geometry": LineString([tuple(base_xy), tuple(endpoint_xy)]),
+                    }
+                )
+
+        # --- Halo: dandelion fan of spokes from terminal stream endpoints ---
+        if halo_n <= 0:
+            continue
+        terminal_start = rec.get("terminal_start", False)
+        terminal_end = rec.get("terminal_end", False)
+        if not terminal_start and not terminal_end:
+            continue
+        total_len = float(line.length)
+        tan_start = -_line_tangent(line, 0.0, tangent_step_m)
+        tan_end = _line_tangent(line, total_len, tangent_step_m)
+        endpoints = []
+        if terminal_start:
+            endpoints.append((0, tan_start, 0.0))
+        if terminal_end:
+            endpoints.append((1, tan_end, total_len))
+        for end_idx, tan_vec, ref_s in endpoints:
+            if not np.isfinite(tan_vec[0]):
+                continue
+            ref_pt = line.interpolate(ref_s)
+            base_xy = np.array([float(ref_pt.x), float(ref_pt.y)], dtype=np.float64)
+            # Fan halo_n spokes over a 180° arc centered on the outward tangent
+            center_angle = float(np.arctan2(tan_vec[1], tan_vec[0]))
+            for h_i in range(halo_n):
+                theta = center_angle - np.pi / 2 + np.pi * (h_i + 0.5) / halo_n
+                spoke_dir = np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
+                ep_xy = base_xy + spoke_dir * halo_half_len
+                angle_deg = float((np.degrees(theta) + 360.0) % 360.0)
+                cross = float(tan_vec[0] * spoke_dir[1] - tan_vec[1] * spoke_dir[0])
+                side = "left" if cross > 0.0 else "right"
+                sid = n_on_stream + end_idx * halo_n + h_i
+                out.append(
+                    {
+                        "reach_id": int(rec["reach_id"]),
+                        "stream_id": int(rec["stream_id"]),
+                        "strahler": rec["strahler"],
+                        "station_id": int(sid),
+                        "s_m": float(ref_s),
+                        "side": side,
+                        "hit_type": "halo",
+                        "target_reach_id": -1,
+                        "dist_m": float(halo_half_len),
+                        "base_x": float(base_xy[0]),
+                        "base_y": float(base_xy[1]),
+                        "endpoint_x": float(ep_xy[0]),
+                        "endpoint_y": float(ep_xy[1]),
+                        "angle_deg": angle_deg,
+                        "orientation_source": "halo",
+                        "slope_mag": np.nan,
+                        "geometry": LineString([tuple(base_xy), tuple(ep_xy)]),
                     }
                 )
     return out
@@ -618,10 +693,14 @@ def _attach_fac_strip_head_elevations(
         if has_ep.any():
             strips.loc[idx_ir[has_ep], "endpoint_elev_m"] = ep_heads[has_ep]
 
-    # Edge strips: endpoint = base
-    edge = strips["hit_type"].eq("edge").to_numpy()
-    if edge.any():
-        strips.loc[edge, "endpoint_elev_m"] = strips.loc[edge, "base_elev_m"].values
+    # Edge and halo strips: endpoint = base
+    edge_or_halo = (
+        strips["hit_type"].eq("edge") | strips["hit_type"].eq("halo")
+    ).to_numpy()
+    if edge_or_halo.any():
+        strips.loc[edge_or_halo, "endpoint_elev_m"] = strips.loc[
+            edge_or_halo, "base_elev_m"
+        ].values
 
     return strips
 
@@ -679,12 +758,44 @@ def _attach_fac_strip_head_depth_offset(
             strips.loc[idx_ir, "endpoint_elev_m"].values - ep_depths
         )
 
-    # Edge strips: endpoint = base
-    edge = strips["hit_type"].eq("edge").to_numpy()
-    if edge.any():
-        strips.loc[edge, "endpoint_elev_m"] = strips.loc[edge, "base_elev_m"].values
+    # Edge and halo strips: endpoint = base (same reach depth)
+    edge_or_halo = (
+        strips["hit_type"].eq("edge") | strips["hit_type"].eq("halo")
+    ).to_numpy()
+    if edge_or_halo.any():
+        strips.loc[edge_or_halo, "endpoint_elev_m"] = strips.loc[
+            edge_or_halo, "base_elev_m"
+        ].values
 
     return strips
+
+
+def _remove_long_crossing_strips(
+    strips: gpd.GeoDataFrame,
+    max_length_m: float,
+) -> gpd.GeoDataFrame:
+    """Drop strips longer than *max_length_m* that intersect any other strip."""
+    long_mask = strips["dist_m"].values > max_length_m
+    if not long_mask.any():
+        return strips
+
+    long_idx = strips.index[long_mask]
+
+    tree = STRtree(strips["geometry"].values)
+
+    drop = set()
+    for idx in long_idx:
+        geom = strips.at[idx, "geometry"]
+        if geom is None or geom.is_empty:
+            continue
+        candidates = tree.query(geom, predicate="intersects")
+        for c in candidates:
+            other_idx = strips.index[c]
+            if other_idx != idx:
+                drop.add(idx)
+                break
+
+    return strips.drop(index=list(drop)).reset_index(drop=True)
 
 
 def generate_fac_strips(
@@ -694,6 +805,7 @@ def generate_fac_strips(
     station_spacing_m: float = DEFAULT_STATION_SPACING_M,
     tangent_step_m: float = DEFAULT_TANGENT_STEP_M,
     min_hit_dist_m: float = DEFAULT_MIN_HIT_DIST_M,
+    halo_n: int = 0,
     workers: int = DEFAULT_WORKERS,
 ) -> gpd.GeoDataFrame:
     if field is None:
@@ -717,12 +829,59 @@ def generate_fac_strips(
     max_ray_dist_m = float(np.hypot(bounds[2] - bounds[0], bounds[3] - bounds[1])) * 1.5
     aoi_boundary = field.aoi_polygon.boundary
 
+    # Identify terminal endpoints (headwaters/outlets not shared with another reach)
+    _JUNCTION_TOL = 1.0  # metres
+    all_starts = []
+    all_ends = []
+    all_rids = []
+    for geom, rid in zip(stream_geoms, stream_ids):
+        coords = np.array(geom.coords)
+        all_starts.append(coords[0, :2])
+        all_ends.append(coords[-1, :2])
+        all_rids.append(rid)
+    all_starts = np.array(all_starts, dtype=np.float64)
+    all_ends = np.array(all_ends, dtype=np.float64)
+    n_streams = len(all_starts)
+
+    terminal_start_set: set[int] = set()
+    terminal_end_set: set[int] = set()
+    for i in range(n_streams):
+        # Check if start[i] is near any other stream's start or end
+        dists_to_starts = np.hypot(
+            all_starts[:, 0] - all_starts[i, 0], all_starts[:, 1] - all_starts[i, 1]
+        )
+        dists_to_ends = np.hypot(
+            all_ends[:, 0] - all_starts[i, 0], all_ends[:, 1] - all_starts[i, 1]
+        )
+        dists_to_starts[i] = np.inf  # exclude self
+        if (
+            dists_to_starts.min() > _JUNCTION_TOL
+            and dists_to_ends.min() > _JUNCTION_TOL
+        ):
+            terminal_start_set.add(all_rids[i])
+
+        # Check if end[i] is near any other stream's start or end
+        dists_to_starts2 = np.hypot(
+            all_starts[:, 0] - all_ends[i, 0], all_starts[:, 1] - all_ends[i, 1]
+        )
+        dists_to_ends2 = np.hypot(
+            all_ends[:, 0] - all_ends[i, 0], all_ends[:, 1] - all_ends[i, 1]
+        )
+        dists_to_ends2[i] = np.inf  # exclude self
+        if (
+            dists_to_starts2.min() > _JUNCTION_TOL
+            and dists_to_ends2.min() > _JUNCTION_TOL
+        ):
+            terminal_end_set.add(all_rids[i])
+
     records = [
         {
             "reach_id": int(row.reach_id),
             "stream_id": int(getattr(row, "stream_id", int(row.reach_id))),
             "strahler": getattr(row, "strahler", np.nan),
             "geometry": row.geometry,
+            "terminal_start": int(row.reach_id) in terminal_start_set,
+            "terminal_end": int(row.reach_id) in terminal_end_set,
         }
         for row in work.itertuples()
         if row.geometry is not None and not row.geometry.is_empty
@@ -746,6 +905,7 @@ def generate_fac_strips(
             station_spacing_m,
             tangent_step_m,
             min_hit_dist_m,
+            halo_n=halo_n,
         )
     else:
         chunk_size = max(1, int(np.ceil(len(records) / (workers * 4))))
@@ -775,6 +935,7 @@ def generate_fac_strips(
                     station_spacing_m,
                     tangent_step_m,
                     min_hit_dist_m,
+                    halo_n,
                 ): len(chunk)
                 for chunk in chunks
             }
@@ -854,8 +1015,9 @@ def rasterize_sparse_sections_20m(
     res_m: float = DEFAULT_BURN_RES_M,
 ) -> tuple[xr.DataArray, xr.DataArray]:
     x_vals, y_vals = _axes_from_bounds(tuple(dem_da.rio.bounds()), res_m)
-    sum_wz = np.zeros((len(y_vals), len(x_vals)), dtype=np.float64)
-    sum_w = np.zeros((len(y_vals), len(x_vals)), dtype=np.float64)
+    ny, nx = len(y_vals), len(x_vals)
+    min_arr = np.full((ny, nx), np.inf, dtype=np.float64)
+    count_arr = np.zeros((ny, nx), dtype=np.float64)
 
     for row in strips.itertuples():
         g = row.geometry
@@ -863,11 +1025,16 @@ def rasterize_sparse_sections_20m(
         ee = float(row.endpoint_elev_m)
         if g is None or g.is_empty or not np.isfinite(be) or not np.isfinite(ee):
             continue
-        _burn_section_to_accumulators(g, be, ee, sum_wz, sum_w, x_vals, y_vals)
+        result = _sample_section_pixels(g, be, ee, x_vals, y_vals)
+        if result is None:
+            continue
+        rows, cols, elevs = result
+        np.minimum.at(min_arr, (rows, cols), elevs)
+        np.add.at(count_arr, (rows, cols), 1.0)
 
-    ws = np.full_like(sum_wz, np.nan)
-    mask = sum_w > 0.0
-    ws[mask] = sum_wz[mask] / sum_w[mask]
+    ws = np.full((ny, nx), np.nan, dtype=np.float64)
+    mask = count_arr > 0.0
+    ws[mask] = min_arr[mask]
 
     ws_da = xr.DataArray(
         ws,
@@ -879,7 +1046,7 @@ def rasterize_sparse_sections_20m(
     ws_da = ws_da.rio.set_spatial_dims(x_dim="x", y_dim="y")
 
     count_da = xr.DataArray(
-        sum_w.astype(np.float32),
+        count_arr.astype(np.float32),
         coords={"y": y_vals, "x": x_vals},
         dims=("y", "x"),
         name="fac_sparse_sections_count_20m",
@@ -1028,6 +1195,8 @@ def fill_sparse_sections_idw(
     dem20_da: xr.DataArray,
     radius_m: float = DEFAULT_IDW_RADIUS_M,
     power: float = DEFAULT_IDW_POWER,
+    post_smooth_m: float = 0.0,
+    dem_min_da: xr.DataArray | None = None,
 ) -> tuple[xr.DataArray, xr.DataArray]:
     sparse = np.asarray(sparse_ws_da.values, dtype=np.float64)
     counts = np.asarray(sparse_count_da.values, dtype=np.float64)
@@ -1050,8 +1219,22 @@ def fill_sparse_sections_idw(
     filled = np.full_like(sparse, np.nan)
     ok = (den > 1e-12) & mask
     filled[ok] = num[ok] / den[ok]
-    # Preserve exact burned section values at source pixels.
-    filled[valid] = sparse[valid]
+
+    # Post-IDW Gaussian smooth to feather strip edges
+    if post_smooth_m > 0.0:
+        sigma_px = post_smooth_m / res_x
+        filled = _nan_gaussian_2d(filled, sigma_px)
+        filled[~mask] = np.nan
+
+    # Clamp water surface to DEM — WS cannot exceed ground elevation.
+    # Use min-resampled DEM if available (preserves narrow channel bottoms).
+    clamp_surface = (
+        np.asarray(dem_min_da.values, dtype=np.float64)
+        if dem_min_da is not None
+        else dem20
+    )
+    clamped = np.isfinite(filled) & np.isfinite(clamp_surface)
+    filled[clamped] = np.minimum(filled[clamped], clamp_surface[clamped])
 
     filled_da = xr.DataArray(
         filled,
@@ -1094,9 +1277,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tangent-step-m", type=float, default=None)
     parser.add_argument("--min-hit-dist-m", type=float, default=None)
     parser.add_argument("--min-strahler", type=int, default=None)
+    parser.add_argument("--max-crossing-strip-m", type=float, default=None)
+    parser.add_argument("--halo-n", type=int, default=None)
     parser.add_argument("--burn-res-m", type=float, default=None)
     parser.add_argument("--idw-radius-m", type=float, default=None)
     parser.add_argument("--idw-power", type=float, default=None)
+    parser.add_argument("--post-smooth-m", type=float, default=None)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--naip-path", type=Path, default=None)
     parser.add_argument("--support-path", type=Path, default=None)
@@ -1129,12 +1315,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             cli.min_hit_dist_m = cfg.min_hit_dist_m
         if cli.min_strahler is None:
             cli.min_strahler = cfg.min_strahler
+        if cli.max_crossing_strip_m is None:
+            cli.max_crossing_strip_m = cfg.max_crossing_strip_m
+        if cli.halo_n is None:
+            cli.halo_n = cfg.halo_n
         if cli.burn_res_m is None:
             cli.burn_res_m = cfg.burn_res_m
         if cli.idw_radius_m is None:
             cli.idw_radius_m = cfg.idw_radius_m
         if cli.idw_power is None:
             cli.idw_power = cfg.idw_power
+        if cli.post_smooth_m is None:
+            cli.post_smooth_m = cfg.post_smooth_m
         if cli.workers is None:
             cli.workers = cfg.workers
         # Stash head-solve kwargs from config for main() to use.
@@ -1159,12 +1351,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             cli.min_hit_dist_m = DEFAULT_MIN_HIT_DIST_M
         if cli.min_strahler is None:
             cli.min_strahler = 0
+        if cli.max_crossing_strip_m is None:
+            cli.max_crossing_strip_m = 0.0
+        if cli.halo_n is None:
+            cli.halo_n = 0
         if cli.burn_res_m is None:
             cli.burn_res_m = DEFAULT_BURN_RES_M
         if cli.idw_radius_m is None:
             cli.idw_radius_m = DEFAULT_IDW_RADIUS_M
         if cli.idw_power is None:
             cli.idw_power = DEFAULT_IDW_POWER
+        if cli.post_smooth_m is None:
+            cli.post_smooth_m = 0.0
         if cli.workers is None:
             cli.workers = DEFAULT_WORKERS
         cli.head_solve_kwargs = {}
@@ -1217,6 +1415,7 @@ def main(argv: list[str] | None = None) -> None:
         station_spacing_m=args.station_spacing_m,
         tangent_step_m=args.tangent_step_m,
         min_hit_dist_m=args.min_hit_dist_m,
+        halo_n=args.halo_n,
         workers=args.workers,
     )
     print(
@@ -1224,6 +1423,15 @@ def main(argv: list[str] | None = None) -> None:
         f"({int((strips['hit_type'] == 'interreach').sum())} interreach, "
         f"{int((strips['hit_type'] == 'edge').sum())} edge)"
     )
+    if args.max_crossing_strip_m > 0:
+        n_before = len(strips)
+        strips = _remove_long_crossing_strips(strips, args.max_crossing_strip_m)
+        print(
+            f"  crossing filter (>{args.max_crossing_strip_m:.0f} m): "
+            f"removed {n_before - len(strips)}, kept {len(strips)}"
+        )
+
+    strips.to_file(args.out_dir / "fac_normals_cross_sections.fgb", driver="FlatGeobuf")
 
     if args.naip_path is not None:
         from handily.rem_fac_head import build_channel_heads
@@ -1233,7 +1441,21 @@ def main(argv: list[str] | None = None) -> None:
         t0 = perf_counter()
         _x, _y = _axes_from_bounds(tuple(dem_da.rio.bounds()), args.burn_res_m)
         _dem20 = sample_dem_to_grid(dem_da, _x, _y)
-        ndvi_da = compute_naip_ndvi_match(str(args.naip_path), _dem20)
+        # Compute NDVI at native NAIP resolution, then resample to 20m with max
+        # so the greenest pixel in each cell drives the seed strength.
+        _x20, _y20 = _axes_from_bounds(tuple(dem_da.rio.bounds()), 20.0)
+        _dem_20m = sample_dem_to_grid(dem_da, _x20, _y20)
+        from rasterio.enums import Resampling as _Resamp
+
+        ndvi_native = compute_naip_ndvi_match(
+            str(args.naip_path),
+            _dem20,
+            resampling=_Resamp.nearest,
+        )
+        ndvi_da = ndvi_native.rio.reproject_match(_dem_20m, resampling=_Resamp.max)
+        print(
+            f"  NDVI: native {ndvi_native.shape} -> 20m {ndvi_da.shape} (max resample)"
+        )
 
         support_da = None
         if args.support_path is not None and args.support_path.exists():
@@ -1285,21 +1507,30 @@ def main(argv: list[str] | None = None) -> None:
             sparse_hd_da.x.values.astype(np.float64),
             sparse_hd_da.y.values.astype(np.float64),
         )
+        # Min-resampled DEM to capture narrow channel bottoms for WS clamping
+        dem_min_da = dem_da.rio.reproject_match(dem20_da, resampling=RioResampling.min)
         hd_idw_ws_da, hd_idw_rem_da = fill_sparse_sections_idw(
             sparse_hd_da,
             sparse_hd_count,
             dem20_da,
             radius_m=args.idw_radius_m,
             power=args.idw_power,
+            post_smooth_m=args.post_smooth_m,
+            dem_min_da=dem_min_da,
         )
         dt = perf_counter() - t0
         hd_filled = int(np.isfinite(hd_idw_ws_da.values).sum())
         print(f"  idw fill: {hd_filled}/{total} pixels, {dt:.2f}s")
 
-        sparse_hd_da.rio.to_raster(args.out_dir / "fac_head_depth_sparse_20m.tif")
-        hd_idw_ws_da.rio.to_raster(args.out_dir / "fac_head_depth_idw_fill_20m.tif")
-        hd_idw_rem_da.rio.to_raster(args.out_dir / "fac_head_depth_rem_20m.tif")
-        print("Wrote fac_head_depth_rem_20m.tif")
+        res_tag = f"{int(args.burn_res_m)}m"
+        sparse_hd_da.rio.to_raster(
+            args.out_dir / f"fac_head_depth_sparse_{res_tag}.tif"
+        )
+        hd_idw_ws_da.rio.to_raster(
+            args.out_dir / f"fac_head_depth_idw_fill_{res_tag}.tif"
+        )
+        hd_idw_rem_da.rio.to_raster(args.out_dir / f"fac_head_depth_rem_{res_tag}.tif")
+        print(f"Wrote fac_head_depth_rem_{res_tag}.tif")
 
     print(f"Done — outputs in {args.out_dir}")
 

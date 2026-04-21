@@ -31,12 +31,15 @@ class FacRemConfig:
     tangent_step_m: float = 10.0
     min_hit_dist_m: float = 5.0
     min_strahler: int = 0
+    max_crossing_strip_m: float = 0.0
+    halo_n: int = 0
     workers: int = 1
 
     # --- Raster resolution ---
     burn_res_m: float = 20.0
     idw_radius_m: float = 200.0
     idw_power: float = 1.0
+    post_smooth_m: float = 0.0
 
     # --- Head-solve: seed strength ---
     ndvi_mid: float = 0.20
