@@ -388,6 +388,63 @@ def compute_ndwi(naip_path: str, ndwi_path: str) -> str:
     return ndwi_path
 
 
+def compute_water_mask(
+    naip_path: str,
+    mask_path: str,
+    ndwi_thresh: float = 0.1,
+    nir_thresh: float = 0.15,
+    ndvi_thresh: float = 0.1,
+) -> str:
+    """Compute composite water mask from a NAIP CIR GeoTIFF.
+
+    Three-gate test: pixel is water when ALL of:
+        NDWI > ndwi_thresh  (basic water signal)
+        NIR/255 < nir_thresh  (water absorbs NIR; bare soil doesn't)
+        NDVI < ndvi_thresh  (excludes vegetation)
+
+    Parameters
+    ----------
+    naip_path : str
+        Path to 3-band CIR NAIP (NIR, Red, Green) or 4-band (R, G, B, NIR).
+    mask_path : str
+        Output path for the uint8 water mask (1=water, 0=not water).
+    """
+    with rasterio.open(naip_path) as src:
+        if src.count >= 4:
+            green = src.read(2).astype("float32")
+            red = src.read(1).astype("float32")
+            nir = src.read(4).astype("float32")
+        elif src.count == 3:
+            nir = src.read(1).astype("float32")
+            red = src.read(2).astype("float32")
+            green = src.read(3).astype("float32")
+        else:
+            raise ValueError(
+                f"Expected 3+ band NAIP, got {src.count} bands: {naip_path}"
+            )
+
+        gn_denom = green + nir
+        ndwi = np.where(gn_denom != 0, (green - nir) / gn_denom, 0.0)
+
+        rn_denom = nir + red
+        ndvi = np.where(rn_denom != 0, (nir - red) / rn_denom, 0.0)
+
+        nir_frac = nir / 255.0
+
+        water = (
+            (ndwi > ndwi_thresh) & (nir_frac < nir_thresh) & (ndvi < ndvi_thresh)
+        ).astype("uint8")
+
+        profile = src.profile.copy()
+        profile.update(count=1, dtype="uint8", nodata=255)
+        with rasterio.open(mask_path, "w", **profile) as dst:
+            dst.write(water, 1)
+
+    pct = water.sum() / water.size * 100
+    LOGGER.info("Water mask: %.2f%% of pixels — %s", pct, mask_path)
+    return mask_path
+
+
 def _extract_sid_files(zip_path: Path, extract_dir: Path) -> list[Path]:
     extract_dir.mkdir(parents=True, exist_ok=True)
     sid_paths: list[Path] = []
@@ -449,6 +506,108 @@ def _write_clipped_ndwi(
         with memfile.open(**profile) as dataset:
             dataset.write(mosaic)
             _clip_dataset_to_aoi(dataset, out_path, aoi_geometry, aoi_crs)
+
+
+def _write_clipped_raw(
+    tif_tiles: list[Path], out_path: str, aoi_geometry, aoi_crs: Any
+) -> None:
+    """Mosaic raw NAIP tiles and clip to AOI geometry."""
+    if len(tif_tiles) == 1:
+        with rasterio.open(tif_tiles[0]) as src:
+            _clip_dataset_to_aoi(src, out_path, aoi_geometry, aoi_crs)
+        return
+
+    with ExitStack() as stack:
+        datasets = [stack.enter_context(rasterio.open(tile)) for tile in tif_tiles]
+        mosaic, transform = merge(datasets)
+        profile = datasets[0].profile.copy()
+
+    profile.update(
+        height=mosaic.shape[1],
+        width=mosaic.shape[2],
+        transform=transform,
+    )
+    with MemoryFile() as memfile:
+        with memfile.open(**profile) as dataset:
+            dataset.write(mosaic)
+            _clip_dataset_to_aoi(dataset, out_path, aoi_geometry, aoi_crs)
+
+
+def naip_raw_for_aoi(
+    aoi_geometry,
+    state: str,
+    fips: str,
+    year: str,
+    out_path: str,
+    cache_dir: str | None = None,
+    cleanup: bool = True,
+    aoi_crs: Any = "EPSG:4326",
+) -> str:
+    """Download NAIP for one AOI, decode, mosaic, and clip — raw bands."""
+
+    state = state.lower()
+    fips = str(fips).zfill(3)
+    aoi_crs = _coerce_crs(aoi_crs)
+    _ensure_parent(out_path)
+
+    entry = find_county_zip(state, year, fips)
+    if entry is None:
+        raise FileNotFoundError(f"No NAIP found for {state} FIPS {fips} year {year}")
+
+    temp_cache_root: Path | None = None
+    cache_root = (
+        Path(cache_dir) if cache_dir else Path(tempfile.mkdtemp(prefix="naip_cache_"))
+    )
+    if cache_dir is None:
+        temp_cache_root = cache_root
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    zip_path = cache_root / entry["name"]
+    if not zip_path.exists():
+        _box_download_file(entry["id"], str(zip_path))
+    else:
+        LOGGER.info("Using cached ZIP: %s", zip_path)
+
+    aoi_tag = _aoi_tag(aoi_geometry, aoi_crs)
+    extract_dir = cache_root / f"{state}_{fips}_{year}"
+    aoi_bounds = _aoi_bounds_wsen(aoi_geometry, aoi_crs)
+    tif_tiles: list[Path] = []
+
+    for sid_path in _extract_sid_files(zip_path, extract_dir):
+        base = sid_path.stem
+        tif_path = extract_dir / f"{base}_{aoi_tag}.tif"
+
+        if not tif_path.exists():
+            try:
+                decode_sid(str(sid_path), str(tif_path), bounds_wsen=aoi_bounds)
+            except RuntimeError as exc:
+                LOGGER.warning("Skipping %s: %s", sid_path.name, exc)
+                continue
+
+        try:
+            with rasterio.open(tif_path) as src:
+                if src.width == 0 or src.height == 0:
+                    continue
+        except Exception as exc:
+            LOGGER.warning("Skipping unreadable tile %s: %s", tif_path.name, exc)
+            continue
+
+        tif_tiles.append(tif_path)
+
+    if not tif_tiles:
+        raise ValueError(f"No NAIP tiles intersect AOI for {state} FIPS {fips} {year}")
+
+    LOGGER.info("Mosaicking %d NAIP tiles for AOI", len(tif_tiles))
+    _write_clipped_raw(tif_tiles, out_path, aoi_geometry, aoi_crs)
+    LOGGER.info("Raw NAIP written: %s", out_path)
+
+    if cleanup:
+        if temp_cache_root is not None:
+            shutil.rmtree(temp_cache_root, ignore_errors=True)
+        elif extract_dir.is_dir():
+            shutil.rmtree(extract_dir, ignore_errors=True)
+
+    return out_path
 
 
 def naip_ndwi_for_aoi(

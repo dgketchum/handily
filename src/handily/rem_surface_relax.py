@@ -29,7 +29,9 @@ class WaterSurfaceRelaxInfo:
     n_boundary_fixed: int
 
 
-def _neighbor_sum_and_weight(values: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _neighbor_sum_and_weight(
+    values: np.ndarray, valid: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     nbr_sum = np.zeros_like(values, dtype=np.float64)
     nbr_w = np.zeros_like(values, dtype=np.float64)
 
@@ -57,7 +59,9 @@ def _match_transform(match_da: xr.DataArray) -> Affine:
     dy = float(np.median(np.diff(y)))
     if not np.isfinite(dx) or not np.isfinite(dy):
         raise ValueError("invalid match_da coordinate spacing")
-    return Affine.translation(float(x[0] - dx / 2.0), float(y[0] - dy / 2.0)) * Affine.scale(dx, dy)
+    return Affine.translation(
+        float(x[0] - dx / 2.0), float(y[0] - dy / 2.0)
+    ) * Affine.scale(dx, dy)
 
 
 def compute_naip_ndvi_match(
@@ -66,7 +70,10 @@ def compute_naip_ndvi_match(
     *,
     resampling: Resampling = Resampling.average,
 ) -> xr.DataArray:
-    """Resample NAIP red/NIR bands directly to a match grid and compute NDVI."""
+    """Resample NAIP red/NIR bands to a match grid and compute NDVI.
+
+    Supports 4-band multispectral (R,G,B,NIR) and 3-band CIR (NIR,R,G).
+    """
     match_transform = _match_transform(match_da)
     match_shape = tuple(int(v) for v in match_da.shape)
     dst_crs = match_da.rio.crs
@@ -77,10 +84,18 @@ def compute_naip_ndvi_match(
     nir = np.full(match_shape, np.nan, dtype=np.float32)
 
     with rasterio.open(naip_path) as src:
-        if src.count < 4:
-            raise ValueError("NAIP raster must have at least 4 bands (R,G,B,NIR)")
+        if src.count >= 4:
+            # 4-band multispectral: R, G, B, NIR
+            red_band, nir_band = 1, 4
+        elif src.count == 3:
+            # 3-band CIR: NIR, R, G
+            red_band, nir_band = 2, 1
+        else:
+            raise ValueError(
+                f"Expected 3+ band NAIP, got {src.count} bands: {naip_path}"
+            )
         reproject(
-            source=rasterio.band(src, 1),
+            source=rasterio.band(src, red_band),
             destination=red,
             src_transform=src.transform,
             src_crs=src.crs,
@@ -91,7 +106,7 @@ def compute_naip_ndvi_match(
             resampling=resampling,
         )
         reproject(
-            source=rasterio.band(src, 4),
+            source=rasterio.band(src, nir_band),
             destination=nir,
             src_transform=src.transform,
             src_crs=src.crs,
@@ -148,9 +163,10 @@ def ndvi_to_clearance(
     valid = np.isfinite(ndvi)
     frac = np.clip((ndvi_dense - ndvi) / (ndvi_dense - ndvi_sparse), 0.0, 1.0)
     frac = frac**gamma
-    clearance[valid] = float(min_clearance) + (
-        float(max_clearance) - float(min_clearance)
-    ) * frac[valid]
+    clearance[valid] = (
+        float(min_clearance)
+        + (float(max_clearance) - float(min_clearance)) * frac[valid]
+    )
 
     out = xr.DataArray(
         clearance,
@@ -180,7 +196,9 @@ def _normalized_gaussian(values: np.ndarray, sigma_px: float) -> np.ndarray:
     return out
 
 
-def smooth_ndvi_gaussian(ndvi_da: xr.DataArray, *, sigma_px: float = 2.0) -> xr.DataArray:
+def smooth_ndvi_gaussian(
+    ndvi_da: xr.DataArray, *, sigma_px: float = 2.0
+) -> xr.DataArray:
     vals = np.asarray(ndvi_da.values, dtype=np.float64)
     smoothed = _normalized_gaussian(vals, sigma_px=float(sigma_px))
     smoothed = np.clip(smoothed, -1.0, 1.0)
@@ -221,9 +239,10 @@ def ndvi_to_clearance_logistic(
     clearance = np.full(ndvi.shape, np.nan, dtype=np.float64)
     valid = np.isfinite(ndvi)
     logistic = 1.0 / (1.0 + np.exp((ndvi - float(ndvi_mid)) / float(ndvi_scale)))
-    clearance[valid] = float(min_clearance) + (
-        float(max_clearance) - float(min_clearance)
-    ) * logistic[valid]
+    clearance[valid] = (
+        float(min_clearance)
+        + (float(max_clearance) - float(min_clearance)) * logistic[valid]
+    )
 
     out = xr.DataArray(
         clearance,
@@ -260,7 +279,9 @@ def shallow_rem_pin_weight(
     if exceedance_scale_m <= 0.0:
         raise ValueError("exceedance_scale_m must be > 0")
 
-    rem_prior_da, clearance_target_da = xr.align(rem_prior_da, clearance_target_da, join="exact")
+    rem_prior_da, clearance_target_da = xr.align(
+        rem_prior_da, clearance_target_da, join="exact"
+    )
     rem_prior = np.asarray(rem_prior_da.values, dtype=np.float64)
     clearance = np.asarray(clearance_target_da.values, dtype=np.float64)
     weight = np.full(rem_prior.shape, np.nan, dtype=np.float64)
@@ -309,7 +330,9 @@ def ndvi_to_prior_pin_weight(
     weight = np.full(ndvi.shape, np.nan, dtype=np.float64)
     valid = np.isfinite(ndvi)
     logistic = 1.0 / (1.0 + np.exp(-(ndvi - float(ndvi_mid)) / float(ndvi_scale)))
-    weight[valid] = float(min_weight) + (float(max_weight) - float(min_weight)) * logistic[valid]
+    weight[valid] = (
+        float(min_weight) + (float(max_weight) - float(min_weight)) * logistic[valid]
+    )
 
     out = xr.DataArray(
         weight,
@@ -378,7 +401,9 @@ def relax_water_surface_upward(
     if clearance_da is None:
         if float(min_clearance_off_support) < 0.0:
             raise ValueError("min_clearance_off_support must be >= 0")
-        clearance = np.full(ws_prior.shape, float(min_clearance_off_support), dtype=np.float64)
+        clearance = np.full(
+            ws_prior.shape, float(min_clearance_off_support), dtype=np.float64
+        )
     else:
         clearance = np.asarray(clearance_da.values, dtype=np.float64)
         if clearance.shape != ws_prior.shape:
@@ -393,7 +418,11 @@ def relax_water_surface_upward(
         np.nan,
     )
     lower = np.where(valid, np.minimum(ws_prior, upper), np.nan)
-    boundary = _boundary_mask(valid) if fix_boundary_to_prior else np.zeros_like(valid, dtype=bool)
+    boundary = (
+        _boundary_mask(valid)
+        if fix_boundary_to_prior
+        else np.zeros_like(valid, dtype=bool)
+    )
     fixed = support | boundary
 
     fidelity = np.full(lower.shape, float(base_fidelity), dtype=np.float64)
@@ -533,9 +562,15 @@ def relax_water_surface_soft_ceiling(
         raise ValueError("pin_weight_da contains NaN/inf values on valid cells")
     pin_weight = np.where(valid, np.maximum(pin_weight, 0.0), 0.0)
 
-    upper = np.where(valid, np.where(support, dem, dem - float(min_clearance_off_support)), np.nan)
+    upper = np.where(
+        valid, np.where(support, dem, dem - float(min_clearance_off_support)), np.nan
+    )
     soft_target = np.where(valid, np.minimum(soft_target, upper), np.nan)
-    boundary = _boundary_mask(valid) if fix_boundary_to_prior else np.zeros_like(valid, dtype=bool)
+    boundary = (
+        _boundary_mask(valid)
+        if fix_boundary_to_prior
+        else np.zeros_like(valid, dtype=bool)
+    )
     fixed = support | boundary
 
     fidelity = np.full(ws_prior.shape, float(base_fidelity), dtype=np.float64)
@@ -558,9 +593,7 @@ def relax_water_surface_soft_ceiling(
         target = current.copy()
         ok = updatable & (denom > 1e-12)
         target[ok] = (
-            fidelity[ok] * ws_prior[ok]
-            + nbr_sum[ok]
-            + pin_weight[ok] * soft_target[ok]
+            fidelity[ok] * ws_prior[ok] + nbr_sum[ok] + pin_weight[ok] * soft_target[ok]
         ) / denom[ok]
         candidate = current.copy()
         candidate[ok] = (1.0 - omega) * current[ok] + omega * target[ok]
@@ -583,7 +616,10 @@ def relax_water_surface_soft_ceiling(
         coords=ws_prior_da.coords,
         dims=ws_prior_da.dims,
         name="relaxed_water_surface_soft_ceiling",
-        attrs={"long_name": "soft_ceiling_relaxed_water_surface_elevation", "units": "m"},
+        attrs={
+            "long_name": "soft_ceiling_relaxed_water_surface_elevation",
+            "units": "m",
+        },
     )
     if hasattr(ws_prior_da, "rio"):
         out = out.rio.write_crs(ws_prior_da.rio.crs)
@@ -649,9 +685,15 @@ def relax_water_surface_ndvi_pins(
     if np.nanmin(pin_weight) < 0.0:
         raise ValueError("ndvi_pin_weight_da values must be >= 0")
 
-    upper = np.where(valid, np.where(support, dem, dem - float(min_clearance_off_support)), np.nan)
+    upper = np.where(
+        valid, np.where(support, dem, dem - float(min_clearance_off_support)), np.nan
+    )
     prior_target = np.where(valid, np.minimum(ws_prior, upper), np.nan)
-    boundary = _boundary_mask(valid) if fix_boundary_to_prior else np.zeros_like(valid, dtype=bool)
+    boundary = (
+        _boundary_mask(valid)
+        if fix_boundary_to_prior
+        else np.zeros_like(valid, dtype=bool)
+    )
     fixed = support | boundary
     total_pin_weight = np.where(valid, float(base_fidelity) + pin_weight, 0.0)
 
@@ -690,7 +732,10 @@ def relax_water_surface_ndvi_pins(
         coords=ws_prior_da.coords,
         dims=ws_prior_da.dims,
         name="relaxed_water_surface_ndvi_pins",
-        attrs={"long_name": "raw_ndvi_pin_relaxed_water_surface_elevation", "units": "m"},
+        attrs={
+            "long_name": "raw_ndvi_pin_relaxed_water_surface_elevation",
+            "units": "m",
+        },
     )
     if hasattr(ws_prior_da, "rio"):
         out = out.rio.write_crs(ws_prior_da.rio.crs)

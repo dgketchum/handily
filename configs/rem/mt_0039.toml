@@ -1,0 +1,51 @@
+# FAC REM — MT AOI 0039
+# Based on NV exp1 tuned parameters (ndvi_mid=0.20 distance_scale=4000 gamma=2.0 rmax_max=60)
+
+[paths]
+dem_path = "/data/ssd2/handily/mt/aoi_0039/dem_bounds_1m.tif"
+streams_path = "/data/ssd2/handily/mt/aoi_0039/streams_fac.fgb"
+out_dir = "/data/ssd2/handily/mt/aoi_0039/experimental_full"
+naip_path = "/data/ssd2/handily/mt/aoi_0039/naip/ortho_1-1_hc_s_mt001_2023_1.tif"
+
+[strips]
+coarse_res_m = 20.0
+smooth_sigma_m = 500.0
+station_spacing_m = 200.0
+tangent_step_m = 10.0
+min_hit_dist_m = 5.0
+min_strahler = 0
+workers = 24
+
+[raster]
+burn_res_m = 20.0
+idw_radius_m = 200.0
+idw_power = 1.0
+
+[seed]
+ndvi_mid = 0.20
+ndvi_scale = 0.06
+ndvi_quantile = 0.9
+support_override = 1.0
+
+[propagation]
+distance_scale_m = 4000.0
+elevation_scale_m = 25.0
+strahler_distance_scale = 0.5
+
+[sag]
+gamma = 2.0
+rmax_min_m = 2.0
+rmax_max_m = 60.0
+alpha_d = 0.75
+alpha_z = 1.0
+
+[solver]
+d_min_off_support_m = 0.5
+support_fraction_threshold = 0.25
+target_weight_base = 2.0
+zero_weight_base = 2.0
+smoothness_weight = 1.0
+neighbor_length_floor_m = 200.0
+max_hydraulic_slope = 0.05
+max_iter = 500
+tol = 0.01
