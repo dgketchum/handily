@@ -290,6 +290,323 @@ def compute_regional_fac(
 
 
 # ---------------------------------------------------------------------------
+# 1m FAC with 10m inflow injection
+# ---------------------------------------------------------------------------
+
+# WhiteboxTools D8 pointer encoding: value → (row_offset, col_offset)
+_D8_OFFSETS = {
+    1: (0, 1),  # E
+    2: (-1, 1),  # NE
+    4: (-1, 0),  # N
+    8: (-1, -1),  # NW
+    16: (0, -1),  # W
+    32: (1, -1),  # SW
+    64: (1, 0),  # S
+    128: (1, 1),  # SE
+}
+
+
+
+def find_inflow_points(
+    regional_fac_path: str | Path,
+    regional_d8_path: str | Path,
+    aoi_bounds: tuple[float, float, float, float],
+    aoi_crs,
+    min_acc: int = 1000,
+) -> list[dict]:
+    """Find cells where regional flow enters the AOI boundary.
+
+    Returns list of dicts with keys: x, y, acc_10m, row_10m, col_10m.
+    Only returns points with accumulation >= min_acc (10m cells).
+    """
+    from rasterio.windows import from_bounds
+
+    left, bottom, right, top = aoi_bounds
+
+    with (
+        rasterio.open(str(regional_fac_path)) as fac_src,
+        rasterio.open(str(regional_d8_path)) as d8_src,
+    ):
+        # Read a strip around the AOI boundary (one 10m cell wider)
+        res = fac_src.transform[0]  # 10m
+        pad = res * 2
+        window = from_bounds(
+            left - pad,
+            bottom - pad,
+            right + pad,
+            top + pad,
+            fac_src.transform,
+        )
+        # Clamp to valid raster extent
+        window = window.intersection(
+            rasterio.windows.Window(0, 0, fac_src.width, fac_src.height)
+        )
+        fac_arr = fac_src.read(1, window=window)
+        d8_arr = d8_src.read(1, window=window)
+        win_transform = fac_src.window_transform(window)
+
+    ny, nx = fac_arr.shape
+    inflows = []
+
+    # Scan boundary of the AOI extent in the 10m grid
+    # For each 10m cell just outside the AOI, check if its D8 direction
+    # points to a cell inside the AOI
+    for r in range(ny):
+        for c in range(nx):
+            d8_val = int(d8_arr[r, c])
+            if d8_val not in _D8_OFFSETS:
+                continue
+            acc = float(fac_arr[r, c])
+            if acc < min_acc:
+                continue
+
+            # Map coords of this cell
+            x, y = win_transform * (c + 0.5, r + 0.5)
+            outside = x < left or x > right or y < bottom or y > top
+
+            if not outside:
+                continue
+
+            # Check if D8 flows into the AOI
+            dr, dc = _D8_OFFSETS[d8_val]
+            tr, tc = r + dr, c + dc
+            if 0 <= tr < ny and 0 <= tc < nx:
+                tx, ty = win_transform * (tc + 0.5, tr + 0.5)
+                inside = left <= tx <= right and bottom <= ty <= top
+                if inside:
+                    inflows.append(
+                        {
+                            "x": tx,  # target cell (inside AOI)
+                            "y": ty,
+                            "acc_10m": acc,
+                        }
+                    )
+
+    # Deduplicate: keep highest accumulation per unique target cell
+    seen: dict[tuple[float, float], dict] = {}
+    for pt in inflows:
+        key = (round(pt["x"], 1), round(pt["y"], 1))
+        if key not in seen or pt["acc_10m"] > seen[key]["acc_10m"]:
+            seen[key] = pt
+    inflows = sorted(seen.values(), key=lambda p: -p["acc_10m"])
+    log.info(
+        "Found %d inflow points (max %.0f 10m-cells = %.0f km²)",
+        len(inflows),
+        inflows[0]["acc_10m"] if inflows else 0,
+        inflows[0]["acc_10m"] * 100 / 1e6 if inflows else 0,
+    )
+    return inflows
+
+
+def augment_accumulation(
+    acc_path: str | Path,
+    d8_path: str | Path,
+    inflow_points: list[dict],
+    out_path: str | Path,
+    scale_factor: float = 100.0,
+) -> Path:
+    """Trace downstream from each inflow point, adding scaled accumulation.
+
+    scale_factor converts 10m cell counts to 1m equivalents (10² = 100).
+    """
+    out_path = Path(out_path)
+
+    with rasterio.open(str(acc_path)) as src:
+        acc = src.read(1).astype(np.float64)
+        profile = src.profile.copy()
+        transform = src.transform
+    with rasterio.open(str(d8_path)) as src:
+        d8 = src.read(1)
+
+    inv = ~transform
+    ny, nx = acc.shape
+    total_augmented = 0
+
+    for pt in inflow_points:
+        inflow_val = pt["acc_10m"] * scale_factor
+        # Find the 1m cell closest to the inflow target
+        fc, fr = inv * (pt["x"], pt["y"])
+        r, c = int(round(fr)), int(round(fc))
+        if r < 0 or r >= ny or c < 0 or c >= nx:
+            continue
+
+        # Trace downstream, adding inflow at every cell
+        visited = set()
+        steps = 0
+        while 0 <= r < ny and 0 <= c < nx:
+            if (r, c) in visited:
+                break
+            visited.add((r, c))
+            acc[r, c] += inflow_val
+            steps += 1
+
+            d8_val = int(d8[r, c])
+            if d8_val not in _D8_OFFSETS:
+                break
+            dr, dc = _D8_OFFSETS[d8_val]
+            r, c = r + dr, c + dc
+
+        total_augmented += steps
+        log.info(
+            "  inflow %.0f km² traced %d cells downstream",
+            pt["acc_10m"] * 100 / 1e6,
+            steps,
+        )
+
+    # Write augmented accumulation
+    profile.update(dtype="float64")
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(acc, 1)
+
+    log.info("Augmented %d cells total, wrote %s", total_augmented, out_path)
+    return out_path
+
+
+def compute_aoi_fac_with_inflow(
+    dem_path: str | Path,
+    regional_fac_path: str | Path,
+    regional_d8_path: str | Path,
+    out_dir: str | Path,
+    threshold: int = 50_000,
+    max_procs: int = 32,
+    min_inflow_acc: int = 1000,
+    regional_res_m: float = 10.0,
+    strahler_path: str | Path | None = None,
+) -> Path:
+    """Run 1m FAC on an AOI with inflow injection from the 10m regional grid.
+
+    Returns the path to ``streams_fac.fgb``.
+    """
+    dem_path = str(dem_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with rasterio.open(dem_path) as src:
+        aoi_bounds = src.bounds
+        aoi_crs = src.crs
+        dem_res = src.transform[0]
+
+    scale_factor = (regional_res_m / dem_res) ** 2
+
+    wbt = whitebox.WhiteboxTools()
+    wbt.set_verbose_mode(False)
+    wbt.set_max_procs(max_procs)
+    wbt.set_compress_rasters(True)
+
+    filled = str(out_dir / "dem_filled.tif")
+    fdir = str(out_dir / "d8_pointer.tif")
+    acc = str(out_dir / "flow_accumulation.tif")
+    acc_aug = str(out_dir / "flow_accumulation_augmented.tif")
+    streams_ras = str(out_dir / "streams.tif")
+    streams_shp = str(out_dir / "streams_raw.shp")
+    strahler_out = str(out_dir / "stream_order.tif")
+    streams_fgb = str(out_dir / "streams_fac.fgb")
+
+    t0 = time.time()
+
+    # 1. Fill depressions
+    if not os.path.exists(filled):
+        log.info("Filling depressions ...")
+        wbt.fill_depressions_wang_and_liu(dem_path, filled, fix_flats=True)
+        log.info("  done in %.0fs", time.time() - t0)
+    else:
+        log.info("Skipping fill — %s exists", filled)
+
+    # 2. D8 pointer
+    if not os.path.exists(fdir):
+        log.info("Computing D8 pointer ...")
+        wbt.d8_pointer(filled, fdir)
+        log.info("  done in %.0fs", time.time() - t0)
+    else:
+        log.info("Skipping D8 pointer — %s exists", fdir)
+
+    # 3. D8 flow accumulation (raw, without inflow)
+    if not os.path.exists(acc):
+        log.info("Computing D8 flow accumulation ...")
+        wbt.d8_flow_accumulation(fdir, acc, out_type="cells", pntr=True, log=False)
+        log.info("  done in %.0fs", time.time() - t0)
+    else:
+        log.info("Skipping accumulation — %s exists", acc)
+
+    # 4. Find inflow points and augment
+    log.info("Finding inflow points from regional grid ...")
+    inflows = find_inflow_points(
+        regional_fac_path,
+        regional_d8_path,
+        (aoi_bounds.left, aoi_bounds.bottom, aoi_bounds.right, aoi_bounds.top),
+        aoi_crs,
+        min_acc=min_inflow_acc,
+    )
+    if inflows:
+        log.info("Augmenting accumulation with %d inflow points ...", len(inflows))
+        augment_accumulation(acc, fdir, inflows, acc_aug, scale_factor=scale_factor)
+        extract_acc = acc_aug
+    else:
+        log.info("No significant inflow — using raw accumulation")
+        extract_acc = acc
+
+    # 5. Extract streams from (augmented) accumulation
+    log.info("Extracting streams (threshold=%d) ...", threshold)
+    wbt.extract_streams(extract_acc, streams_ras, threshold=threshold)
+    log.info("  done in %.0fs", time.time() - t0)
+
+    # 6. Strahler stream order
+    log.info("Computing Strahler stream order ...")
+    wbt.strahler_stream_order(fdir, streams_ras, strahler_out)
+    log.info("  done in %.0fs", time.time() - t0)
+
+    # 7. Vectorize
+    log.info("Vectorizing streams ...")
+    wbt.raster_streams_to_vector(streams_ras, fdir, streams_shp)
+    log.info("  done in %.0fs", time.time() - t0)
+
+    # 8. Post-process
+    log.info("Post-processing ...")
+    raw_gdf = gpd.read_file(streams_shp)
+    with rasterio.open(dem_path) as src:
+        dem_crs = src.crs
+    if raw_gdf.crs is None:
+        raw_gdf = raw_gdf.set_crs(dem_crs)
+    else:
+        raw_gdf = raw_gdf.to_crs(dem_crs)
+
+    valid = raw_gdf[
+        raw_gdf.geometry.notna()
+        & raw_gdf.geometry.is_valid
+        & ~raw_gdf.geometry.is_empty
+    ]
+    geoms = list(valid.geometry)
+    merged = linemerge(MultiLineString(geoms))
+    if merged.geom_type == "LineString":
+        final_geoms = [merged]
+    elif merged.geom_type == "MultiLineString":
+        final_geoms = list(merged.geoms)
+    else:
+        final_geoms = [merged]
+
+    final_geoms = snap_dangling_ends(final_geoms, snap_tol=2.0)
+
+    # Sample Strahler from per-AOI order raster (not regional)
+    orders = sample_stream_order(final_geoms, strahler_out)
+
+    gdf = gpd.GeoDataFrame(
+        {"stream_id": range(len(final_geoms)), "strahler": orders},
+        geometry=final_geoms,
+        crs=dem_crs,
+    )
+    gdf["length_m"] = gdf.geometry.length
+    gdf.to_file(streams_fgb, driver="FlatGeobuf")
+    log.info(
+        "Wrote %d streams (%.0f km) in %.0fs → %s",
+        len(gdf),
+        gdf.length_m.sum() / 1000,
+        time.time() - t0,
+        streams_fgb,
+    )
+    return Path(streams_fgb)
+
+
+# ---------------------------------------------------------------------------
 # Per-AOI clip
 # ---------------------------------------------------------------------------
 
