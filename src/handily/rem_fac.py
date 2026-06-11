@@ -24,9 +24,11 @@ import geopandas as gpd
 import numpy as np
 import rioxarray
 import xarray as xr
+import rasterio
 from rasterio.enums import Resampling as RioResampling
 from rasterio.features import shapes
 from rasterio.transform import Affine
+from rasterio.warp import reproject
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import distance_transform_edt, gaussian_filter
 from scipy.signal import fftconvolve
@@ -49,6 +51,90 @@ DEFAULT_GAUSSIAN_SIGMA_PX = 3.0
 DEFAULT_IDW_RADIUS_M = 200.0
 DEFAULT_IDW_POWER = 1.0
 DEFAULT_WORKERS = 1
+
+
+def _match_transform(match_da: xr.DataArray) -> Affine:
+    x = np.asarray(match_da.x.values, dtype=np.float64)
+    y = np.asarray(match_da.y.values, dtype=np.float64)
+    if x.ndim != 1 or y.ndim != 1 or x.size < 2 or y.size < 2:
+        raise ValueError("match_da must have 1D x/y coordinates with at least 2 cells")
+    dx = float(np.median(np.diff(x)))
+    dy = float(np.median(np.diff(y)))
+    if not np.isfinite(dx) or not np.isfinite(dy):
+        raise ValueError("invalid match_da coordinate spacing")
+    return Affine.translation(
+        float(x[0] - dx / 2.0), float(y[0] - dy / 2.0)
+    ) * Affine.scale(dx, dy)
+
+
+def compute_naip_ndvi_match(
+    naip_path: str,
+    match_da: xr.DataArray,
+    *,
+    resampling: RioResampling = RioResampling.average,
+) -> xr.DataArray:
+    """Resample NAIP red/NIR bands to a match grid and compute NDVI.
+
+    Supports 4-band multispectral (R,G,B,NIR) and 3-band CIR (NIR,R,G).
+    """
+    match_transform = _match_transform(match_da)
+    match_shape = tuple(int(v) for v in match_da.shape)
+    dst_crs = match_da.rio.crs
+    if dst_crs is None:
+        raise ValueError("match_da must have a CRS")
+
+    red = np.full(match_shape, np.nan, dtype=np.float32)
+    nir = np.full(match_shape, np.nan, dtype=np.float32)
+
+    with rasterio.open(naip_path) as src:
+        if src.count >= 4:
+            red_band, nir_band = 1, 4
+        elif src.count == 3:
+            red_band, nir_band = 2, 1
+        else:
+            raise ValueError(
+                f"Expected 3+ band NAIP, got {src.count} bands: {naip_path}"
+            )
+        reproject(
+            source=rasterio.band(src, red_band),
+            destination=red,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=src.nodata,
+            dst_transform=match_transform,
+            dst_crs=dst_crs,
+            dst_nodata=np.nan,
+            resampling=resampling,
+        )
+        reproject(
+            source=rasterio.band(src, nir_band),
+            destination=nir,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=src.nodata,
+            dst_transform=match_transform,
+            dst_crs=dst_crs,
+            dst_nodata=np.nan,
+            resampling=resampling,
+        )
+
+    denom = nir + red
+    ndvi = np.full(match_shape, np.nan, dtype=np.float32)
+    ok = np.isfinite(red) & np.isfinite(nir) & (np.abs(denom) > 1e-12)
+    ndvi[ok] = (nir[ok] - red[ok]) / denom[ok]
+    ndvi = np.clip(ndvi, -1.0, 1.0)
+
+    out = xr.DataArray(
+        ndvi,
+        coords=match_da.coords,
+        dims=match_da.dims,
+        name="ndvi",
+        attrs={"long_name": "naip_ndvi", "units": "1"},
+    )
+    out = out.rio.write_crs(dst_crs)
+    out = out.rio.set_spatial_dims(x_dim="x", y_dim="y")
+    out = out.rio.write_nodata(np.nan)
+    return out
 
 
 @dataclass
@@ -1435,7 +1521,6 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.naip_path is not None:
         from handily.rem_fac_head import build_channel_heads
-        from handily.rem_surface_relax import compute_naip_ndvi_match
 
         print("Running channel-head longitudinal solve")
         t0 = perf_counter()
@@ -1445,14 +1530,14 @@ def main(argv: list[str] | None = None) -> None:
         # so the greenest pixel in each cell drives the seed strength.
         _x20, _y20 = _axes_from_bounds(tuple(dem_da.rio.bounds()), 20.0)
         _dem_20m = sample_dem_to_grid(dem_da, _x20, _y20)
-        from rasterio.enums import Resampling as _Resamp
-
         ndvi_native = compute_naip_ndvi_match(
             str(args.naip_path),
             _dem20,
-            resampling=_Resamp.nearest,
+            resampling=RioResampling.nearest,
         )
-        ndvi_da = ndvi_native.rio.reproject_match(_dem_20m, resampling=_Resamp.max)
+        ndvi_da = ndvi_native.rio.reproject_match(
+            _dem_20m, resampling=RioResampling.max
+        )
         print(
             f"  NDVI: native {ndvi_native.shape} -> 20m {ndvi_da.shape} (max resample)"
         )
