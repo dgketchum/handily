@@ -306,7 +306,6 @@ _D8_OFFSETS = {
 }
 
 
-
 def find_inflow_points(
     regional_fac_path: str | Path,
     regional_d8_path: str | Path,
@@ -401,6 +400,7 @@ def find_inflow_points(
 def augment_accumulation(
     acc_path: str | Path,
     d8_path: str | Path,
+    regional_d8_path: str | Path,
     inflow_points: list[dict],
     out_path: str | Path,
     scale_factor: float = 100.0,
@@ -408,6 +408,9 @@ def augment_accumulation(
     """Trace downstream from each inflow point, adding scaled accumulation.
 
     scale_factor converts 10m cell counts to 1m equivalents (10² = 100).
+    When the initial target cell is nodata in the 1m grid (common at DEM
+    boundary fringes), the 10m D8 pointer is followed inward until a valid
+    1m cell is found.
     """
     out_path = Path(out_path)
 
@@ -417,18 +420,55 @@ def augment_accumulation(
         transform = src.transform
     with rasterio.open(str(d8_path)) as src:
         d8 = src.read(1)
+    with rasterio.open(str(regional_d8_path)) as src:
+        reg_d8 = src.read(1)
+        reg_transform = src.transform
 
     inv = ~transform
+    reg_inv = ~reg_transform
     ny, nx = acc.shape
+    reg_ny, reg_nx = reg_d8.shape
     total_augmented = 0
+    _MAX_REGIONAL_HOPS = 200
 
     for pt in inflow_points:
         inflow_val = pt["acc_10m"] * scale_factor
         # Find the 1m cell closest to the inflow target
         fc, fr = inv * (pt["x"], pt["y"])
         r, c = int(round(fr)), int(round(fc))
-        if r < 0 or r >= ny or c < 0 or c >= nx:
-            continue
+
+        # If target cell is nodata, follow the 10m D8 pointer inward
+        if r < 0 or r >= ny or c < 0 or c >= nx or int(d8[r, c]) not in _D8_OFFSETS:
+            # Start from the inflow target in the 10m grid and trace forward
+            rfc, rfr = reg_inv * (pt["x"], pt["y"])
+            rr10, rc10 = int(round(rfr)), int(round(rfc))
+            found = False
+            for _ in range(_MAX_REGIONAL_HOPS):
+                d8_10 = (
+                    int(reg_d8[rr10, rc10])
+                    if (0 <= rr10 < reg_ny and 0 <= rc10 < reg_nx)
+                    else 0
+                )
+                if d8_10 not in _D8_OFFSETS:
+                    break
+                dr10, dc10 = _D8_OFFSETS[d8_10]
+                rr10, rc10 = rr10 + dr10, rc10 + dc10
+                # Map this 10m cell back to 1m
+                x10, y10 = reg_transform * (rc10 + 0.5, rr10 + 0.5)
+                fc1, fr1 = inv * (x10, y10)
+                r1, c1 = int(round(fr1)), int(round(fc1))
+                if 0 <= r1 < ny and 0 <= c1 < nx and int(d8[r1, c1]) in _D8_OFFSETS:
+                    r, c = r1, c1
+                    found = True
+                    break
+            if not found:
+                log.warning(
+                    "  inflow %.0f km² at (%.1f, %.1f): no valid 1m cell found",
+                    pt["acc_10m"] * 100 / 1e6,
+                    pt["x"],
+                    pt["y"],
+                )
+                continue
 
         # Trace downstream, adding inflow at every cell
         visited = set()
@@ -539,7 +579,14 @@ def compute_aoi_fac_with_inflow(
     )
     if inflows:
         log.info("Augmenting accumulation with %d inflow points ...", len(inflows))
-        augment_accumulation(acc, fdir, inflows, acc_aug, scale_factor=scale_factor)
+        augment_accumulation(
+            acc,
+            fdir,
+            str(regional_d8_path),
+            inflows,
+            acc_aug,
+            scale_factor=scale_factor,
+        )
         extract_acc = acc_aug
     else:
         log.info("No significant inflow — using raw accumulation")
