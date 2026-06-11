@@ -1,7 +1,16 @@
 import os
 import glob
+import warnings
+
 import geopandas as gpd
 import ee
+
+warnings.warn(
+    "handily.ndwi_export is deprecated — NAIP NDWI should be computed via "
+    "the local Box download pipeline (handily.naip) instead of Earth Engine.",
+    FutureWarning,
+    stacklevel=2,
+)
 
 
 def _ee_geom(geom):
