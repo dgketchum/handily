@@ -39,7 +39,7 @@ strahler_distance_scale = 0.5
 [sag]
 gamma = 2.0
 rmax_min_m = 2.0
-rmax_max_m = 60.0
+rmax_max_m = 30.0
 alpha_d = 0.75
 alpha_z = 1.0
 
@@ -48,7 +48,7 @@ d_min_off_support_m = 0.5
 support_fraction_threshold = 0.25
 target_weight_base = 2.0
 zero_weight_base = 2.0
-smoothness_weight = 1.0
+smoothness_weight = 3.0
 neighbor_length_floor_m = 200.0
 max_hydraulic_slope = 0.05
 max_iter = 500

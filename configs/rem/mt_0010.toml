@@ -10,16 +10,19 @@ naip_path = "/data/ssd2/handily/mt/aoi_0010/naip/ortho_1-1_hc_s_mt001_2023_1.tif
 [strips]
 coarse_res_m = 20.0
 smooth_sigma_m = 500.0
-station_spacing_m = 200.0
+station_spacing_m = 50.0
 tangent_step_m = 10.0
 min_hit_dist_m = 5.0
 min_strahler = 0
+max_crossing_strip_m = 800.0
+halo_n = 12
 workers = 24
 
 [raster]
-burn_res_m = 20.0
-idw_radius_m = 200.0
-idw_power = 1.0
+burn_res_m = 5.0
+idw_radius_m = 1000.0
+idw_power = 2.0
+post_smooth_m = 100.0
 
 [seed]
 ndvi_mid = 0.20
