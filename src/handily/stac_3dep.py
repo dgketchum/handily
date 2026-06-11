@@ -780,7 +780,7 @@ def mosaic_from_stac(
     nd = dem.rio.nodata
     if nd is not None and np.isfinite(nd):
         dem = dem.where(dem != nd)
-        dem = dem.rio.write_nodata(np.nan)
+    dem = dem.rio.write_nodata(np.nan)
 
     # Enforce LiDAR resolution sanity (1 m nominal)
     try:
