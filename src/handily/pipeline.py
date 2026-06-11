@@ -127,24 +127,7 @@ class REMWorkflow:
             else self.config.flowlines_buffer_m
         )
 
-        if self.config.rem_method == "anisotropic_frame":
-            from . import rem_frame
-
-            annotated = compute.propagate_flowline_confirmation(
-                flowlines_for_mask,
-                self.dem,
-                ndwi_da=self.ndwi,
-                ndwi_threshold=float(ndwi_threshold),
-                flowlines_buffer_m=buf_m,
-                max_hops=self.config.rem_propagate_hops,
-            )
-            reachable = annotated[annotated["reachable_from_seed"]].copy()
-            self.streams = compute.rasterize_confirmed_flowlines(reachable, self.dem)
-            result = rem_frame.compute_rem_anisotropic_frame(
-                self.dem, self.ndwi, reachable, self.config
-            )
-            self.rem = result.rem_da
-        elif self.config.rem_propagate_mask:
+        if self.config.rem_propagate_mask:
             self.streams = compute.build_network_propagated_mask(
                 flowlines_for_mask,
                 self.dem,
@@ -443,24 +426,7 @@ def run_experiment(
     # --- compute ---
     t0 = time.monotonic()
 
-    if config.rem_method == "anisotropic_frame":
-        from . import rem_frame
-
-        annotated = compute.propagate_flowline_confirmation(
-            flowlines_for_mask,
-            dem_da,
-            ndwi_da=ndwi_da,
-            ndwi_threshold=config.ndwi_threshold,
-            flowlines_buffer_m=config.flowlines_buffer_m,
-            max_hops=config.rem_propagate_hops,
-        )
-        reachable = annotated[annotated["reachable_from_seed"]].copy()
-        streams = compute.rasterize_confirmed_flowlines(reachable, dem_da)
-        result = rem_frame.compute_rem_anisotropic_frame(
-            dem_da, ndwi_da, reachable, config
-        )
-        rem_da = result.rem_da
-    elif config.rem_propagate_mask:
+    if config.rem_propagate_mask:
         streams = compute.build_network_propagated_mask(
             flowlines_for_mask,
             dem_da,
@@ -534,28 +500,7 @@ def run_experiment(
         "rem_excluded_fcodes": sorted(excluded),
         "rem_propagate_mask": config.rem_propagate_mask,
         "rem_propagate_hops": config.rem_propagate_hops,
-        "rem_method": config.rem_method,
     }
-    if config.rem_method == "anisotropic_frame":
-        params.update(
-            {
-                "rem_snap_w_elev": config.rem_snap_w_elev,
-                "rem_snap_w_water": config.rem_snap_w_water,
-                "rem_snap_w_prior": config.rem_snap_w_prior,
-                "rem_snap_w_transition": config.rem_snap_w_transition,
-                "rem_water_support_mode": config.rem_water_support_mode,
-                "rem_support_corridor_half_width_m": config.rem_support_corridor_half_width_m,
-                "rem_support_corridor_half_length_m": config.rem_support_corridor_half_length_m,
-                "rem_min_station_water_hit_fraction": config.rem_min_station_water_hit_fraction,
-                "rem_max_consecutive_no_water_m": config.rem_max_consecutive_no_water_m,
-                "rem_max_mean_snap_offset_m": config.rem_max_mean_snap_offset_m,
-                "rem_min_seeded_fraction": config.rem_min_seeded_fraction,
-                "rem_snap_max_offset_m": config.rem_snap_max_offset_m,
-                "rem_frame_station_spacing_m": config.rem_frame_station_spacing_m,
-                "rem_frame_smoothing_m": config.rem_frame_smoothing_m,
-                "rem_zero_mode": config.rem_zero_mode,
-            }
-        )
     run_meta = {
         "experiment_id": experiment_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
