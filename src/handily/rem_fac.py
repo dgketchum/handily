@@ -1287,6 +1287,7 @@ def _effective_config_from_args(args: argparse.Namespace):
         "streams_path": str(args.streams_path),
         "out_dir": str(args.out_dir),
         "naip_path": str(args.naip_path) if args.naip_path is not None else None,
+        "ndvi_path": str(args.ndvi_path) if args.ndvi_path is not None else None,
         "support_path": (
             str(args.support_path) if args.support_path is not None else None
         ),
@@ -1356,6 +1357,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--post-smooth-m", type=float, default=None)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--naip-path", type=Path, default=None)
+    parser.add_argument("--ndvi-path", type=Path, default=None)
     parser.add_argument("--support-path", type=Path, default=None)
     parser.add_argument("--fac-path", type=Path, default=None)
     cli = parser.parse_args(argv)
@@ -1377,6 +1379,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             cli.out_dir = Path(cfg.out_dir)
         if cli.naip_path is None and cfg.naip_path is not None:
             cli.naip_path = Path(cfg.naip_path)
+        if cli.ndvi_path is None and cfg.ndvi_path is not None:
+            cli.ndvi_path = Path(cfg.ndvi_path)
         if cli.support_path is None and cfg.support_path is not None:
             cli.support_path = Path(cfg.support_path)
         if cli.fac_path is None and cfg.fac_path is not None:
@@ -1521,28 +1525,36 @@ def main(argv: list[str] | None = None) -> None:
 
     strips.to_file(args.out_dir / "fac_normals_cross_sections.fgb", driver="FlatGeobuf")
 
-    if args.naip_path is not None:
+    if args.naip_path is not None or args.ndvi_path is not None:
         from handily.rem_fac_head import build_channel_heads
 
         print("Running channel-head longitudinal solve")
         t0 = perf_counter()
         _x, _y = _axes_from_bounds(tuple(dem_da.rio.bounds()), args.burn_res_m)
         _dem20 = sample_dem_to_grid(dem_da, _x, _y)
-        # Compute NDVI at native NAIP resolution, then resample to 20m with max
-        # so the greenest pixel in each cell drives the seed strength.
-        _x20, _y20 = _axes_from_bounds(tuple(dem_da.rio.bounds()), 20.0)
-        _dem_20m = sample_dem_to_grid(dem_da, _x20, _y20)
-        ndvi_native = compute_naip_ndvi_match(
-            str(args.naip_path),
-            _dem20,
-            resampling=RioResampling.nearest,
-        )
-        ndvi_da = ndvi_native.rio.reproject_match(
-            _dem_20m, resampling=RioResampling.max
-        )
-        print(
-            f"  NDVI: native {ndvi_native.shape} -> 20m {ndvi_da.shape} (max resample)"
-        )
+        if args.ndvi_path is not None:
+            # Prebuilt NDVI grid (e.g. evidence/ndvi_20m.tif from
+            # build_basin_naip_evidence.py) — used as-is.
+            ndvi_da = rioxarray.open_rasterio(args.ndvi_path).squeeze("band", drop=True)
+            ndvi_da = ndvi_da.rio.set_spatial_dims(x_dim="x", y_dim="y")
+            print(f"  NDVI: prebuilt {ndvi_da.shape} from {args.ndvi_path}")
+        else:
+            # Compute NDVI at native NAIP resolution, then resample to 20m with
+            # max so the greenest pixel in each cell drives the seed strength.
+            _x20, _y20 = _axes_from_bounds(tuple(dem_da.rio.bounds()), 20.0)
+            _dem_20m = sample_dem_to_grid(dem_da, _x20, _y20)
+            ndvi_native = compute_naip_ndvi_match(
+                str(args.naip_path),
+                _dem20,
+                resampling=RioResampling.nearest,
+            )
+            ndvi_da = ndvi_native.rio.reproject_match(
+                _dem_20m, resampling=RioResampling.max
+            )
+            print(
+                f"  NDVI: native {ndvi_native.shape} -> 20m {ndvi_da.shape} "
+                f"(max resample)"
+            )
 
         support_da = None
         if args.support_path is not None and args.support_path.exists():
