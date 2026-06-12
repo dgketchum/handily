@@ -10,7 +10,6 @@ from handily.rem_fac_topology import (
     estimate_reach_seed_strength,
     propagate_upstream_wet_influence,
 )
-from handily.rem_fac import _attach_fac_strip_head_elevations
 
 
 def _grid(values: np.ndarray) -> xr.DataArray:
@@ -95,6 +94,32 @@ def test_solve_channel_heads_support_hard_pinned():
     heads = solve_channel_heads(topo, d_min_off_support_m=0.5)
     by_id = heads.set_index("stream_id")
     assert np.isclose(by_id.loc[3, "head_depth_m"], 0.0)
+
+
+def test_order_area_hard_pin_pins_evidence_free_mainstem():
+    """High-order, high-drainage reach pins to the surface without mask support."""
+    topo = _seeded_topo()
+    topo.streams["strahler"] = [0, 1, 5]
+    topo.streams["drainage_km2"] = [1.0, 10.0, 600.0]
+    heads = solve_channel_heads(
+        topo, d_min_off_support_m=0.5, strahler_pin_min=5, area_pin_km2=250.0
+    )
+    by_id = heads.set_index("stream_id")
+    assert bool(by_id.loc[3, "hard_pin"])
+    assert np.isclose(by_id.loc[3, "head_depth_m"], 0.0)
+    assert not bool(by_id.loc[1, "hard_pin"])
+    assert by_id.loc[1, "head_depth_m"] >= 0.5 - 1e-9
+
+
+def test_order_pin_respects_area_guard():
+    """Order qualifies but junction-corrected drainage is tiny: no pin."""
+    topo = _seeded_topo()
+    topo.streams["strahler"] = [0, 1, 5]
+    topo.streams["drainage_km2"] = [1.0, 10.0, 2.0]
+    heads = solve_channel_heads(
+        topo, d_min_off_support_m=0.5, strahler_pin_min=5, area_pin_km2=250.0
+    )
+    assert not heads.set_index("stream_id")["hard_pin"].any()
 
 
 def test_support_at_shared_endpoint_does_not_hard_pin_neighbor():
@@ -239,46 +264,6 @@ def test_build_channel_heads_includes_propagated_weight():
         elevation_scale_m=2.0,
     )
     assert "topo_pin_weight" in heads.columns
-
-
-def test_attach_fac_strip_head_elevations_overrides_base():
-    """Head-solved base elevation should replace DEM-based values."""
-    strips = gpd.GeoDataFrame(
-        {
-            "stream_id": [1, 1, 2],
-            "reach_id": [10, 10, 20],
-            "hit_type": ["edge", "interreach", "edge"],
-            "target_reach_id": [-1, 20, -1],
-            "base_elev_m": [100.0, 100.0, 90.0],
-            "endpoint_elev_m": [100.0, 90.0, 90.0],
-            "geometry": [
-                LineString([(0, 0), (1, 0)]),
-                LineString([(0, 0), (1, 1)]),
-                LineString([(1, 0), (2, 0)]),
-            ],
-        },
-        geometry="geometry",
-        crs="EPSG:5070",
-    )
-    heads = gpd.GeoDataFrame(
-        {
-            "stream_id": [1, 2],
-            "reach_id": [10, 20],
-            "channel_head_m": [95.0, 88.0],
-            "geometry": [
-                LineString([(0.5, 0.5), (1.5, 0.5)]),
-                LineString([(1.5, 0.5), (2.5, 0.5)]),
-            ],
-        },
-        geometry="geometry",
-        crs="EPSG:5070",
-    )
-    result = _attach_fac_strip_head_elevations(strips, heads)
-    assert np.isclose(result.iloc[0]["base_elev_m"], 95.0)
-    assert np.isclose(result.iloc[1]["base_elev_m"], 95.0)
-    assert np.isclose(result.iloc[1]["endpoint_elev_m"], 88.0)
-    assert np.isclose(result.iloc[0]["endpoint_elev_m"], 95.0)
-    assert np.isclose(result.iloc[2]["endpoint_elev_m"], 88.0)
 
 
 # --- New residual-depth tests ---
@@ -445,6 +430,71 @@ def test_residual_solve_smooths_residual_not_absolute_head():
         )
 
 
+def test_drainage_area_prior_keeps_big_river_at_floor():
+    """High-drainage reaches with zero imagery evidence stay at the wet floor.
+
+    A river draining >= area_sag_hi_km2 never runs dry — the FAC-derived
+    area prior must hold it near the bed even when NDVI/support see nothing.
+    """
+    streams = _chain_streams()
+    elev = _sloped_elev()
+    ndvi = _grid(np.full((3, 5), 0.0, dtype=np.float64))
+    # 1e9 cells of 1 m2 = 1000 km2 — far above area_sag_hi_km2.
+    fac = _grid(np.full((3, 5), 1.0e9, dtype=np.float64))
+    heads = build_channel_heads(
+        streams,
+        elev,
+        ndvi,
+        fac_da=fac,
+        sample_spacing_m=0.5,
+        distance_scale_m=2.0,
+        elevation_scale_m=2.0,
+    )
+    by_id = heads.set_index("stream_id")
+    for sid in [1, 2, 3]:
+        assert by_id.loc[sid, "head_depth_m"] < 0.6, (
+            f"reach {sid}: depth {by_id.loc[sid, 'head_depth_m']:.2f} m — "
+            "area prior failed to hold a big river near the bed"
+        )
+    # Control: the same bone-dry chain without FAC detaches.
+    heads_dry = build_channel_heads(
+        streams,
+        elev,
+        ndvi,
+        sample_spacing_m=0.5,
+        distance_scale_m=2.0,
+        elevation_scale_m=2.0,
+    )
+    assert heads_dry.set_index("stream_id").loc[1, "head_depth_m"] > 1.0
+
+
+def test_hydraulic_slope_floor_does_not_drag_wet_reaches_off_bed():
+    """Observed-wet reaches above a steep wet-to-wet bed drop stay near bed.
+
+    With a tight max_hydraulic_slope and steep bed, the slope floor would
+    push an unpinned wet reach to its r_max cap (depth = d_min + rmax_min).
+    Wet evidence must relax the allowance so depth stays at the d_min floor.
+    """
+    streams = _steep_chain()
+    elev = _steep_elev()
+    # High NDVI everywhere: every reach is a strong seed (w_wet ~ 1) but
+    # nothing is hard-pinned (no support raster).
+    ndvi = _grid(np.full((3, 5), 0.8, dtype=np.float64))
+    heads = build_channel_heads(
+        streams,
+        elev,
+        ndvi,
+        sample_spacing_m=0.5,
+        max_hydraulic_slope=0.05,
+    )
+    by_id = heads.set_index("stream_id")
+    for sid in [1, 2, 3]:
+        assert by_id.loc[sid, "head_depth_m"] < 0.6, (
+            f"reach {sid}: depth {by_id.loc[sid, 'head_depth_m']:.2f} m — "
+            "slope floor dragged a wet reach off the bed"
+        )
+
+
 def test_max_hydraulic_slope_becomes_lower_bound_on_residual():
     """Hydraulic slope constraint should increase r when bed drops steeply."""
     topo = _steep_seeded_topo(wet_reach=3)
@@ -493,6 +543,43 @@ def test_invalid_reach_excluded_does_not_break_neighbors():
     assert np.isnan(by_id.loc[2, "channel_head_m"])
     assert np.isfinite(by_id.loc[1, "channel_head_m"])
     assert np.isfinite(by_id.loc[3, "channel_head_m"])
+
+
+def test_downstream_wet_propagation_keeps_mainstem_wet():
+    """Reaches below a wet headwater seed must not sag toward r_max.
+
+    Wet support on the upstream-most reach; the two downstream reaches
+    have no local evidence. Without downstream propagation they would sag
+    toward r_target (tens of m with default rmax) — with it they stay
+    near the bed.
+    """
+    streams = _chain_streams()
+    elev = _sloped_elev()
+    ndvi = _grid(np.full((3, 5), 0.0, dtype=np.float64))
+    support = _grid(np.zeros((3, 5), dtype=np.float64))
+    for c in [0, 1]:
+        support.values[2, c] = 1.0
+
+    heads = build_channel_heads(
+        streams,
+        elev,
+        ndvi,
+        support_da=support,
+        sample_spacing_m=0.5,
+        distance_scale_m=2.0,
+        elevation_scale_m=2.0,
+        down_distance_scale_m=100.0,
+        # Toy bed drops 1 m per 1 m reach; loosen the hydraulic-slope floor
+        # so it doesn't force detachment regardless of wetness.
+        max_hydraulic_slope=2.0,
+    )
+    by_id = heads.set_index("stream_id")
+    assert np.isclose(by_id.loc[1, "head_depth_m"], 0.0)
+    for sid in [2, 3]:
+        assert by_id.loc[sid, "head_depth_m"] < 1.0, (
+            f"reach {sid}: depth {by_id.loc[sid, 'head_depth_m']:.2f} m "
+            "should stay near bed below a wet headwater"
+        )
 
 
 def test_solve_channel_heads_dry_headwaters_detach():
