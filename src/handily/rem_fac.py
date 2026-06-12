@@ -23,6 +23,7 @@ from time import perf_counter
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import rioxarray
 import xarray as xr
 import rasterio
@@ -687,9 +688,47 @@ def _generate_strip_rows_for_chunk(
     return out
 
 
+def _snap_points_to_fac_max(
+    xy: np.ndarray,
+    fac_da: xr.DataArray,
+    radius_cells: int,
+) -> np.ndarray:
+    """Snap each (x, y) point to the max-FAC cell center within a window.
+
+    At coarse resolution the vectorized stream line can sit a cell off the
+    true channel; sampling terrain at the line blends bank cells into the
+    base elevation.  Snapping to the strongest accumulation cell targets
+    the channel itself.  Points outside the FAC grid (or with no finite
+    FAC in the window) are returned unchanged.
+    """
+    fac = np.asarray(fac_da.values, dtype=np.float64)
+    xs = fac_da.x.values.astype(np.float64)
+    ys = fac_da.y.values.astype(np.float64)
+    cols = np.round((xy[:, 0] - xs[0]) / (xs[1] - xs[0])).astype(np.int64)
+    rows = np.round((xy[:, 1] - ys[0]) / (ys[1] - ys[0])).astype(np.int64)
+    inside = (cols >= 0) & (cols < xs.size) & (rows >= 0) & (rows < ys.size)
+
+    offs = np.arange(-radius_cells, radius_cells + 1)
+    rr = np.clip(rows[:, None, None] + offs[None, :, None], 0, ys.size - 1)
+    cc = np.clip(cols[:, None, None] + offs[None, None, :], 0, xs.size - 1)
+    win = np.where(np.isfinite(fac[rr, cc]), fac[rr, cc], -np.inf)
+    flat = win.reshape(len(xy), -1)
+    best = np.argmax(flat, axis=1)
+    idx = np.arange(len(xy))
+    found = inside & np.isfinite(flat[idx, best])
+
+    out = xy.astype(np.float64).copy()
+    out[found, 0] = xs[cc.reshape(len(xy), -1)[idx, best][found]]
+    out[found, 1] = ys[rr.reshape(len(xy), -1)[idx, best][found]]
+    return out
+
+
 def _attach_fac_strip_elevations(
     strips: gpd.GeoDataFrame,
     dem_da: xr.DataArray,
+    fac_da: xr.DataArray | None = None,
+    base_fac_snap_cells: int = 0,
+    base_smooth_stations: int = 0,
 ) -> gpd.GeoDataFrame:
     if strips.empty:
         strips["base_elev_m"] = np.array([], dtype=np.float64)
@@ -701,24 +740,51 @@ def _attach_fac_strip_elevations(
         dem_da.x.values.astype(np.float64),
         dem_da.y.values.astype(np.float64),
     )
-    base_pts = np.column_stack(
+    base_xy = np.column_stack(
         [
-            strips["base_y"].to_numpy(dtype=np.float64),
             strips["base_x"].to_numpy(dtype=np.float64),
+            strips["base_y"].to_numpy(dtype=np.float64),
         ]
     )
-    base_elev = dem_interp(base_pts)
-    endpoint_elev = base_elev.copy()
+    snap = fac_da is not None and base_fac_snap_cells > 0
+    if snap:
+        base_xy = _snap_points_to_fac_max(base_xy, fac_da, base_fac_snap_cells)
+    base_elev = dem_interp(np.column_stack([base_xy[:, 1], base_xy[:, 0]]))
 
+    if base_smooth_stations > 1:
+        # Smooth the per-station base profile along each reach with a rolling
+        # low quantile keyed on s_m, so residual bank contamination and
+        # station-to-station jitter don't stamp a noisy water surface.
+        df = pd.DataFrame(
+            {
+                "sid": strips["stream_id"].to_numpy(),
+                "s": strips["s_m"].to_numpy(dtype=np.float64),
+                "e": base_elev,
+            }
+        )
+        stations = df.drop_duplicates(["sid", "s"]).sort_values(["sid", "s"]).copy()
+        stations["e_sm"] = stations.groupby("sid")["e"].transform(
+            lambda s: s.rolling(
+                base_smooth_stations, center=True, min_periods=1
+            ).quantile(0.25)
+        )
+        lut = stations.set_index(["sid", "s"])["e_sm"]
+        base_elev = lut.loc[pd.MultiIndex.from_arrays([df["sid"], df["s"]])].to_numpy()
+
+    endpoint_elev = base_elev.copy()
     interreach = strips["hit_type"].eq("interreach").to_numpy()
     if interreach.any():
-        end_pts = np.column_stack(
+        end_xy = np.column_stack(
             [
-                strips.loc[interreach, "endpoint_y"].to_numpy(dtype=np.float64),
                 strips.loc[interreach, "endpoint_x"].to_numpy(dtype=np.float64),
+                strips.loc[interreach, "endpoint_y"].to_numpy(dtype=np.float64),
             ]
         )
-        endpoint_elev[interreach] = dem_interp(end_pts)
+        if snap:
+            end_xy = _snap_points_to_fac_max(end_xy, fac_da, base_fac_snap_cells)
+        endpoint_elev[interreach] = dem_interp(
+            np.column_stack([end_xy[:, 1], end_xy[:, 0]])
+        )
 
     strips = strips.copy()
     strips["base_elev_m"] = base_elev
@@ -828,6 +894,9 @@ def generate_fac_strips(
     min_hit_dist_m: float = DEFAULT_MIN_HIT_DIST_M,
     halo_n: int = 0,
     workers: int = DEFAULT_WORKERS,
+    fac_da: xr.DataArray | None = None,
+    base_fac_snap_cells: int = 0,
+    base_smooth_stations: int = 0,
 ) -> gpd.GeoDataFrame:
     if field is None:
         field = build_orientation_field(dem_da)
@@ -976,7 +1045,13 @@ def generate_fac_strips(
         strips = strips.sort_values(["reach_id", "side", "station_id"]).reset_index(
             drop=True
         )
-    return _attach_fac_strip_elevations(strips, dem_da)
+    return _attach_fac_strip_elevations(
+        strips,
+        dem_da,
+        fac_da=fac_da,
+        base_fac_snap_cells=base_fac_snap_cells,
+        base_smooth_stations=base_smooth_stations,
+    )
 
 
 def build_fac_wedges(strips: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -1305,6 +1380,8 @@ def _effective_config_from_args(args: argparse.Namespace):
         "idw_radius_m": args.idw_radius_m,
         "idw_power": args.idw_power,
         "post_smooth_m": args.post_smooth_m,
+        "base_fac_snap_cells": args.base_fac_snap_cells,
+        "base_smooth_stations": args.base_smooth_stations,
     }
     kwargs.update(args.head_solve_kwargs)
     return FacRemConfig(**kwargs)
@@ -1355,6 +1432,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--idw-radius-m", type=float, default=None)
     parser.add_argument("--idw-power", type=float, default=None)
     parser.add_argument("--post-smooth-m", type=float, default=None)
+    parser.add_argument("--base-fac-snap-cells", type=int, default=None)
+    parser.add_argument("--base-smooth-stations", type=int, default=None)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--naip-path", type=Path, default=None)
     parser.add_argument("--ndvi-path", type=Path, default=None)
@@ -1409,6 +1488,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             cli.idw_power = cfg.idw_power
         if cli.post_smooth_m is None:
             cli.post_smooth_m = cfg.post_smooth_m
+        if cli.base_fac_snap_cells is None:
+            cli.base_fac_snap_cells = cfg.base_fac_snap_cells
+        if cli.base_smooth_stations is None:
+            cli.base_smooth_stations = cfg.base_smooth_stations
         if cli.workers is None:
             cli.workers = cfg.workers
         # Stash head-solve kwargs from config for main() to use.
@@ -1445,6 +1528,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             cli.idw_power = DEFAULT_IDW_POWER
         if cli.post_smooth_m is None:
             cli.post_smooth_m = 0.0
+        if cli.base_fac_snap_cells is None:
+            cli.base_fac_snap_cells = 0
+        if cli.base_smooth_stations is None:
+            cli.base_smooth_stations = 0
         if cli.workers is None:
             cli.workers = DEFAULT_WORKERS
         cli.head_solve_kwargs = {}
@@ -1491,6 +1578,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     field.smoothed_dem.rio.to_raster(args.out_dir / "fac_normals_smoothed_dem.tif")
 
+    fac_da = None
+    if args.fac_path is not None and args.fac_path.exists():
+        fac_da = rioxarray.open_rasterio(args.fac_path).squeeze("band", drop=True)
+        fac_da = fac_da.rio.set_spatial_dims(x_dim="x", y_dim="y")
+        fac_da = fac_da.where(fac_da >= 0)
+
     print("Generating aspect-normal strips")
     strips = generate_fac_strips(
         streams,
@@ -1501,6 +1594,9 @@ def main(argv: list[str] | None = None) -> None:
         min_hit_dist_m=args.min_hit_dist_m,
         halo_n=args.halo_n,
         workers=args.workers,
+        fac_da=fac_da,
+        base_fac_snap_cells=args.base_fac_snap_cells,
+        base_smooth_stations=args.base_smooth_stations,
     )
     print(
         f"  strips: {len(strips)} "
@@ -1562,12 +1658,6 @@ def main(argv: list[str] | None = None) -> None:
                 "band", drop=True
             )
             support_da = support_da.rio.set_spatial_dims(x_dim="x", y_dim="y")
-
-        fac_da = None
-        if args.fac_path is not None and args.fac_path.exists():
-            fac_da = rioxarray.open_rasterio(args.fac_path).squeeze("band", drop=True)
-            fac_da = fac_da.rio.set_spatial_dims(x_dim="x", y_dim="y")
-            fac_da = fac_da.where(fac_da >= 0)
 
         heads = build_channel_heads(
             streams,

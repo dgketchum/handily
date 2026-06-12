@@ -17,6 +17,11 @@ workers = 48
 
 [raster]
 burn_res_m = 10.0
+# Burn-side bed-bias fix: snap strip base points to the max-FAC cell
+# (channel) within 2 cells before sampling, then smooth the per-reach
+# base profile with a rolling q25 over 5 stations.
+base_fac_snap_cells = 2
+base_smooth_stations = 5
 
 [sag]
 area_sag_lo_km2 = 25.0
