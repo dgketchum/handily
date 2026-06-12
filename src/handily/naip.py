@@ -309,10 +309,17 @@ def decode_sid(
     sid_path: str,
     tif_path: str,
     bounds_wsen: tuple[float, float, float, float] | None = None,
+    scale: int | None = None,
 ) -> str:
-    """Decode a MrSID file to GeoTIFF using ``mrsiddecode``."""
+    """Decode a MrSID file to GeoTIFF using ``mrsiddecode``.
+
+    ``scale`` selects a reduced-resolution decode level: output resolution
+    is ``native * 2**scale`` (e.g. scale=3 on 0.6m NAIP yields ~4.8m).
+    """
 
     cmd = [MRSIDDECODE, "-i", sid_path, "-o", tif_path, "-of", "tifg", "-wf"]
+    if scale is not None:
+        cmd.extend(["-s", str(scale)])
     if bounds_wsen is not None:
         from pyproj import Transformer
 
