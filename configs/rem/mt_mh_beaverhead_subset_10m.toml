@@ -1,0 +1,13 @@
+# Beaverhead AOI-cluster subset of the Missouri Headwaters 10m REM —
+# fast-iteration test bed (~17 Mpx, 1,754 reaches) covering the three
+# AOIs with 1m benchmark products (mt 0007/0009/0010) plus the
+# Beaverhead mainstem. Evidence/FAC rasters stay full-basin (sampled by
+# coordinate); only DEM and streams are clipped.
+# Box (EPSG:5070): -1382500 2601500 -1341000 2642250
+
+profile = "mt_missouri_headwaters_10m.toml"
+
+[paths]
+dem_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/dem_10m.tif"
+streams_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/streams_regional.fgb"
+out_dir = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/rem_10m"
