@@ -708,18 +708,20 @@ def _snap_points_to_fac_max(
     rows = np.round((xy[:, 1] - ys[0]) / (ys[1] - ys[0])).astype(np.int64)
     inside = (cols >= 0) & (cols < xs.size) & (rows >= 0) & (rows < ys.size)
 
+    k = 2 * radius_cells + 1
     offs = np.arange(-radius_cells, radius_cells + 1)
     rr = np.clip(rows[:, None, None] + offs[None, :, None], 0, ys.size - 1)
     cc = np.clip(cols[:, None, None] + offs[None, None, :], 0, xs.size - 1)
+    rr = np.broadcast_to(rr, (len(xy), k, k)).reshape(len(xy), -1)
+    cc = np.broadcast_to(cc, (len(xy), k, k)).reshape(len(xy), -1)
     win = np.where(np.isfinite(fac[rr, cc]), fac[rr, cc], -np.inf)
-    flat = win.reshape(len(xy), -1)
-    best = np.argmax(flat, axis=1)
+    best = np.argmax(win, axis=1)
     idx = np.arange(len(xy))
-    found = inside & np.isfinite(flat[idx, best])
+    found = inside & np.isfinite(win[idx, best])
 
     out = xy.astype(np.float64).copy()
-    out[found, 0] = xs[cc.reshape(len(xy), -1)[idx, best][found]]
-    out[found, 1] = ys[rr.reshape(len(xy), -1)[idx, best][found]]
+    out[found, 0] = xs[cc[idx, best][found]]
+    out[found, 1] = ys[rr[idx, best][found]]
     return out
 
 
