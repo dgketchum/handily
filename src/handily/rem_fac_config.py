@@ -36,7 +36,14 @@ CONFIG_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "halo_n",
         "workers",
     ),
-    "raster": ("burn_res_m", "idw_radius_m", "idw_power", "post_smooth_m"),
+    "raster": (
+        "burn_res_m",
+        "idw_radius_m",
+        "idw_power",
+        "post_smooth_m",
+        "base_fac_snap_cells",
+        "base_smooth_stations",
+    ),
     "seed": ("ndvi_mid", "ndvi_scale", "ndvi_quantile", "support_override"),
     "propagation": (
         "distance_scale_m",
@@ -140,6 +147,8 @@ class FacRemConfig:
     idw_radius_m: float = 200.0
     idw_power: float = 1.0
     post_smooth_m: float = 0.0
+    base_fac_snap_cells: int = 0
+    base_smooth_stations: int = 0
 
     # --- Head-solve: seed strength ---
     ndvi_mid: float = 0.20
