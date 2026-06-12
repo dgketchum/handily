@@ -21,6 +21,7 @@ CONFIG_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "streams_path",
         "out_dir",
         "naip_path",
+        "ndvi_path",
         "support_path",
         "fac_path",
     ),
@@ -55,6 +56,8 @@ CONFIG_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
     "solver": (
         "d_min_off_support_m",
         "support_fraction_threshold",
+        "strahler_pin_min",
+        "area_pin_km2",
         "target_weight_base",
         "zero_weight_base",
         "smoothness_weight",
@@ -117,6 +120,7 @@ class FacRemConfig:
     streams_path: str
     out_dir: str
     naip_path: str | None = None
+    ndvi_path: str | None = None
     support_path: str | None = None
     fac_path: str | None = None
 
@@ -161,6 +165,8 @@ class FacRemConfig:
     # --- Head-solve: residual solver ---
     d_min_off_support_m: float = 0.5
     support_fraction_threshold: float = 0.25
+    strahler_pin_min: int | None = None
+    area_pin_km2: float | None = None
     target_weight_base: float = 2.0
     zero_weight_base: float = 2.0
     smoothness_weight: float = 1.0
@@ -175,6 +181,7 @@ class FacRemConfig:
             "streams_path",
             "out_dir",
             "naip_path",
+            "ndvi_path",
             "support_path",
             "fac_path",
         ):
@@ -230,6 +237,8 @@ class FacRemConfig:
             "area_sag_hi_km2": self.area_sag_hi_km2,
             "d_min_off_support_m": self.d_min_off_support_m,
             "support_fraction_threshold": self.support_fraction_threshold,
+            "strahler_pin_min": self.strahler_pin_min,
+            "area_pin_km2": self.area_pin_km2,
             "target_weight_base": self.target_weight_base,
             "zero_weight_base": self.zero_weight_base,
             "smoothness_weight": self.smoothness_weight,

@@ -1,0 +1,27 @@
+# Missouri Headwaters basin-scale FAC REM on the regional 10m grid.
+# First-look run: head solve matches head_solve_10m run 4
+# (25/250 sag + Strahler>=5/area>=250 hard pin), strips/burn/IDW at 10m.
+
+profile = "profiles/mt_0009_best.toml"
+
+[paths]
+dem_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/dem_10m.tif"
+streams_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/streams_regional.fgb"
+out_dir = "/data/ssd2/handily/mt/regional/missouri_headwaters/rem_10m"
+ndvi_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/evidence/ndvi_20m.tif"
+support_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/evidence/support_20m.tif"
+fac_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/flow_accumulation.tif"
+
+[strips]
+workers = 48
+
+[raster]
+burn_res_m = 10.0
+
+[sag]
+area_sag_lo_km2 = 25.0
+area_sag_hi_km2 = 250.0
+
+[solver]
+strahler_pin_min = 5
+area_pin_km2 = 250.0
