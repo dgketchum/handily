@@ -53,6 +53,16 @@ def test_snap_moves_offset_point_to_channel_cell(channel_grids):
     assert snapped[0, 0] == pytest.approx(35.0)
 
 
+def test_snap_finds_max_anywhere_in_window():
+    # single FAC peak at the window's bottom-right corner — its flattened
+    # index exceeds one window row, which a (N, k) reshape would miss
+    fac = np.ones((7, 7))
+    fac[5, 5] = 1000.0
+    # point at cell (3, 3) = (35, 35); peak cell (5, 5) = (55, 15)
+    snapped = _snap_points_to_fac_max(np.array([[35.0, 35.0]]), _grid_da(fac), 2)
+    assert snapped[0].tolist() == pytest.approx([55.0, 15.0])
+
+
 def test_snap_outside_grid_returns_point_unchanged(channel_grids):
     _, fac_da = channel_grids
     pt = np.array([[1e6, 1e6]])
