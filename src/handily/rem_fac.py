@@ -15,10 +15,11 @@ ownership/rasterization workflow.
 from __future__ import annotations
 
 import argparse
+import json
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import geopandas as gpd
 import numpy as np
@@ -725,72 +726,6 @@ def _attach_fac_strip_elevations(
     return strips
 
 
-def _attach_fac_strip_head_elevations(
-    strips: gpd.GeoDataFrame,
-    heads_gdf: gpd.GeoDataFrame,
-) -> gpd.GeoDataFrame:
-    """Override strip base/endpoint elevations with solved channel heads.
-
-    Strips must already have DEM-based elevations (from generate_fac_strips).
-    Values are only overridden where the head lookup succeeds; DEM values
-    are preserved as fallback.
-    """
-    if strips.empty:
-        return strips
-
-    strips = strips.copy()
-
-    head_by_stream = dict(
-        zip(
-            heads_gdf["stream_id"].astype(int),
-            heads_gdf["channel_head_m"].astype(np.float64),
-        )
-    )
-    head_by_reach: dict[int, float] = {}
-    if "reach_id" in heads_gdf.columns:
-        head_by_reach = dict(
-            zip(
-                heads_gdf["reach_id"].astype(int),
-                heads_gdf["channel_head_m"].astype(np.float64),
-            )
-        )
-
-    # Override base elevation with source reach's solved head
-    base_heads = np.array(
-        [head_by_stream.get(int(sid), np.nan) for sid in strips["stream_id"]],
-        dtype=np.float64,
-    )
-    has_base = np.isfinite(base_heads)
-    if has_base.any():
-        strips.loc[has_base, "base_elev_m"] = base_heads[has_base]
-
-    # Override interreach endpoint with target reach's solved head
-    interreach = strips["hit_type"].eq("interreach").to_numpy()
-    if interreach.any() and head_by_reach:
-        ep_heads = np.array(
-            [
-                head_by_reach.get(int(rid), np.nan)
-                for rid in strips.loc[interreach, "target_reach_id"]
-            ],
-            dtype=np.float64,
-        )
-        has_ep = np.isfinite(ep_heads)
-        idx_ir = strips.index[interreach]
-        if has_ep.any():
-            strips.loc[idx_ir[has_ep], "endpoint_elev_m"] = ep_heads[has_ep]
-
-    # Edge and halo strips: endpoint = base
-    edge_or_halo = (
-        strips["hit_type"].eq("edge") | strips["hit_type"].eq("halo")
-    ).to_numpy()
-    if edge_or_halo.any():
-        strips.loc[edge_or_halo, "endpoint_elev_m"] = strips.loc[
-            edge_or_halo, "base_elev_m"
-        ].values
-
-    return strips
-
-
 def _attach_fac_strip_head_depth_offset(
     strips: gpd.GeoDataFrame,
     heads_gdf: gpd.GeoDataFrame,
@@ -1344,6 +1279,56 @@ def fill_sparse_sections_idw(
     return filled_da, rem_da
 
 
+def _effective_config_from_args(args: argparse.Namespace):
+    from handily.rem_fac_config import FacRemConfig
+
+    kwargs = {
+        "dem_path": str(args.dem_path),
+        "streams_path": str(args.streams_path),
+        "out_dir": str(args.out_dir),
+        "naip_path": str(args.naip_path) if args.naip_path is not None else None,
+        "support_path": (
+            str(args.support_path) if args.support_path is not None else None
+        ),
+        "fac_path": str(args.fac_path) if args.fac_path is not None else None,
+        "coarse_res_m": args.coarse_res_m,
+        "smooth_sigma_m": args.smooth_sigma_m,
+        "station_spacing_m": args.station_spacing_m,
+        "tangent_step_m": args.tangent_step_m,
+        "min_hit_dist_m": args.min_hit_dist_m,
+        "min_strahler": args.min_strahler,
+        "max_crossing_strip_m": args.max_crossing_strip_m,
+        "halo_n": args.halo_n,
+        "workers": args.workers,
+        "burn_res_m": args.burn_res_m,
+        "idw_radius_m": args.idw_radius_m,
+        "idw_power": args.idw_power,
+        "post_smooth_m": args.post_smooth_m,
+    }
+    kwargs.update(args.head_solve_kwargs)
+    return FacRemConfig(**kwargs)
+
+
+def _write_run_metadata(
+    args: argparse.Namespace,
+    diagnostics: dict[str, object],
+) -> None:
+    effective_config = _effective_config_from_args(args)
+    metadata = {
+        "schema_version": 1,
+        "command": "python -m handily.rem_fac",
+        "config_path": args.config_source_path,
+        "profile_path": args.profile_path,
+        "effective_config": effective_config.to_section_dict(),
+        "diagnostics": diagnostics,
+    }
+    out_path = args.out_dir / "fac_rem_run.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"Wrote {out_path.name}")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="FAC-based aspect-normal strip prototype"
@@ -1372,12 +1357,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--naip-path", type=Path, default=None)
     parser.add_argument("--support-path", type=Path, default=None)
+    parser.add_argument("--fac-path", type=Path, default=None)
     cli = parser.parse_args(argv)
+    cli.config_source_path = None
+    cli.profile_path = None
 
     if cli.config is not None:
         from handily.rem_fac_config import FacRemConfig
 
         cfg = FacRemConfig.from_toml(cli.config)
+        cli.config_source_path = getattr(cfg, "source_path", str(cli.config))
+        cli.profile_path = getattr(cfg, "profile_path", None)
         # Config provides defaults; CLI flags override.
         if cli.dem_path is None:
             cli.dem_path = Path(cfg.dem_path)
@@ -1389,6 +1379,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             cli.naip_path = Path(cfg.naip_path)
         if cli.support_path is None and cfg.support_path is not None:
             cli.support_path = Path(cfg.support_path)
+        if cli.fac_path is None and cfg.fac_path is not None:
+            cli.fac_path = Path(cfg.fac_path)
         if cli.coarse_res_m is None:
             cli.coarse_res_m = cfg.coarse_res_m
         if cli.smooth_sigma_m is None:
@@ -1459,6 +1451,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics: dict[str, object] = {}
 
     print(f"Loading DEM: {args.dem_path}")
     dem_da = rioxarray.open_rasterio(args.dem_path).squeeze("band", drop=True)
@@ -1477,6 +1470,7 @@ def main(argv: list[str] | None = None) -> None:
     ].copy()
     streams = streams.sort_values("reach_id").reset_index(drop=True)
     print(f"  streams: {len(streams)}")
+    diagnostics["streams"] = {"count": int(len(streams))}
 
     print("Building smoothed DEM orientation field")
     field = build_orientation_field(
@@ -1509,6 +1503,7 @@ def main(argv: list[str] | None = None) -> None:
         f"({int((strips['hit_type'] == 'interreach').sum())} interreach, "
         f"{int((strips['hit_type'] == 'edge').sum())} edge)"
     )
+    strips_before_filter = len(strips)
     if args.max_crossing_strip_m > 0:
         n_before = len(strips)
         strips = _remove_long_crossing_strips(strips, args.max_crossing_strip_m)
@@ -1516,6 +1511,13 @@ def main(argv: list[str] | None = None) -> None:
             f"  crossing filter (>{args.max_crossing_strip_m:.0f} m): "
             f"removed {n_before - len(strips)}, kept {len(strips)}"
         )
+    diagnostics["strips"] = {
+        "count_before_filter": int(strips_before_filter),
+        "count": int(len(strips)),
+        "removed_long_crossing": int(strips_before_filter - len(strips)),
+        "interreach": int((strips["hit_type"] == "interreach").sum()),
+        "edge": int((strips["hit_type"] == "edge").sum()),
+    }
 
     strips.to_file(args.out_dir / "fac_normals_cross_sections.fgb", driver="FlatGeobuf")
 
@@ -1549,11 +1551,18 @@ def main(argv: list[str] | None = None) -> None:
             )
             support_da = support_da.rio.set_spatial_dims(x_dim="x", y_dim="y")
 
+        fac_da = None
+        if args.fac_path is not None and args.fac_path.exists():
+            fac_da = rioxarray.open_rasterio(args.fac_path).squeeze("band", drop=True)
+            fac_da = fac_da.rio.set_spatial_dims(x_dim="x", y_dim="y")
+            fac_da = fac_da.where(fac_da >= 0)
+
         heads = build_channel_heads(
             streams,
             _dem20,
             ndvi_da,
             support_da=support_da,
+            fac_da=fac_da,
             **args.head_solve_kwargs,
         )
         heads.to_file(args.out_dir / "fac_channel_heads.fgb", driver="FlatGeobuf")
@@ -1565,6 +1574,13 @@ def main(argv: list[str] | None = None) -> None:
             f"head depth: min={depth.min():.2f} mean={depth.mean():.2f} "
             f"max={depth.max():.2f} m"
         )
+        diagnostics["heads"] = {
+            "count": int(len(heads)),
+            "runtime_s": float(dt),
+            "head_depth_min_m": float(depth.min()),
+            "head_depth_mean_m": float(depth.mean()),
+            "head_depth_max_m": float(depth.max()),
+        }
     else:
         strips_depth = None
 
@@ -1584,6 +1600,12 @@ def main(argv: list[str] | None = None) -> None:
             f"  sparse burn: {burned}/{total} pixels "
             f"({100.0 * burned / max(total, 1):.1f}%), {dt:.2f}s"
         )
+        diagnostics["sparse_burn"] = {
+            "pixels_burned": int(burned),
+            "pixels_total": int(total),
+            "coverage_fraction": float(burned / max(total, 1)),
+            "runtime_s": float(dt),
+        }
 
         print("IDW-filling depth-offset raster")
         t0 = perf_counter()
@@ -1606,6 +1628,12 @@ def main(argv: list[str] | None = None) -> None:
         dt = perf_counter() - t0
         hd_filled = int(np.isfinite(hd_idw_ws_da.values).sum())
         print(f"  idw fill: {hd_filled}/{total} pixels, {dt:.2f}s")
+        diagnostics["idw_fill"] = {
+            "pixels_filled": int(hd_filled),
+            "pixels_total": int(total),
+            "coverage_fraction": float(hd_filled / max(total, 1)),
+            "runtime_s": float(dt),
+        }
 
         res_tag = f"{int(args.burn_res_m)}m"
         sparse_hd_da.rio.to_raster(
@@ -1617,6 +1645,7 @@ def main(argv: list[str] | None = None) -> None:
         hd_idw_rem_da.rio.to_raster(args.out_dir / f"fac_head_depth_rem_{res_tag}.tif")
         print(f"Wrote fac_head_depth_rem_{res_tag}.tif")
 
+    _write_run_metadata(args, diagnostics)
     print(f"Done — outputs in {args.out_dir}")
 
 

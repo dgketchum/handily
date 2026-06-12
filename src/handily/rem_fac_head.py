@@ -22,7 +22,10 @@ from handily.rem_fac_topology import (
     FacTopologyResult,
     build_fac_topology,
     estimate_reach_seed_strength,
+    propagate_downstream_wet_influence,
     propagate_upstream_wet_influence,
+    compute_strahler_from_topology,
+    sample_reach_drainage_km2,
 )
 
 LOGGER = logging.getLogger("handily.rem_fac_head")
@@ -33,6 +36,9 @@ def _build_residual_targets(
     *,
     distance_scale_m: float = 4000.0,
     elevation_scale_m: float = 25.0,
+    down_distance_scale_m: float = 20000.0,
+    area_sag_lo_km2: float = 50.0,
+    area_sag_hi_km2: float = 500.0,
     alpha_d: float = 0.75,
     alpha_z: float = 1.0,
     gamma: float = 2.0,
@@ -40,6 +46,8 @@ def _build_residual_targets(
     rmax_max_m: float = 60.0,
 ) -> gpd.GeoDataFrame:
     """Derive per-reach sag targets and bounds from propagated wet influence."""
+    if not (0.0 < area_sag_lo_km2 < area_sag_hi_km2):
+        raise ValueError("require 0 < area_sag_lo_km2 < area_sag_hi_km2")
     out = streams.copy()
 
     w_wet = out["topo_pin_weight"].values.astype(np.float64)
@@ -50,7 +58,36 @@ def _build_residual_targets(
     f_d = 1.0 - np.exp(-dist / max(distance_scale_m, 1.0))
     f_z = 1.0 - np.exp(-gain / max(elevation_scale_m, 1.0))
 
-    g = np.clip(np.maximum(dry, np.maximum(alpha_d * f_d, alpha_z * f_z)), 0.0, 1.0)
+    # fmax ignores NaN from dist/gain on reaches with no reachable seed,
+    # so those fall back to the dryness term instead of collapsing to NaN.
+    g = np.clip(np.fmax(dry, np.fmax(alpha_d * f_d, alpha_z * f_z)), 0.0, 1.0)
+
+    if "topo_down_weight" in out.columns:
+        # Per-source sag drivers, wettest evidence wins: upstream-propagated
+        # influence (above) and downstream-propagated influence each bound
+        # the sag independently; fmin takes the lower (wetter) of the two.
+        # Downstream of a wet seed there is no elevation barrier, so g_down
+        # uses distance attenuation only.
+        w_down = out["topo_down_weight"].values.astype(np.float64)
+        dist_down = out["topo_down_dist_m"].values.astype(np.float64)
+        f_dd = 1.0 - np.exp(-dist_down / max(down_distance_scale_m, 1.0))
+        g_down = np.clip(np.fmax(1.0 - w_down, alpha_d * f_dd), 0.0, 1.0)
+        out["sag_driver_down"] = g_down
+        g = np.fmin(g, g_down)
+
+    if "drainage_km2" in out.columns:
+        # Never-runs-dry prior: a river draining >= area_sag_hi_km2 does not
+        # disappear underground, so the sag driver is forced to 0 there
+        # regardless of imagery evidence; the ceiling ramps log-linearly up
+        # to 1 at area_sag_lo_km2. fmin ignores NaN where drainage is unknown.
+        area = out["drainage_km2"].values.astype(np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            g_area = (np.log(area_sag_hi_km2) - np.log(area)) / (
+                np.log(area_sag_hi_km2) - np.log(area_sag_lo_km2)
+            )
+        g_area = np.clip(g_area, 0.0, 1.0)
+        out["sag_driver_area"] = g_area
+        g = np.fmin(g, g_area)
 
     r_max = rmax_min_m + (rmax_max_m - rmax_min_m) * g
     r_target = r_max * np.power(g, gamma)
@@ -67,6 +104,8 @@ def solve_channel_heads(
     *,
     d_min_off_support_m: float = 0.5,
     support_fraction_threshold: float = 0.25,
+    strahler_pin_min: int | None = None,
+    area_pin_km2: float | None = None,
     target_weight_base: float = 2.0,
     zero_weight_base: float = 2.0,
     smoothness_weight: float = 1.0,
@@ -81,9 +120,14 @@ def solve_channel_heads(
     recovers ``h_i = h_upper_i - r_i``.
 
     Hard-pinned reaches (``seed_support_fraction >= threshold``) get
-    ``r = 0``.  Other reaches are pulled toward ``r_target`` (derived
-    from dryness / distance / elevation gain) while being smoothed along
-    the network in residual space.
+    ``r = 0``.  ``strahler_pin_min`` additionally hard-pins downstream
+    mainstems by topology order (headwaters 0), conjunctively guarded by
+    ``area_pin_km2`` when given — the water mask systematically misses
+    large channels (narrow/shadow/turbid), leaving them at the
+    ``d_min_off_support_m`` floor instead of the surface. Other reaches
+    are pulled toward ``r_target`` (derived from dryness / distance /
+    elevation gain) while being smoothed along the network in residual
+    space.
     """
     streams = topology.streams
     n = len(streams)
@@ -131,6 +175,20 @@ def solve_channel_heads(
         hard_pin = streams["seed_support_hit"].values.astype(bool)
     else:
         hard_pin = np.zeros(n, dtype=bool)
+    n_support_pin = int(hard_pin.sum())
+
+    if strahler_pin_min is not None and "strahler" in streams.columns:
+        order_pin = streams["strahler"].values.astype(int) >= int(strahler_pin_min)
+        if area_pin_km2 is not None and "drainage_km2" in streams.columns:
+            order_pin &= streams["drainage_km2"].values.astype(np.float64) >= float(
+                area_pin_km2
+            )
+        LOGGER.info(
+            "  %d reaches hard-pinned by order/area (%d new beyond support)",
+            int(order_pin.sum()),
+            int((order_pin & ~hard_pin).sum()),
+        )
+        hard_pin = hard_pin | order_pin
 
     # --- local ceiling and targets ---
     d_min = float(d_min_off_support_m)
@@ -173,8 +231,12 @@ def solve_channel_heads(
     r[~valid] = np.nan
 
     s_max = float(max_hydraulic_slope)
-    n_hard = int(hard_pin.sum())
-    LOGGER.info("  %d / %d reaches hard-pinned by support", n_hard, n)
+    LOGGER.info(
+        "  %d / %d reaches hard-pinned (%d by support)",
+        int(hard_pin.sum()),
+        n,
+        n_support_pin,
+    )
 
     order = np.argsort(z_mid)
 
@@ -201,8 +263,13 @@ def solve_channel_heads(
 
             # Max hydraulic slope in recovered-head space:
             # h_i - h_j <= s_max * L  =>  r_i >= r_j + h_upper_i - h_upper_j - s_max * L
+            # Wet evidence relaxes the allowance (divide by dryness): observed
+            # water surfaces do drop steeply (rapids, dams, canyon riffles),
+            # so the smoothness prior must not drag an observed-wet reach off
+            # the bed above a steep wet-to-wet drop.
             for j, L in ds_nbrs[i]:
-                r_floor = r[j] + h_upper[i] - h_upper[j] - s_max * L
+                s_allow = s_max * L / max(1.0 - w_wet[i], 1e-6)
+                r_floor = r[j] + h_upper[i] - h_upper[j] - s_allow
                 r_new = max(r_new, r_floor)
 
             r_new = max(0.0, min(r_new, r_max[i]))
@@ -242,6 +309,7 @@ def build_channel_heads(
     elev_da: xr.DataArray,
     ndvi_da: xr.DataArray,
     support_da: xr.DataArray | None = None,
+    fac_da: xr.DataArray | None = None,
     *,
     node_precision: int = 3,
     sample_spacing_m: float = 20.0,
@@ -251,9 +319,14 @@ def build_channel_heads(
     support_override: float = 1.0,
     distance_scale_m: float = 4000.0,
     elevation_scale_m: float = 25.0,
+    down_distance_scale_m: float = 20000.0,
     strahler_distance_scale: float = 0.5,
+    area_sag_lo_km2: float = 50.0,
+    area_sag_hi_km2: float = 500.0,
     d_min_off_support_m: float = 0.5,
     support_fraction_threshold: float = 0.25,
+    strahler_pin_min: int | None = None,
+    area_pin_km2: float | None = None,
     target_weight_base: float = 2.0,
     zero_weight_base: float = 2.0,
     smoothness_weight: float = 1.0,
@@ -269,7 +342,9 @@ def build_channel_heads(
 ) -> gpd.GeoDataFrame:
     """End-to-end: topology, wet anchors, upstream propagation, sag targets, graph solve."""
     LOGGER.info("Building FAC topology (%d reaches)", len(streams_gdf))
-    topo = build_fac_topology(streams_gdf, elev_da, node_precision=node_precision)
+    topo = build_fac_topology(
+        streams_gdf, elev_da, fac_da, node_precision=node_precision
+    )
 
     if "reach_id" in streams_gdf.columns:
         sid_to_rid = dict(
@@ -281,6 +356,17 @@ def build_channel_heads(
         topo.streams["reach_id"] = np.array(
             [sid_to_rid.get(int(sid), int(sid)) for sid in topo.streams["stream_id"]],
             dtype=np.int64,
+        )
+
+    # Whitebox vector labels carry 0s, downstream drops, and junction
+    # contamination; the topology-recomputed order (headwaters 0) drives
+    # propagation decay scaling and the order/area hard pin below.
+    topo.streams = compute_strahler_from_topology(topo)
+
+    if fac_da is not None:
+        LOGGER.info("Sampling reach drainage area from flow accumulation")
+        topo.streams["drainage_km2"] = sample_reach_drainage_km2(
+            topo.streams, fac_da, sample_spacing_m=sample_spacing_m
         )
 
     LOGGER.info("Estimating wet-anchor strengths")
@@ -303,11 +389,21 @@ def build_channel_heads(
         strahler_distance_scale=strahler_distance_scale,
     )
 
+    LOGGER.info("Propagating wet influence downstream")
+    topo.streams = propagate_downstream_wet_influence(
+        topo,
+        distance_scale_m=down_distance_scale_m,
+        strahler_distance_scale=strahler_distance_scale,
+    )
+
     LOGGER.info("Building residual sag targets")
     topo.streams = _build_residual_targets(
         topo.streams,
         distance_scale_m=distance_scale_m,
         elevation_scale_m=elevation_scale_m,
+        down_distance_scale_m=down_distance_scale_m,
+        area_sag_lo_km2=area_sag_lo_km2,
+        area_sag_hi_km2=area_sag_hi_km2,
         alpha_d=alpha_d,
         alpha_z=alpha_z,
         gamma=gamma,
@@ -315,11 +411,27 @@ def build_channel_heads(
         rmax_max_m=rmax_max_m,
     )
 
+    # The solver's wetness weight pulls toward r=0 with the strongest
+    # evidence from either direction (g already took the per-source min).
+    # The drainage-area prior counts as wetness too — otherwise the
+    # hydraulic-slope floor could still drag evidence-free high-area
+    # reaches off the bed at steep drops.
+    topo.streams["topo_pin_weight_up"] = topo.streams["topo_pin_weight"]
+    w_eff = np.fmax(
+        topo.streams["topo_pin_weight"].values,
+        topo.streams["topo_down_weight"].values,
+    )
+    if "sag_driver_area" in topo.streams.columns:
+        w_eff = np.fmax(w_eff, 1.0 - topo.streams["sag_driver_area"].values)
+    topo.streams["topo_pin_weight"] = w_eff
+
     LOGGER.info("Solving channel heads (residual-depth)")
     return solve_channel_heads(
         topo,
         d_min_off_support_m=d_min_off_support_m,
         support_fraction_threshold=support_fraction_threshold,
+        strahler_pin_min=strahler_pin_min,
+        area_pin_km2=area_pin_km2,
         target_weight_base=target_weight_base,
         zero_weight_base=zero_weight_base,
         smoothness_weight=smoothness_weight,
