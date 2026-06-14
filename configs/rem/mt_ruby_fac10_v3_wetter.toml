@@ -1,0 +1,12 @@
+# Ruby Phase 7 variant 3: slightly wetter, spring-biased seed. Lowers the
+# wetness sigmoid midpoint (0.40 -> 0.32) so marginal valley/riparian reaches
+# stay wet — should lift NHD spring capture at the risk of over-wetting uplands.
+# A/B vs baseline on well + spring residuals.
+
+profile = "mt_ruby_fac10_baseline.toml"
+
+[seed]
+ndvi_mid = 0.32
+
+[paths]
+out_dir = "/data/ssd2/handily/mt/regional/ruby_huc8/rem/ruby_v3_wetter"

@@ -1,0 +1,11 @@
+# Ruby Phase 7 variant 2: slightly drier seed. Raises the wetness sigmoid
+# midpoint (0.40 -> 0.48) so only stronger wetness evidence keeps a reach wet;
+# genuinely dry uplands detach more. A/B vs baseline on well + spring residuals.
+
+profile = "mt_ruby_fac10_baseline.toml"
+
+[seed]
+ndvi_mid = 0.48
+
+[paths]
+out_dir = "/data/ssd2/handily/mt/regional/ruby_huc8/rem/ruby_v2_drier"
