@@ -1,0 +1,21 @@
+# Beaverhead subset, DENSE network, S2 NDVI evidence — evidence upgrade from
+# the iteration-2 post-mortem (notes/FAC10_PROGRESS.md, notes/HANDOFF.md).
+# Replaces the diluted 20m NAIP NDVI grid with 10m Sentinel-2 summer
+# climatology NDVI (2019-2024 median, Cloud Score+ masked). In the Big Hole
+# valley-floor window the S2 NDVI reads 0.785 vs the 20m NAIP grid's 0.152 —
+# the dilution that washed the floor dry. Seed sigmoid sharpened to match
+# (ndvi_mid 0.20->0.12, ndvi_scale 0.06->0.04). Everything else (fac/support/
+# streams/raster/sag/solver) identical to the dense run for a clean A/B.
+# Separate out_dir so rem_10m_dense/ (20m-NAIP iteration) survives.
+
+profile = "mt_missouri_headwaters_10m.toml"
+
+[paths]
+dem_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/dem_10m.tif"
+streams_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/dense_fac/streams_regional.fgb"
+ndvi_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/evidence/s2/ndvi_summer_10m.tif"
+out_dir = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/rem_10m_dense_s2"
+
+[seed]
+ndvi_mid = 0.12
+ndvi_scale = 0.04
