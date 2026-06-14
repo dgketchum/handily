@@ -1,0 +1,66 @@
+# Ruby HUC8 FAC10 baseline profile.
+#
+# Self-contained flattening of the accepted Beaverhead
+# slopebase_idw300_wetness effective parameters (inheritance chain
+# mt_0009_best -> missouri_headwaters_10m -> dense -> naked -> s2 ->
+# slopebase_idw300 -> wetness) as the Ruby starting point. Per-config TOMLs
+# supply [paths] (DEM / streams / FAC / S2 wetness seed / out_dir).
+#
+# No support_path on purpose: in semi-arid montane valleys open water is rare,
+# so the S2 spring-NDVI + fall-NDWI wetness index is used as a continuous seed
+# and the Strahler/area hard pins (strahler_pin_min / area_pin_km2) provide the
+# never-runs-dry support, rather than a binary NDWI water mask.
+
+[strips]
+coarse_res_m = 20.0
+smooth_sigma_m = 500.0
+station_spacing_m = 50.0
+tangent_step_m = 10.0
+min_hit_dist_m = 5.0
+min_strahler = 0
+max_crossing_strip_m = 800.0
+naked_fill_m = 200.0
+halo_n = 12
+workers = 48
+
+[raster]
+burn_res_m = 10.0
+idw_radius_m = 300.0
+idw_power = 2.0
+post_smooth_m = 30.0
+base_fac_snap_cells = 2
+base_smooth_stations = 5
+
+[seed]
+# S2 spring-NDVI + fall-NDWI wetness index in [0, 1]; sigmoid recentered for it.
+ndvi_mid = 0.40
+ndvi_scale = 0.12
+ndvi_quantile = 0.9
+support_override = 1.0
+
+[propagation]
+distance_scale_m = 4000.0
+elevation_scale_m = 25.0
+strahler_distance_scale = 0.5
+
+[sag]
+gamma = 2.0
+rmax_min_m = 2.0
+rmax_max_m = 60.0
+alpha_d = 0.75
+alpha_z = 1.0
+area_sag_lo_km2 = 25.0
+area_sag_hi_km2 = 250.0
+
+[solver]
+d_min_off_support_m = 0.5
+support_fraction_threshold = 0.25
+strahler_pin_min = 5
+area_pin_km2 = 250.0
+target_weight_base = 2.0
+zero_weight_base = 2.0
+smoothness_weight = 1.0
+neighbor_length_floor_m = 200.0
+max_hydraulic_slope = 0.05
+max_iter = 500
+tol = 0.01

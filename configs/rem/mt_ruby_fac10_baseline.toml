@@ -1,0 +1,13 @@
+# Ruby HUC8 FAC10 baseline — accepted Beaverhead parameter logic on the full
+# Ruby 10m regional grid with the S2 wetness seed. Phase 7 variants tune from
+# here. Tune ONLY against GWX observation tiers and NHD spring anchors; never
+# against the Ma raster.
+
+profile = "profiles/ruby_fac10_baseline.toml"
+
+[paths]
+dem_path = "/data/ssd2/handily/mt/regional/ruby_huc8/dem_10m.tif"
+streams_path = "/data/ssd2/handily/mt/regional/ruby_huc8/streams_regional.fgb"
+fac_path = "/data/ssd2/handily/mt/regional/ruby_huc8/flow_accumulation.tif"
+ndvi_path = "/data/ssd2/handily/mt/regional/ruby_huc8/evidence/s2/wetness_seed_10m.tif"
+out_dir = "/data/ssd2/handily/mt/regional/ruby_huc8/rem/ruby_fac10_baseline"

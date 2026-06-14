@@ -1,0 +1,13 @@
+# Ruby Phase 7 variant 4: stronger headwater sag. Raises the dry-reach sag
+# exponent (gamma 2.0 -> 3.0) and the residual-depth ceiling (rmax_max_m
+# 60 -> 100) so dry headwaters sag deeper toward the prior water table while
+# wet valley reaches stay pinned. A/B vs baseline on upland well residuals.
+
+profile = "mt_ruby_fac10_baseline.toml"
+
+[sag]
+gamma = 3.0
+rmax_max_m = 100.0
+
+[paths]
+out_dir = "/data/ssd2/handily/mt/regional/ruby_huc8/rem/ruby_v4_sag"
