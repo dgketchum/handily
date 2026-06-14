@@ -51,6 +51,9 @@ dev = [
   "isort",
   "mypy",
 ]
+ee = [
+  "earthengine-api>=1.0",
+]
 
 [project.urls]
 Homepage = "https://example.com/handily"
