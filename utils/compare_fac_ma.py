@@ -57,12 +57,23 @@ VALLEY_DIST_M = 500.0  # well within this of a mapped stream -> valley setting
 
 
 def sample_raster_at_points(raster_path: str, gdf: gpd.GeoDataFrame) -> np.ndarray:
-    """Sample band 1 at each point; nodata / non-finite -> nan."""
+    """Sample band 1 at each point; nodata / non-finite / out-of-bounds -> nan.
+
+    ``rasterio.sample`` returns 0.0 (not nodata) for points outside a raster
+    whose nodata is None — which the FAC REM is — so out-of-grid wells would
+    otherwise read as a spurious 0 m (surface water) and contaminate the score.
+    Points outside the raster bounds are masked to NaN explicitly.
+    """
     with rasterio.open(raster_path) as src:
         pts = gdf.to_crs(src.crs)
-        coords = [(g.x, g.y) for g in pts.geometry]
-        vals = np.array([v[0] for v in src.sample(coords, indexes=1)], dtype="float64")
+        xs = np.array([g.x for g in pts.geometry], dtype="float64")
+        ys = np.array([g.y for g in pts.geometry], dtype="float64")
+        vals = np.array(
+            [v[0] for v in src.sample(zip(xs, ys), indexes=1)], dtype="float64"
+        )
         nod = src.nodata
+        b = src.bounds
+    vals[(xs < b.left) | (xs > b.right) | (ys < b.bottom) | (ys > b.top)] = np.nan
     if nod is not None and np.isfinite(nod):
         vals[vals == nod] = np.nan
     vals[~np.isfinite(vals)] = np.nan
@@ -228,9 +239,12 @@ def raster_diffs(fac_rem: str, ma: str, out_dir: Path) -> dict:
     )
 
     for lvl in SHALLOW_LEVELS:
-        # 0 neither, 1 fac-only, 2 ma-only, 3 both shallow
+        # 0 neither, 1 fac-only, 2 ma-only, 3 both shallow; 255 = nodata.
         cls = (fac_v < lvl).astype("uint8") + 2 * (ma_v < lvl).astype("uint8")
-        cls = cls.where(np.isfinite(fac_v) & np.isfinite(ma_v), 255)
+        cls = cls.where(np.isfinite(fac_v) & np.isfinite(ma_v), 255).astype("uint8")
+        # Drop the float nodata (3.4e38) inherited from the FAC grid — it can't be
+        # written into a uint8 band — and tag 255 as nodata instead.
+        cls = cls.rio.write_nodata(255)
         cls.rio.to_raster(
             out_dir / f"shallow_agreement_{int(lvl)}m.tif", compress="deflate"
         )
@@ -271,6 +285,23 @@ def main() -> None:
     if args.fac_rem:
         rasters = {"fac": args.fac_rem, **rasters}
 
+    # When a FAC REM is given, score FAC and Ma on the SAME footprint: drop wells
+    # outside the FAC grid (NaN pred via sample_raster_at_points). Ma is statewide
+    # and finite everywhere, so without this FAC scores on its in-grid subset
+    # while Ma scores on all wells — an apples-to-oranges comparison.
+    if args.fac_rem:
+        in_grid = np.isfinite(sample_raster_at_points(args.fac_rem, wells))
+        n_drop = int((~in_grid).sum())
+        if n_drop:
+            log.info(
+                "Dropping %d / %d wells outside the FAC REM grid; scoring FAC+Ma "
+                "on the %d in-grid wells",
+                n_drop,
+                len(wells),
+                int(in_grid.sum()),
+            )
+        wells = wells.loc[in_grid].reset_index(drop=True)
+
     all_rows: list[dict] = []
     well_resids = wells[
         [
@@ -299,16 +330,21 @@ def main() -> None:
             else spring_out.join(s_keep.drop(columns="geometry"))
         )
 
-    diffs = {}
-    if args.fac_rem:
-        log.info("Building raster difference products")
-        diffs = raster_diffs(args.fac_rem, args.ma, out_dir)
-
     summary = pd.DataFrame(all_rows)
     summary_path = out_dir / "score_summary.csv"
     summary.to_csv(summary_path, index=False)
     well_resids.to_file(out_dir / "well_residuals.fgb", driver="FlatGeobuf")
     spring_out.to_file(out_dir / "spring_residuals.fgb", driver="FlatGeobuf")
+
+    # Raster diff products are optional and heavier; a write failure here must
+    # never discard the point metrics already persisted above.
+    diffs = {}
+    if args.fac_rem:
+        log.info("Building raster difference products")
+        try:
+            diffs = raster_diffs(args.fac_rem, args.ma, out_dir)
+        except Exception as e:  # noqa: BLE001
+            log.warning("raster_diffs failed: %s", e)
 
     note = {
         "phase": "6_ma_benchmark_comparison",
