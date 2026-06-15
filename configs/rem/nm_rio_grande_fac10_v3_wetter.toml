@@ -1,0 +1,20 @@
+# NM Rio Grande-Albuquerque (HUC8 13020203) FAC10 REM.
+#
+# Replicates the best Ruby variant (v3_wetter: wetness sigmoid midpoint 0.40 ->
+# 0.32 so marginal valley/riparian reaches stay wet) on the NM regional 10m grid
+# with the S2 spring-NDVI + fall-NDWI wetness seed. Starting point only — NM has
+# no GWX wells / springs collected yet, so these are the transferred Ruby-tuned
+# params. Re-tune ONLY against NM GWX observation tiers + NHD spring anchors once
+# collected; never against the Ma raster.
+
+profile = "profiles/ruby_fac10_baseline.toml"
+
+[seed]
+ndvi_mid = 0.32
+
+[paths]
+dem_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/dem_10m.tif"
+streams_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/streams_regional.fgb"
+fac_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/flow_accumulation.tif"
+ndvi_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/evidence/s2/s2_wetness_seed_10m.tif"
+out_dir = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/rem/nm_rga_v3_wetter"
