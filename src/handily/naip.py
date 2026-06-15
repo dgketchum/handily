@@ -22,6 +22,7 @@ import requests
 from rasterio.io import MemoryFile
 from rasterio.mask import mask as rio_mask
 from rasterio.merge import merge
+from rasterio.windows import Window
 
 LOGGER = logging.getLogger("handily.naip")
 
@@ -349,6 +350,16 @@ def decode_sid(
         pix_lrx = int((map_lr[0] - origin_x) / res)
         pix_lry = int((origin_y - map_lr[1]) / res)
 
+        # When a reduced-resolution level is requested, mrsiddecode interprets
+        # -ulxy/-lrxy in that level's pixel grid, not the full-res grid. The
+        # conversion above is in full-res pixels, so scale them down by 2**scale.
+        if scale is not None and scale > 0:
+            div = 2**scale
+            pix_ulx //= div
+            pix_uly //= div
+            pix_lrx //= div
+            pix_lry //= div
+
         # Clamp to SID pixel dimensions
         pix_ulx = max(0, pix_ulx)
         pix_uly = max(0, pix_uly)
@@ -418,36 +429,51 @@ def compute_water_mask(
     """
     with rasterio.open(naip_path) as src:
         if src.count >= 4:
-            green = src.read(2).astype("float32")
-            red = src.read(1).astype("float32")
-            nir = src.read(4).astype("float32")
+            green_b, red_b, nir_b = 2, 1, 4
         elif src.count == 3:
-            nir = src.read(1).astype("float32")
-            red = src.read(2).astype("float32")
-            green = src.read(3).astype("float32")
+            nir_b, red_b, green_b = 1, 2, 3
         else:
             raise ValueError(
                 f"Expected 3+ band NAIP, got {src.count} bands: {naip_path}"
             )
 
-        gn_denom = green + nir
-        ndwi = np.where(gn_denom != 0, (green - nir) / gn_denom, 0.0)
-
-        rn_denom = nir + red
-        ndvi = np.where(rn_denom != 0, (nir - red) / rn_denom, 0.0)
-
-        nir_frac = nir / 255.0
-
-        water = (
-            (ndwi > ndwi_thresh) & (nir_frac < nir_thresh) & (ndvi < ndvi_thresh)
-        ).astype("uint8")
-
         profile = src.profile.copy()
         profile.update(count=1, dtype="uint8", nodata=255)
-        with rasterio.open(mask_path, "w", **profile) as dst:
-            dst.write(water, 1)
 
-    pct = water.sum() / water.size * 100
+        # Process in row blocks. A corridor-clipped county decoded at ~1 m can
+        # exceed 100 GB; reading three bands as float32 plus the derived
+        # NDWI/NDVI arrays would blow past RAM and OOM the worker. The three-gate
+        # test is purely per-pixel, so block output is identical to a whole-array
+        # computation. Target ~0.5 GB per band-block.
+        bytes_per_row = max(1, src.width * 4)
+        rows_per_block = max(1, min(src.height, int(5e8 // bytes_per_row)))
+
+        water_sum = 0
+        total = 0
+        with rasterio.open(mask_path, "w", **profile) as dst:
+            for row0 in range(0, src.height, rows_per_block):
+                nrows = min(rows_per_block, src.height - row0)
+                win = Window(0, row0, src.width, nrows)
+                green = src.read(green_b, window=win).astype("float32")
+                red = src.read(red_b, window=win).astype("float32")
+                nir = src.read(nir_b, window=win).astype("float32")
+
+                gn_denom = green + nir
+                ndwi = np.where(gn_denom != 0, (green - nir) / gn_denom, 0.0)
+                rn_denom = nir + red
+                ndvi = np.where(rn_denom != 0, (nir - red) / rn_denom, 0.0)
+                nir_frac = nir / 255.0
+
+                water = (
+                    (ndwi > ndwi_thresh)
+                    & (nir_frac < nir_thresh)
+                    & (ndvi < ndvi_thresh)
+                ).astype("uint8")
+                dst.write(water, 1, window=win)
+                water_sum += int(water.sum())
+                total += int(water.size)
+
+    pct = water_sum / total * 100
     LOGGER.info("Water mask: %.2f%% of pixels — %s", pct, mask_path)
     return mask_path
 
