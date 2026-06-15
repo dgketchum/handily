@@ -33,6 +33,7 @@ CONFIG_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "min_hit_dist_m",
         "min_strahler",
         "max_crossing_strip_m",
+        "naked_fill_m",
         "halo_n",
         "workers",
     ),
@@ -65,6 +66,7 @@ CONFIG_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "support_fraction_threshold",
         "strahler_pin_min",
         "area_pin_km2",
+        "below_bed_offset_m",
         "target_weight_base",
         "zero_weight_base",
         "smoothness_weight",
@@ -139,6 +141,11 @@ class FacRemConfig:
     min_hit_dist_m: float = 5.0
     min_strahler: int = 0
     max_crossing_strip_m: float = 0.0
+    # When > 0: if a station ray finds no stream, or only finds a stream beyond
+    # max_crossing_strip_m, emit a bounded flat ray of this length (endpoint =
+    # local channel elevation) instead of a long edge/AOI ray.  0 disables the
+    # bounded fallback.
+    naked_fill_m: float = 0.0
     halo_n: int = 0
     workers: int = 1
 
@@ -176,6 +183,11 @@ class FacRemConfig:
     support_fraction_threshold: float = 0.25
     strahler_pin_min: int | None = None
     area_pin_km2: float | None = None
+    # Below-bed offset (m) for order/area-pinned perennial mainstems: in
+    # diverted/losing semi-arid valleys the table sits ~1-2 m below the bed, so
+    # the pinned water surface drops by this much instead of sitting at the bed
+    # (head_depth = 0). 0.0 keeps the legacy bed pin. See notes/lit synthesis 4c.
+    below_bed_offset_m: float = 0.0
     target_weight_base: float = 2.0
     zero_weight_base: float = 2.0
     smoothness_weight: float = 1.0
@@ -248,6 +260,7 @@ class FacRemConfig:
             "support_fraction_threshold": self.support_fraction_threshold,
             "strahler_pin_min": self.strahler_pin_min,
             "area_pin_km2": self.area_pin_km2,
+            "below_bed_offset_m": self.below_bed_offset_m,
             "target_weight_base": self.target_weight_base,
             "zero_weight_base": self.zero_weight_base,
             "smoothness_weight": self.smoothness_weight,

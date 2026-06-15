@@ -1,0 +1,21 @@
+# Ruby lit-improvement v5: release the streambed pin with a below-bed offset.
+#
+# Builds on the best variant (v3_wetter seed, ndvi_mid 0.32) and adds the first
+# notes/lit-grounded FAC change: order/area-pinned perennial mainstems no longer
+# place the water surface AT the bed (head_depth = 0). In this diverted, losing
+# semi-arid valley the regional table sits ~1-2 m below the bed (Ruby GWX wells;
+# synthesis 4c), so the pinned surface drops by below_bed_offset_m. This targets
+# the near-channel wet bias (FAC primary bias ~-7.6 m) without touching uplands.
+#
+# A/B vs v3_wetter on well + spring residuals; benchmark = Ma.
+
+profile = "mt_ruby_fac10_baseline.toml"
+
+[seed]
+ndvi_mid = 0.32
+
+[solver]
+below_bed_offset_m = 2.5
+
+[paths]
+out_dir = "/data/ssd2/handily/mt/regional/ruby_huc8/rem/ruby_v5_belowbed"
