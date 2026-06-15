@@ -230,9 +230,12 @@ def main() -> None:
         "status",
     ]
     log.info("Wrote %s", args.out)
-    print(out[cols].to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    present = [c for c in cols if c in out.columns]
+    print(out[present].to_string(index=False, float_format=lambda v: f"{v:.3f}"))
     if not ranked.empty:
         print(f"\nBest variant: {ranked.iloc[0]['variant']}")
+    else:
+        log.warning("no variant produced a score_summary.csv — nothing to rank")
 
 
 if __name__ == "__main__":
