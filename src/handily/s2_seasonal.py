@@ -81,6 +81,7 @@ class S2SeasonalConfig:
     scale_m: int = DEFAULT_SCALE_M
     crs: str = DEFAULT_CRS
     climatology: bool = False
+    climatology_only: bool = False
     buffer_km: float = 0.0
     dest: str = "bucket"
     drive_folder: str | None = None
@@ -221,16 +222,21 @@ def export_s2_seasonal(cfg: S2SeasonalConfig) -> list[ee.batch.Task]:
     # per-season climatology accumulators
     season_year_imgs: dict[str, list[ee.Image]] = {s: [] for s in cfg.seasons}
 
+    # climatology_only suppresses the per-(season, year) exports (just the
+    # across-year median composites are wanted) but still accumulates the
+    # per-year images so the climatology reduction below has its inputs.
     for season, bounds in cfg.seasons.items():
         for year in cfg.years:
             img = season_composite(
                 geometry, year, bounds, cfg.indices, cfg.cloud_threshold
             )
             season_year_imgs[season].append(img.select(cfg.indices))
+            if cfg.climatology_only:
+                continue
             name = f"s2_{season}_{year}_{cfg.scale_m}m"
             tasks.append(_export_image(img, cfg, geometry, name))
 
-    if cfg.climatology:
+    if cfg.climatology or cfg.climatology_only:
         y0, y1 = min(cfg.years), max(cfg.years)
         for season, imgs in season_year_imgs.items():
             coll = ee.ImageCollection(imgs)
@@ -299,6 +305,11 @@ def main() -> None:
         help="also export per-season median across years",
     )
     p.add_argument(
+        "--climatology-only",
+        action="store_true",
+        help="export ONLY the per-season across-year medians (skip per-year)",
+    )
+    p.add_argument(
         "--buffer-km",
         type=float,
         default=0.0,
@@ -321,6 +332,7 @@ def main() -> None:
         scale_m=args.scale,
         crs=args.crs,
         climatology=args.climatology,
+        climatology_only=args.climatology_only,
         buffer_km=args.buffer_km,
         dest=args.dest,
         drive_folder=args.drive_folder,
