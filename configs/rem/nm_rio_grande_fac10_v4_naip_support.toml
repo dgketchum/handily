@@ -1,0 +1,28 @@
+# NM Rio Grande-Albuquerque (HUC8 13020203) FAC10 REM — v4.
+#
+# v3_wetter + a NAIP multi-year open-water support raster wired as support_path.
+# The S2 10m NDWI seed (ndvi_path) misses the narrow Rio Grande surface; the
+# 3-year (2018/2020/2022) sub-meter NAIP NDWI mask resolves it. The raw mask is
+# 86% flood-irrigated cropland off-channel (MRGCD parcels flood every year, so
+# K-of-N persistence does not remove them), so support is restricted to within
+# 200 m of the Strahler>=5 FAC network (utils/restrict_support_to_channels.py) —
+# a continuous Rio Grande ribbon (86% mainstem continuity) with the floodplain
+# irrigation dropped. This is additive over the strahler/area pin: the mainstem
+# is pinned either way; NDWI pins mid-order (str 5-6) wet channels below the
+# 250 km^2 area threshold and confirms valley wetness.
+#
+# Still Ruby-transferred params (ndvi_mid 0.32). Re-tune ONLY against NM GWX
+# unconfined tiers + NHD spring anchors; never against the Ma raster.
+
+profile = "profiles/ruby_fac10_baseline.toml"
+
+[seed]
+ndvi_mid = 0.32
+
+[paths]
+dem_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/dem_10m.tif"
+streams_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/streams_regional.fgb"
+fac_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/flow_accumulation.tif"
+ndvi_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/evidence/s2/s2_wetness_seed_10m.tif"
+support_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/evidence/naip/naip_ndwi_support_3yr_5m_channelclean.tif"
+out_dir = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/rem/nm_rga_v4_naip_support"
