@@ -106,6 +106,7 @@ def solve_channel_heads(
     support_fraction_threshold: float = 0.25,
     strahler_pin_min: int | None = None,
     area_pin_km2: float | None = None,
+    below_bed_offset_m: float = 0.0,
     target_weight_base: float = 2.0,
     zero_weight_base: float = 2.0,
     smoothness_weight: float = 1.0,
@@ -176,6 +177,7 @@ def solve_channel_heads(
     else:
         hard_pin = np.zeros(n, dtype=bool)
     n_support_pin = int(hard_pin.sum())
+    support_pin = hard_pin.copy()
 
     if strahler_pin_min is not None and "strahler" in streams.columns:
         order_pin = streams["strahler"].values.astype(int) >= int(strahler_pin_min)
@@ -192,7 +194,24 @@ def solve_channel_heads(
 
     # --- local ceiling and targets ---
     d_min = float(d_min_off_support_m)
-    h_upper = np.where(hard_pin, z_mid, z_mid - d_min)
+    below_bed = max(float(below_bed_offset_m), 0.0)
+    # Pinned reaches normally place the water surface at the streambed
+    # (head_depth = 0) — the connected/gaining default. In diverted/losing
+    # semi-arid valleys the regional table sits ~1-2 m BELOW the bed (Ruby GWX
+    # wells; notes/lit synthesis 4c), so order/area-pinned mainstems get a
+    # below-bed offset. Imagery-confirmed wet reaches (support pins) are
+    # genuinely connected and stay at the bed. Non-pinned reaches keep the
+    # d_min floor (the sag relaxation deepens them further).
+    offset = np.where(hard_pin, 0.0, d_min)
+    if below_bed > 0.0:
+        below_bed_mask = hard_pin & ~support_pin
+        offset = np.where(below_bed_mask, below_bed, offset)
+        LOGGER.info(
+            "  below-bed offset %.2f m on %d order/area-pinned reaches",
+            below_bed,
+            int(below_bed_mask.sum()),
+        )
+    h_upper = z_mid - offset
 
     r_target = (
         streams["r_target_m"].values.astype(np.float64)
@@ -327,6 +346,7 @@ def build_channel_heads(
     support_fraction_threshold: float = 0.25,
     strahler_pin_min: int | None = None,
     area_pin_km2: float | None = None,
+    below_bed_offset_m: float = 0.0,
     target_weight_base: float = 2.0,
     zero_weight_base: float = 2.0,
     smoothness_weight: float = 1.0,
@@ -432,6 +452,7 @@ def build_channel_heads(
         support_fraction_threshold=support_fraction_threshold,
         strahler_pin_min=strahler_pin_min,
         area_pin_km2=area_pin_km2,
+        below_bed_offset_m=below_bed_offset_m,
         target_weight_base=target_weight_base,
         zero_weight_base=zero_weight_base,
         smoothness_weight=smoothness_weight,
