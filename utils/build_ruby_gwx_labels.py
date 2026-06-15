@@ -1,13 +1,18 @@
-"""Phase 4 of the Ruby HUC8 pilot: GWX observation package.
+"""Phase 4 GWX observation package builder (Ruby pilot, generalized per-region).
 
-Builds a calibration/validation well package for the Ruby FAC10 prior from the
-GWX ``current`` build. Three artifacts under ``evidence/gwx/``:
+Builds a calibration/validation well package for a regional FAC10 prior from the
+GWX ``current`` build. Three artifacts under ``evidence/gwx/`` (``<prefix>`` is
+``--label-prefix``, default ``ruby``):
 
-  * ``ruby_wells_raw.parquet``           — every GWX index row in Ruby + 20 km
-  * ``ruby_wells_canonical.parquet``     — one row per ``canonical_id`` (co-located
+  * ``<prefix>_wells_raw.parquet``           — every GWX index row in region + buffer
+  * ``<prefix>_wells_canonical.parquet``     — one row per ``canonical_id`` (co-located
     and cross-source duplicates collapsed) with merged metadata
-  * ``ruby_well_observation_labels.parquet`` — canonical well + DTW labels, tier,
+  * ``<prefix>_well_observation_labels.parquet`` — canonical well + DTW labels, tier,
     and weight, self-contained for Phase 6 scoring
+
+The builder is region-agnostic: pass ``--label-prefix``, ``--out-root``, and a
+``--buffer-fgb`` to target any study area. Defaults reproduce the Ruby pilot
+byte-for-byte (prefix ``ruby``, monitoring-override source ``mt_gwic``).
 
 Why each piece matters
 ----------------------
@@ -15,11 +20,13 @@ Why each piece matters
   ``canonical_id`` clusters; co-located / cross-source duplicates must not become
   independent calibration points. We pool every member's per-well time series and
   derive one label per cluster.
-* **GWAAMON override.** The index has no explicit GWAAMON network flag and no
-  precomputed trend column. Ruby-specific rule: an ``mt_gwic`` well is treated as
-  monitoring when it has a multi-point series (``has_time_series``) or
-  ``well_use == 'monitoring'`` — GWAAMON is a monitoring time-series source even
-  when the generic classifier leaves it ``unknown``.
+* **Monitoring-source override.** The index has no explicit monitoring-network
+  flag and no precomputed trend column. For the configured monitoring source
+  (``--monitoring-source``, Ruby default ``mt_gwic`` = GWAAMON), a well is treated
+  as monitoring when it has a multi-point series (``has_time_series``) or
+  ``well_use == 'monitoring'`` — such networks are monitoring time-series sources
+  even when the generic classifier leaves them ``unknown``. The generic
+  ``well_use``/``well_class == 'monitoring'`` path fires for every source.
 * **Stale ``file_path``.** Index ``file_path`` points at the dead
   ``products/staging/wells/`` tree; basenames resolve under ``current/wells/``.
   We remap by basename and report how many fail to resolve (never silently drop).
@@ -37,6 +44,10 @@ Tiering (see ``classify_well``) — diagnostics are excluded from FAC tuning:
 Usage:
     uv run python utils/build_ruby_gwx_labels.py \
         --out-root /data/ssd2/handily/mt/regional/ruby_huc8
+
+    uv run python utils/build_ruby_gwx_labels.py \
+        --out-root /data/ssd2/handily/nm/regional/rio_grande_albuquerque \
+        --label-prefix nm --monitoring-source ''
 """
 
 from __future__ import annotations
@@ -113,15 +124,17 @@ FALL_MONTHS = {9, 10}  # align with S2 fall window (Sep 1 - Oct 31)
 # --------------------------------------------------------------------------- #
 # Spatial query
 # --------------------------------------------------------------------------- #
-def load_ruby_wells(index_path: str, buffer_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """All GWX index rows whose point falls inside the Ruby+buffer polygon."""
+def load_region_wells(
+    index_path: str, buffer_gdf: gpd.GeoDataFrame
+) -> gpd.GeoDataFrame:
+    """All GWX index rows whose point falls inside the region+buffer polygon."""
     log.info("Reading GWX index: %s", index_path)
     wells = gpd.read_parquet(index_path, columns=INDEX_COLUMNS)
     poly4326 = buffer_gdf.to_crs(4326).union_all()
     minx, miny, maxx, maxy = poly4326.bounds
     box = wells.cx[minx:maxx, miny:maxy]
     inside = box[box.within(poly4326)].copy().reset_index(drop=True)
-    log.info("  %d wells in Ruby+buffer (from %d in bbox)", len(inside), len(box))
+    log.info("  %d wells in region+buffer (from %d in bbox)", len(inside), len(box))
     return inside
 
 
@@ -271,14 +284,19 @@ def _first_valid(series: pd.Series):
     return vals.iloc[0] if len(vals) else None
 
 
-def _override_class(group: pd.DataFrame) -> str | None:
-    """Ruby monitoring override: mt_gwic GWAAMON-style or any monitoring tag."""
-    is_mt = (group["source"] == "mt_gwic").any()
+def _override_class(group: pd.DataFrame, monitoring_source: str | None) -> str | None:
+    """Monitoring override: a well from ``monitoring_source`` with a time series or
+    monitoring tag, or any source tagged monitoring, is treated as monitoring."""
+    is_mon_src = (
+        bool((group["source"] == monitoring_source).any())
+        if monitoring_source
+        else False
+    )
     has_ts = bool(group["has_time_series"].any())
     is_monitor = (group["well_use"] == "monitoring").any() or (
         group["well_class"] == "monitoring"
     ).any()
-    if (is_mt and (has_ts or is_monitor)) or is_monitor:
+    if (is_mon_src and (has_ts or is_monitor)) or is_monitor:
         return "monitoring"
     classes = group["well_class"].dropna()
     return str(classes.mode().iloc[0]) if len(classes) else None
@@ -288,7 +306,7 @@ def classify_well(meta: dict, label: dict) -> dict:
     """Assign tier, weight, and a human-readable reason."""
     acc = meta.get("h_accuracy_class")
     conf = meta.get("confinement_class")
-    override = meta.get("ruby_override_class")
+    override = meta.get("override_class")
     depth = meta.get("well_depth")
     screen_top = meta.get("screen_top")
 
@@ -327,7 +345,11 @@ def classify_well(meta: dict, label: dict) -> dict:
         return diag("artesian_above_surface")
     if depth_known and value > depth:
         return diag("dtw_below_well_bottom")
-    if value > DEEP_WATER_M:
+    if value > DEEP_WATER_M and not unconfined:
+        # The deep-reading heuristic (assume a non-phreatic/confined aquifer) is
+        # only valid for unknown-confinement wells. An explicitly unconfined deep
+        # water table (e.g. an arid-basin deep regional table) is physical and
+        # stays in scope as a water-table observation.
         return diag("deep_water_nonphreatic")
     if deep_screen:
         return diag("deep_screen_nonphreatic")
@@ -348,7 +370,12 @@ def classify_well(meta: dict, label: dict) -> dict:
     return {"tier": "secondary", "weight": W_SECONDARY, "exclusion_reason": ""}
 
 
-def collapse_and_label(raw: gpd.GeoDataFrame, workers: int) -> gpd.GeoDataFrame:
+def collapse_and_label(
+    raw: gpd.GeoDataFrame,
+    workers: int,
+    override_col: str,
+    monitoring_source: str | None,
+) -> gpd.GeoDataFrame:
     raw = raw.copy()
     raw["_acc_rank"] = raw["h_accuracy_class"].map(ACCURACY_RANK).fillna(0)
     raw["_cur_path"] = raw["file_path"].map(remap_well_path)
@@ -397,7 +424,7 @@ def collapse_and_label(raw: gpd.GeoDataFrame, workers: int) -> gpd.GeoDataFrame:
             "well_class": _first_valid(group["well_class"]),
             "class_confidence": _first_valid(group["class_confidence"]),
             "well_use": _first_valid(group["well_use"]),
-            "ruby_override_class": _override_class(group),
+            "override_class": _override_class(group, monitoring_source),
             "confinement_class": rep["confinement_class"],
             "confinement_source": rep["confinement_source"],
             "well_depth": _first_valid(group["well_depth"]),
@@ -417,6 +444,7 @@ def collapse_and_label(raw: gpd.GeoDataFrame, workers: int) -> gpd.GeoDataFrame:
         records.append({**meta, **lab, **label, **tier})
 
     out = gpd.GeoDataFrame(records, geometry="geometry", crs=raw.crs)
+    out = out.rename(columns={"override_class": override_col})
     return out
 
 
@@ -428,27 +456,47 @@ def main() -> None:
     p.add_argument("--out-root", default="/data/ssd2/handily/mt/regional/ruby_huc8")
     p.add_argument("--index", default=WELLS_INDEX)
     p.add_argument(
+        "--label-prefix",
+        default="ruby",
+        help="output filename + override-column prefix (e.g. 'ruby', 'nm')",
+    )
+    p.add_argument(
         "--buffer-fgb",
         default=None,
-        help="defaults to <out-root>/boundary/ruby_huc8_buffer_20km.fgb",
+        help="defaults to <out-root>/boundary/<label-prefix>_huc8_buffer_20km.fgb",
+    )
+    p.add_argument(
+        "--monitoring-source",
+        default="mt_gwic",
+        help="GWX source whose time-series wells are forced to monitoring "
+        "(Ruby: mt_gwic/GWAAMON). Set to '' to disable the source-specific rule.",
     )
     p.add_argument("--workers", type=int, default=32)
     args = p.parse_args()
+
+    prefix = args.label_prefix
+    override_col = f"{prefix}_override_class"
+    monitoring_source = args.monitoring_source or None
 
     out_root = Path(args.out_root)
     gwx_dir = out_root / "evidence" / "gwx"
     gwx_dir.mkdir(parents=True, exist_ok=True)
     buffer_fgb = args.buffer_fgb or str(
-        out_root / "boundary" / "ruby_huc8_buffer_20km.fgb"
+        out_root / "boundary" / f"{prefix}_huc8_buffer_20km.fgb"
     )
 
     buffer_gdf = gpd.read_file(buffer_fgb)
-    raw = load_ruby_wells(args.index, buffer_gdf)
-    raw_path = gwx_dir / "ruby_wells_raw.parquet"
+    raw = load_region_wells(args.index, buffer_gdf)
+    raw_path = gwx_dir / f"{prefix}_wells_raw.parquet"
     raw.to_parquet(raw_path)
     log.info("Wrote %s (%d rows)", raw_path, len(raw))
 
-    labels = collapse_and_label(raw, workers=args.workers)
+    labels = collapse_and_label(
+        raw,
+        workers=args.workers,
+        override_col=override_col,
+        monitoring_source=monitoring_source,
+    )
 
     canonical_cols = [
         "canonical_id",
@@ -459,7 +507,7 @@ def main() -> None:
         "well_class",
         "class_confidence",
         "well_use",
-        "ruby_override_class",
+        override_col,
         "confinement_class",
         "confinement_source",
         "well_depth",
@@ -473,9 +521,9 @@ def main() -> None:
         "geometry",
     ]
     canonical = labels[canonical_cols].copy()
-    canonical_path = gwx_dir / "ruby_wells_canonical.parquet"
+    canonical_path = gwx_dir / f"{prefix}_wells_canonical.parquet"
     canonical.to_parquet(canonical_path)
-    labels_path = gwx_dir / "ruby_well_observation_labels.parquet"
+    labels_path = gwx_dir / f"{prefix}_well_observation_labels.parquet"
     labels.to_parquet(labels_path)
 
     tier_counts = labels["tier"].value_counts().to_dict()
@@ -489,14 +537,14 @@ def main() -> None:
         "phase": "4_gwx_observation_package",
         "date": date.today().isoformat(),
         "index": args.index,
+        "label_prefix": prefix,
+        "monitoring_source": monitoring_source,
         "buffer_fgb": buffer_fgb,
         "raw_well_rows": int(len(raw)),
         "canonical_wells": int(len(labels)),
         "tier_counts": {k: int(v) for k, v in tier_counts.items()},
         "diagnostic_reason_counts": {k: int(v) for k, v in reason_counts.items()},
-        "monitoring_override_wells": int(
-            (labels["ruby_override_class"] == "monitoring").sum()
-        ),
+        "monitoring_override_wells": int((labels[override_col] == "monitoring").sum()),
         "timeseries_wells": int(labels["is_timeseries"].sum()),
         "primary_dtw_median_m": (
             float(primary["dtw_label_m"].median()) if len(primary) else None
@@ -508,7 +556,9 @@ def main() -> None:
             "labels": str(labels_path),
         },
     }
-    note_path = out_root / "run_notes" / "gwx_observation_package.json"
+    note_dir = out_root / "run_notes"
+    note_dir.mkdir(parents=True, exist_ok=True)
+    note_path = note_dir / "gwx_observation_package.json"
     with open(note_path, "w") as f:
         json.dump(note, f, indent=2)
     log.info("Wrote %s and %s", canonical_path, labels_path)
