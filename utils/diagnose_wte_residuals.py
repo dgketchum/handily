@@ -20,10 +20,16 @@ below ground the table sits); predicting it avoids letting absolute DEM elevatio
 dominate, which is what makes the fit transfer toward statewide / CONUS scale.
 WTE = DEM - DTW is recovered after the fact for the blend.
 
-Gate: p_fac = exp(-max(elev_above_str7, 0) / h0), with the length scale h0 fit on
-each training fold (minimising weighted blended MAD) and applied out-of-fold. Near
-the Rio Grande mainstem (regional base level) p_fac -> 1 and FAC dominates; high on
-the basin-fill uplands p_fac -> 0 and the regional model dominates.
+Gate: p_fac = exp(-max(elev_above_str7, 0) / h0). The hybrid is scored under
+nested blocked CV: the held-out regional component reuses the leak-free global
+OOF regional prediction, while the gate length scale h0 is fit per outer fold on
+an INNER blocked-CV regional prediction of the training rows only -- so h0 never
+sees the held-out fold's labels. Near the Rio Grande mainstem (regional base
+level) p_fac -> 1 and FAC dominates; high on the basin-fill uplands p_fac -> 0 and
+the regional model dominates.
+
+Springs are scored as pure holdout shallow-discharge constraints: the regional
+model is trained on water-table WELLS ONLY (never on springs), per CLAUDE.md.
 
 Output (under ``<out_dir>/diagnostics``):
   wte_diagnostic_scores.csv        product x group MAD/bias/RMSE/recall/precision
@@ -86,6 +92,16 @@ def _gate(elev_above, h0):
     return np.exp(-np.clip(elev_above, 0, None) / h0)
 
 
+def _regional_model():
+    return HistGradientBoostingRegressor(
+        max_iter=400,
+        learning_rate=0.05,
+        max_depth=3,
+        min_samples_leaf=15,
+        l2_regularization=1.0,
+    )
+
+
 def _blocked_cv_regional(d, feats, target, group_col):
     """Out-of-fold regional DTW prediction under spatial blocked CV."""
     X = d[feats].to_numpy("float64")
@@ -96,32 +112,45 @@ def _blocked_cv_regional(d, feats, target, group_col):
     n_splits = min(5, len(np.unique(grp)))
     gkf = GroupKFold(n_splits=n_splits)
     for tr, te in gkf.split(X, y, grp):
-        mdl = HistGradientBoostingRegressor(
-            max_iter=400,
-            learning_rate=0.05,
-            max_depth=3,
-            min_samples_leaf=15,
-            l2_regularization=1.0,
-        )
+        mdl = _regional_model()
         mdl.fit(X[tr], y[tr], sample_weight=w[tr])
         pred[te] = mdl.predict(X[te])
     return np.clip(pred, 0, None)
 
 
-def _fit_gate_scale(elev_above, fac_dtw, reg_dtw, obs_dtw, w, grp):
-    """Pick the gate length scale h0 out-of-fold (fit on train, applied on test)."""
-    p_fac = np.full(len(obs_dtw), np.nan)
+def _hybrid_oof(wt, feats, obs, reg_global, group_col):
+    """Leak-free FAC-authority blend scored out-of-fold (nested CV).
+
+    The held-out regional component is reused from the global blocked-CV regional
+    prediction ``reg_global`` -- for each fold that is a fit on all *other* folds,
+    so it is leak-free for the test rows (GroupKFold is deterministic in the
+    groups, so the partition matches). The gate length scale h0 is the only thing
+    fit from the training rows, and it needs their regional prediction; that is
+    recomputed by INNER blocked CV inside each outer-training set so h0 never sees
+    the held-out fold's labels (the prior nested-CV leak).
+    """
+    fac = wt["fac_dtw_m"].to_numpy("float64")
+    elev = wt[GATE_VAR].to_numpy("float64")
+    w = wt["weight"].to_numpy("float64")
+    grp = wt[group_col].to_numpy()
+    hyb = np.full(len(wt), np.nan)
+    p_fac = np.full(len(wt), np.nan)
     gkf = GroupKFold(n_splits=min(5, len(np.unique(grp))))
-    for tr, te in gkf.split(elev_above, obs_dtw, grp):
+    for tr, te in gkf.split(elev.reshape(-1, 1), obs, grp):
+        reg_tr = _blocked_cv_regional(
+            wt.iloc[tr].assign(_t=obs[tr]), feats, "_t", group_col
+        )
         best_h, best_mad = GATE_SCALES_M[0], np.inf
         for h0 in GATE_SCALES_M:
-            p = _gate(elev_above[tr], h0)
-            blend = (1 - p) * reg_dtw[tr] + p * fac_dtw[tr]
-            mad = np.average(np.abs(blend - obs_dtw[tr]), weights=w[tr])
+            p = _gate(elev[tr], h0)
+            blend = (1 - p) * reg_tr + p * fac[tr]
+            mad = np.average(np.abs(blend - obs[tr]), weights=w[tr])
             if mad < best_mad:
                 best_mad, best_h = mad, h0
-        p_fac[te] = _gate(elev_above[te], best_h)
-    return p_fac
+        p_te = _gate(elev[te], best_h)
+        hyb[te] = np.clip((1 - p_te) * reg_global[te] + p_te * fac[te], 0, None)
+        p_fac[te] = p_te
+    return hyb, p_fac
 
 
 def _metrics(pred, obs, w):
@@ -189,9 +218,7 @@ def main():
     obs = wt["target_dtw_m"].to_numpy("float64")
     fac = wt["fac_dtw_m"].to_numpy("float64")
     ma = wt["ma_dtw_m"].to_numpy("float64")
-    elev = wt[GATE_VAR].to_numpy("float64")
     w = wt["weight"].to_numpy("float64")
-    grp = wt[group_col].to_numpy()
 
     products = {"FAC": fac, "Ma": ma}
     feature_set_used = {}
@@ -201,8 +228,7 @@ def main():
         reg = _blocked_cv_regional(wt.assign(_t=obs), usable, "_t", group_col)
         wt[f"regional_dtw__{set_name}"] = reg
         products[f"Regional[{set_name}]"] = reg
-        p_fac = _fit_gate_scale(elev, fac, reg, obs, w, grp)
-        hyb = np.clip((1 - p_fac) * reg + p_fac * fac, 0, None)
+        hyb, p_fac = _hybrid_oof(wt, usable, obs, reg, group_col)
         wt[f"p_fac__{set_name}"] = p_fac
         wt[f"hybrid_dtw__{set_name}"] = hyb
         products[f"Hybrid[{set_name}]"] = hyb
@@ -251,22 +277,16 @@ def main():
     for set_name in FEATURE_SETS:
         if sp.empty:
             break
-        # score the same products at springs (obs DTW = 0); capture = predicted shallow
+        # Springs are shallow-discharge constraints, NOT regional-aquifer labels
+        # (CLAUDE.md): the regional model is trained on water-table WELLS ONLY and
+        # springs are scored as pure holdout points. capture = predicted shallow.
         feats = feature_set_used[set_name]
         sp_in = sp[sp[feats + [GATE_VAR, "fac_dtw_m"]].notna().all(axis=1)].copy()
         if sp_in.empty:
             continue
-        sp_reg = _blocked_cv_regional(
-            pd.concat(
-                [
-                    wt.assign(_t=obs),
-                    sp_in.assign(_t=0.0, weight=sp_in.get("weight", 0.25)),
-                ]
-            ),
-            feats,
-            "_t",
-            group_col,
-        )[len(wt) :]
+        sp_mdl = _regional_model()
+        sp_mdl.fit(wt[feats].to_numpy("float64"), obs, sample_weight=w)
+        sp_reg = np.clip(sp_mdl.predict(sp_in[feats].to_numpy("float64")), 0, None)
         sp_p = _gate(sp_in[GATE_VAR].to_numpy("float64"), 60.0)
         sp_hyb = np.clip(
             (1 - sp_p) * sp_reg + sp_p * sp_in["fac_dtw_m"].to_numpy("float64"), 0, None
