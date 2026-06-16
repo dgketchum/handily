@@ -1,0 +1,51 @@
+# NM Rio Grande-Albuquerque REM-regional WTE hybrid, v0.
+#
+# Mixture-of-experts water-table estimator:
+#   WTE_hybrid = (1 - p_fac) * WTE_regional + p_fac * WTE_fac
+# FAC keeps the riparian/shallow win (high shallow recall); a climate +
+# topographic-position regional model fixes the deep arid-basin table (FAC's
+# -82 m unconfined bias). Calibrate to GWX unconfined/marginal wells + NHD
+# springs only; Ma is a BENCHMARK, never a training label.
+#
+# Climate (gridMET aridity index P/PET) is the transferable physical driver:
+# fitting the regional table against aridity + height-above-regional-base-level
+# rather than basin coordinates is what carries from this basin to statewide and
+# CONUS scale. See notes/plans/nm_rio_grande_wte_hybrid_code_implementation_plan.md.
+
+[paths]
+root = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque"
+dem = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/dem_10m.tif"
+wells = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/evidence/gwx/nm_well_observation_labels.parquet"
+springs = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/evidence/springs/nhd_springs_45800.fgb"
+streams = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/streams_regional.fgb"
+heads = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/rem/nm_rga_v4_naip_support/fac_channel_heads.fgb"
+fac_dtw = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/rem/nm_rga_v4_naip_support/fac_head_depth_rem_10m.tif"
+flow_accumulation = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/flow_accumulation.tif"
+ma_benchmark = "/nas/gwx/wtd_states/wtd_new_mexico.tif"
+out_dir = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/hybrid/v0"
+
+[climate]
+# gridMET ~4 km daily stacks; reduced to long-term means in climate_normals.py.
+gridmet_dir = "/mnt/mco_nas1/shared/gridmet"
+
+[covariates]
+# Professional gridded products (EPSG:5070). The builder samples whatever is
+# present and reports per-covariate coverage; layers that do not cover NM
+# (e.g. MT-clipped depth-to-bedrock) are dropped, not silently zero-filled.
+zell_sanford_dtw = "/nas/gwx/studies/analysis_ready/zell_sanford_2020_dtw/zell_sanford_2020_dtw_5070.tif"
+fan_dtw = "/nas/gwx/studies/analysis_ready/fan_2013_wtd/fan_2013_wtd_conus_5070_posdown.tif"
+reitz_effective_recharge = "/nas/gwx/studies/analysis_ready/reitz_2017_recharge/reitz_effective_recharge_0013_5070.tif"
+reitz_total_recharge = "/nas/gwx/studies/analysis_ready/reitz_2017_recharge/reitz_total_recharge_0013_5070.tif"
+reitz_et = "/nas/gwx/studies/analysis_ready/reitz_2017_et/reitz_et_0013_5070.tif"
+wolock_bfi = "/nas/gwx/studies/analysis_ready/wolock_2003_bfi/wolock_2003_bfi_5070.tif"
+ssurgo_wtdep = "/nas/gwx/studies/analysis_ready/ssurgo_wtdep/ssurgo_wtdep_min_cm_90m_5070.tif"
+
+[covariate_table]
+out = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/hybrid/covariates/wte_points.parquet"
+include_springs = true
+# Build distance + height-above-drainage covariates to streams at each Strahler
+# floor: 1 = any channel, 5 = major valley-axis network, 7 = Rio Grande mainstem
+# (regional base level).
+distance_strahler_floors = [1, 5, 7]
+relief_radius_m = 300.0
+block_sizes_m = [10000, 20000, 50000]
