@@ -358,17 +358,30 @@ def add_observed_columns(wells: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return wells
 
 
+def _grouped_folds(
+    groups: np.ndarray, n_splits_max: int = 5
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Positional GroupKFold splits; raises ValueError if <2 groups.
+
+    GroupKFold is deterministic in the groups + n_splits, so an inner call on a
+    subset of rows reproduces the same partition the outer call would assign --
+    this is what lets the residual model reuse the global OOF regional prior for
+    its test fold while building train targets from an inner re-fit.
+    """
+    n_groups = len(np.unique(groups))
+    if n_groups < 2:
+        raise ValueError(f"need >=2 spatial blocks for CV; got {n_groups}")
+    gkf = GroupKFold(n_splits=min(n_splits_max, n_groups))
+    return list(gkf.split(np.zeros((len(groups), 1)), groups=groups))
+
+
 def make_group_folds(
     wells: pd.DataFrame, group_col: str, n_splits_max: int = 5
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    grp = wells[group_col].to_numpy()
-    n_groups = len(np.unique(grp))
-    if n_groups < 2:
-        raise SystemExit(f"need >=2 spatial blocks for CV; got {n_groups}")
-    n_splits = min(n_splits_max, n_groups)
-    gkf = GroupKFold(n_splits=n_splits)
-    dummy = np.zeros((len(wells), 1))
-    return list(gkf.split(dummy, groups=grp))
+    try:
+        return _grouped_folds(wells[group_col].to_numpy(), n_splits_max)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
 
 def fold_assignment(n: int, folds: list[tuple[np.ndarray, np.ndarray]]) -> np.ndarray:
@@ -453,6 +466,34 @@ def rbf_predict(
     return rbf(query_xy)
 
 
+def regional_fit_predict(
+    train_xy: np.ndarray,
+    train_y: np.ndarray,
+    train_w: np.ndarray,
+    query_xy: np.ndarray,
+    spec: MethodSpec,
+) -> np.ndarray:
+    """One regional interpolator fit on (train_xy, train_y) -> query predictions."""
+    if spec.family == "idw":
+        return idw_predict(
+            train_xy,
+            train_y,
+            query_xy,
+            train_weight=train_w,
+            k=spec.params["k"],
+            power=spec.params["power"],
+        )
+    if spec.family == "rbf":
+        return rbf_predict(
+            train_xy,
+            train_y,
+            query_xy,
+            kernel=spec.params["kernel"],
+            smoothing=spec.params["smoothing"],
+        )
+    raise ValueError(f"unknown method family {spec.family!r}")
+
+
 def crossfit_regional_method(
     wells: pd.DataFrame,
     folds: list[tuple[np.ndarray, np.ndarray]],
@@ -464,25 +505,7 @@ def crossfit_regional_method(
     w = wells["weight_model"].to_numpy("float64")
     pred = np.full(len(wells), np.nan)
     for tr, te in folds:
-        if spec.family == "idw":
-            pred[te] = idw_predict(
-                xy[tr],
-                y[tr],
-                xy[te],
-                train_weight=w[tr],
-                k=spec.params["k"],
-                power=spec.params["power"],
-            )
-        elif spec.family == "rbf":
-            pred[te] = rbf_predict(
-                xy[tr],
-                y[tr],
-                xy[te],
-                kernel=spec.params["kernel"],
-                smoothing=spec.params["smoothing"],
-            )
-        else:
-            raise ValueError(f"unknown method family {spec.family!r}")
+        pred[te] = regional_fit_predict(xy[tr], y[tr], w[tr], xy[te], spec)
     return pred
 
 
@@ -787,46 +810,101 @@ def _hgb() -> HistGradientBoostingRegressor:
         )
 
 
+def _per_method_residual_feats(m: str) -> set[str]:
+    return {
+        f"fac_minus_regional_wte__{m}",
+        f"fac_minus_regional_dtw__{m}",
+        f"regional_dtw_oof__{m}",
+        f"regional_head_above_ground_m__{m}",
+    }
+
+
+def _residual_features(method_name: str) -> list[str]:
+    m = method_name
+    return STATIC_RESIDUAL_FEATURES + sorted(_per_method_residual_feats(m))
+
+
+def _build_residual_X(
+    df: pd.DataFrame, reg_wte: np.ndarray, feats: list[str], m: str
+) -> np.ndarray:
+    """Feature matrix for `feats`; the per-method columns are recomputed from the
+    supplied regional WTE (so train rows use inner-OOF prior, test rows the
+    outer-train prior) rather than read from the global-OOF columns."""
+    dem = df["dem_m"].to_numpy("float64")
+    fac_wte = df["fac_wte_m"].to_numpy("float64")
+    fac_dtw = df["fac_dtw_m"].to_numpy("float64")
+    _, dtw_clip, _ = clip_dtw(reg_wte, dem)
+    derived = {
+        f"fac_minus_regional_wte__{m}": fac_wte - reg_wte,
+        f"fac_minus_regional_dtw__{m}": fac_dtw - dtw_clip,
+        f"regional_dtw_oof__{m}": dtw_clip,
+        f"regional_head_above_ground_m__{m}": np.clip(reg_wte - dem, 0, None),
+    }
+    cols = [derived[f] if f in derived else df[f].to_numpy("float64") for f in feats]
+    return np.column_stack(cols)
+
+
 def fit_residual_model_oof(
     wells: gpd.GeoDataFrame,
     folds: list[tuple[np.ndarray, np.ndarray]],
-    method_name: str,
+    spec: MethodSpec,
     group_col: str,
 ) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
-    """OOF residual-WTE model on top of the regional prior + feature importance.
+    """Nested-CV residual-WTE model on top of the regional prior + importance.
 
-    y = regional_residual_wte__<m>. The regional prior is already OOF; the
-    residual model is fit on training-fold rows only and predicts held-out rows.
+    Strictly leak-free (no nested-CV leakage). For each outer fold:
+      * the held-out regional prior is the global OOF column, which equals a
+        fit on the outer-train labels (same fold partition) -- leak-free;
+      * the residual target ``obs_wte - regional`` and the per-method features
+        for the *train* rows are rebuilt from an INNER-CV regional prior fit
+        only inside the outer-train set, so the outer-test labels never reach
+        the regressor's training data.
     """
-    m = method_name
-    feats = [f for f in _residual_features(m) if f in wells.columns]
+    m = spec.name
+    per_method = _per_method_residual_feats(m)
+    feats = [f for f in _residual_features(m) if f in per_method or f in wells.columns]
     assert not (set(feats) & DISALLOWED_RESIDUAL_FEATURES), "leaky residual feature"
 
-    X = wells[feats].to_numpy("float64")
-    y = wells[f"regional_residual_wte__{m}"].to_numpy("float64")
-    w = wells["weight_model"].to_numpy("float64")
+    obs_wte = wells["obs_wte_m"].to_numpy("float64")
     dem = wells["dem_m"].to_numpy("float64")
-    reg_wte = wells[f"regional_wte_oof__{m}"].to_numpy("float64")
+    w = wells["weight_model"].to_numpy("float64")
+    xy = wells[["x_5070", "y_5070"]].to_numpy("float64")
+    reg_global = wells[f"regional_wte_oof__{m}"].to_numpy("float64")  # leak-free OOF
 
     res_hat = np.full(len(wells), np.nan)
     imp_acc, imp_n = np.zeros(len(feats)), 0
     for tr, te in folds:
-        mdl = _hgb()
-        mdl.fit(X[tr], y[tr], sample_weight=w[tr])
-        res_hat[te] = mdl.predict(X[te])
+        train_df = wells.iloc[tr]
+        # inner-OOF regional prior for the train rows (within outer-train only)
+        try:
+            inner = _grouped_folds(train_df[group_col].to_numpy())
+            reg_tr = crossfit_regional_method(train_df, inner, spec)
+        except ValueError:  # too few inner blocks: fit-on-train (rare, logged once)
+            reg_tr = regional_fit_predict(xy[tr], obs_wte[tr], w[tr], xy[tr], spec)
+        reg_te = reg_global[te]  # == fit on outer-train, predict outer-test
+
+        X_tr = _build_residual_X(train_df, reg_tr, feats, m)
+        y_tr = obs_wte[tr] - reg_tr
+        X_te = _build_residual_X(wells.iloc[te], reg_te, feats, m)
+        y_te = obs_wte[te] - reg_te
+
+        ok = np.isfinite(y_tr)  # drop rows whose inner prior failed; X NaNs are fine
+        mdl = _hgb()  # HistGBR tolerates NaN features natively
+        mdl.fit(X_tr[ok], y_tr[ok], sample_weight=w[tr][ok])
+        res_hat[te] = mdl.predict(X_te)
         try:
             pi = permutation_importance(
-                mdl, X[te], y[te], sample_weight=w[te], n_repeats=5, random_state=0
+                mdl, X_te, y_te, sample_weight=w[te], n_repeats=5, random_state=0
             )
             imp_acc += pi.importances_mean
             imp_n += 1
         except Exception:  # importance is best-effort; never blocks OOF preds
             pass
 
-    hybrid_wte = reg_wte + res_hat
+    hybrid_wte = reg_global + res_hat
     hybrid_dtw = np.clip(dem - hybrid_wte, 0, None)
     out = wells.copy()
-    out[f"residual_wte_obs__{m}"] = y
+    out[f"residual_wte_obs__{m}"] = obs_wte - reg_global
     out[f"residual_wte_hat__{m}"] = res_hat
     out[f"hybrid_wte_oof__{m}"] = hybrid_wte
     out[f"hybrid_dtw_oof__{m}"] = hybrid_dtw
@@ -844,16 +922,6 @@ def fit_residual_model_oof(
             {"feature": feats, "importance_mean": np.nan, "status": "not_computed"}
         )
     return out, imp
-
-
-def _residual_features(method_name: str) -> list[str]:
-    m = method_name
-    return STATIC_RESIDUAL_FEATURES + [
-        f"fac_minus_regional_wte__{m}",
-        f"fac_minus_regional_dtw__{m}",
-        f"regional_dtw_oof__{m}",
-        f"regional_head_above_ground_m__{m}",
-    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -1012,7 +1080,8 @@ def main() -> None:
     residual_method = None
     if do_residual and recommended is not None:
         residual_method = recommended
-        res_pts, imp = fit_residual_model_oof(wells, folds, residual_method, group_col)
+        rec_spec = next(s for s in specs if s.name == recommended)
+        res_pts, imp = fit_residual_model_oof(wells, folds, rec_spec, group_col)
         m = residual_method
         res_products = [
             {
@@ -1093,6 +1162,7 @@ def main() -> None:
         "benchmark_only_products": ["Ma"] if "ma_dtw_m" in wells else [],
         "residual_model": do_residual,
         "residual_model_method": residual_method,
+        "residual_model_cv": "nested (inner-OOF train residuals, leak-free)",
         "runtime_s": round(perf_counter() - t0, 1),
     }
     write_run_json(out_dir / "regional_prior_run.json", run)

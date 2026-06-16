@@ -180,3 +180,61 @@ def test_build_method_specs_defaults():
     names = {s.name for s in specs}
     assert {"idw_k16_p2", "idw_k32_p2", "idw_k64_p2"} <= names
     assert {"rbf_tps_s25", "rbf_tps_s100", "rbf_tps_s400"} <= names
+
+
+# --- nested-CV leak-free invariants ----------------------------------------- #
+def _multiblock_df(n_blocks=5, per_block=3):
+    rows = []
+    for b in range(n_blocks):
+        for j in range(per_block):
+            rows.append(
+                {
+                    "x_5070": b * 50_000.0 + j * 100.0,
+                    "y_5070": j * 100.0,
+                    "obs_wte_m": 1000.0 + 40.0 * b + j,
+                    "weight_model": 1.0,
+                    "block_20km": f"b{b}",
+                }
+            )
+    return gpd.GeoDataFrame(
+        rows, geometry=[Point(r["x_5070"], r["y_5070"]) for r in rows], crs=5070
+    )
+
+
+def test_global_oof_equals_fit_on_outer_train():
+    # the residual model reuses the global OOF regional prior as its leak-free
+    # held-out prediction; this only holds if the global OOF for a test fold
+    # equals a direct fit on that fold's outer-training rows.
+    df = _multiblock_df()
+    folds = brp.make_group_folds(df, "block_20km")
+    spec = brp.MethodSpec("idw_k4_p2", "idw", {"k": 4, "power": 2.0})
+    oof = brp.crossfit_regional_method(df, folds, spec)
+    xy = df[["x_5070", "y_5070"]].to_numpy("float64")
+    y = df["obs_wte_m"].to_numpy("float64")
+    w = df["weight_model"].to_numpy("float64")
+    for tr, te in folds:
+        direct = brp.regional_fit_predict(xy[tr], y[tr], w[tr], xy[te], spec)
+        assert np.allclose(oof[te], direct)
+
+
+def test_grouped_folds_requires_two_blocks():
+    with pytest.raises(ValueError):
+        brp._grouped_folds(np.array(["only_one"] * 5))
+    folds = brp._grouped_folds(np.array(["a", "a", "b", "b", "c", "c"]))
+    assert len(folds) >= 2
+
+
+def test_inner_train_folds_exclude_outer_test_block():
+    # the inner CV used to build residual training targets is restricted to the
+    # outer-train rows, so the held-out outer block can never enter inner training.
+    df = _multiblock_df()
+    folds = brp.make_group_folds(df, "block_20km")
+    for tr, _ in folds:
+        train_df = df.iloc[tr]
+        inner = brp._grouped_folds(train_df["block_20km"].to_numpy())
+        train_blocks = set(train_df["block_20km"])
+        for itr, ite in inner:
+            seen = set(train_df["block_20km"].to_numpy()[itr]) | set(
+                train_df["block_20km"].to_numpy()[ite]
+            )
+            assert seen <= train_blocks
