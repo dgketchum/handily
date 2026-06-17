@@ -80,6 +80,11 @@ def download_3dep_10m_tiles(
         log.info("  downloading %s ...", name)
         tmp = local.with_suffix(".tif.part")
         with requests.get(url, stream=True, timeout=300) as r:
+            if r.status_code == 404:
+                # No 3DEP coverage for this 1-degree cell (border/Mexico/ocean);
+                # normal for a basin whose bbox overhangs the US edge -> skip.
+                log.warning("  %s: no 3DEP coverage (404) -> skip", name)
+                continue
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0))
             with (
