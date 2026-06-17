@@ -30,7 +30,9 @@ def main():
     parser = argparse.ArgumentParser(description="Build regional FAC stream network")
     parser.add_argument("--wbd-path", required=True, help="Path to WBD shapefile")
     huc_group = parser.add_mutually_exclusive_group(required=True)
-    huc_group.add_argument("--huc6", help="HUC6 code (e.g. 160401)")
+    huc_group.add_argument(
+        "--huc6", nargs="+", help="One or more HUC6 codes (e.g. 130100 130201)"
+    )
     huc_group.add_argument(
         "--huc8", nargs="+", help="One or more HUC8 codes (e.g. 10020004 10020002)"
     )
@@ -47,10 +49,12 @@ def main():
     # Load basin boundary — supports HUC6 or HUC8 (union of multiple)
     wbd_gdf = gpd.read_file(args.wbd_path)
     if args.huc6:
-        basin = wbd_gdf[wbd_gdf["huc6"] == args.huc6]
+        col = "huc6" if "huc6" in wbd_gdf.columns else "HUC6"
+        basin = wbd_gdf[wbd_gdf[col].isin(args.huc6)]
         if basin.empty:
             raise ValueError(f"HUC6 {args.huc6} not found in {args.wbd_path}")
-        label = f"{basin['name'].iloc[0]} ({args.huc6})"
+        names = ", ".join(basin["name"].unique())
+        label = f"{names} ({'+'.join(args.huc6)})"
     else:
         col = "huc8" if "huc8" in wbd_gdf.columns else "HUC8"
         basin = wbd_gdf[wbd_gdf[col].isin(args.huc8)]
