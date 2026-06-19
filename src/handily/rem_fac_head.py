@@ -335,6 +335,7 @@ def build_channel_heads(
     ndvi_quantile: float = 0.9,
     ndvi_mid: float = 0.20,
     ndvi_scale: float = 0.06,
+    seed_corridor_m: float = 0.0,
     support_override: float = 1.0,
     distance_scale_m: float = 4000.0,
     elevation_scale_m: float = 25.0,
@@ -398,6 +399,7 @@ def build_channel_heads(
         ndvi_quantile=ndvi_quantile,
         ndvi_mid=ndvi_mid,
         ndvi_scale=ndvi_scale,
+        seed_corridor_m=seed_corridor_m,
         support_override=support_override,
     )
 
