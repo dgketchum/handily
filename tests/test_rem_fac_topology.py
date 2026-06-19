@@ -63,6 +63,57 @@ def test_estimate_reach_seed_strength_uses_support_override():
     assert vals[3] < 0.5
 
 
+def _bare_channel_green_flank_streams() -> gpd.GeoDataFrame:
+    # One reach running E-W down the middle row (y=3.5) of a 7x8 grid.
+    return gpd.GeoDataFrame(
+        {
+            "stream_id": [1],
+            "strahler": [1],
+            "length_m": [5.0],
+            "geometry": [LineString([(1.5, 3.5), (6.5, 3.5)])],
+        },
+        geometry="geometry",
+        crs="EPSG:5070",
+    )
+
+
+def test_seed_corridor_samples_off_centerline_green():
+    # Channel itself is bare (NDVI 0) but an irrigated/vegetated band sits two
+    # cells off-axis on both flanks (y=5.5 and y=1.5, i.e. +/-2 m laterally).
+    streams = _bare_channel_green_flank_streams()
+    ndvi = _grid(np.zeros((7, 8), dtype=np.float64))
+    ndvi.values[1, :] = 0.8  # y = 5.5, +2 m flank
+    ndvi.values[5, :] = 0.8  # y = 1.5, -2 m flank
+
+    common = dict(sample_spacing_m=1.0, ndvi_mid=0.4, ndvi_scale=0.1)
+
+    # Centerline-only (legacy) sees only the bare channel -> near-zero seed.
+    centerline = estimate_reach_seed_strength(streams, ndvi, **common)
+    assert centerline["seed_ndvi_q"].iloc[0] == 0.0
+    assert centerline["seed_strength"].iloc[0] < 0.05
+
+    # A corridor too narrow to reach the flank (+/-1 m) stays bare.
+    narrow = estimate_reach_seed_strength(streams, ndvi, seed_corridor_m=1.0, **common)
+    assert narrow["seed_ndvi_q"].iloc[0] == 0.0
+    assert narrow["seed_strength"].iloc[0] < 0.05
+
+    # A +/-2 m corridor spans the green flank -> high quantile -> wet seed.
+    wide = estimate_reach_seed_strength(streams, ndvi, seed_corridor_m=2.0, **common)
+    assert wide["seed_ndvi_q"].iloc[0] == 0.8
+    assert wide["seed_strength"].iloc[0] > 0.95
+
+
+def test_seed_corridor_rejects_negative_width():
+    streams = _bare_channel_green_flank_streams()
+    ndvi = _grid(np.zeros((7, 8), dtype=np.float64))
+    try:
+        estimate_reach_seed_strength(streams, ndvi, seed_corridor_m=-1.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for negative seed_corridor_m")
+
+
 def test_propagate_upstream_wet_influence_decays_along_chain():
     streams = _toy_streams()
     elev = _grid(np.tile(np.array([4.0, 3.0, 2.0, 1.0, 0.0], dtype=np.float64), (3, 1)))

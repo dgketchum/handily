@@ -45,7 +45,13 @@ CONFIG_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "base_fac_snap_cells",
         "base_smooth_stations",
     ),
-    "seed": ("ndvi_mid", "ndvi_scale", "ndvi_quantile", "support_override"),
+    "seed": (
+        "ndvi_mid",
+        "ndvi_scale",
+        "ndvi_quantile",
+        "seed_corridor_m",
+        "support_override",
+    ),
     "propagation": (
         "distance_scale_m",
         "elevation_scale_m",
@@ -161,6 +167,13 @@ class FacRemConfig:
     ndvi_mid: float = 0.20
     ndvi_scale: float = 0.06
     ndvi_quantile: float = 0.9
+    # Lateral half-width (m) of the swath sampled for the NDVI seed quantile.
+    # 0.0 = legacy centerline-only sampling. When > 0, the seed evidence is
+    # sampled across perpendicular transects spanning ±seed_corridor_m so a
+    # reach whose centerline runs down a bare valley-floor arroyo still picks up
+    # the adjacent irrigated/vegetated floor instead of solving spuriously deep.
+    # Self-limiting: desert uplands have no adjacent green to raise the quantile.
+    seed_corridor_m: float = 0.0
     support_override: float = 1.0
 
     # --- Head-solve: wet propagation ---
@@ -244,6 +257,7 @@ class FacRemConfig:
             "ndvi_mid": self.ndvi_mid,
             "ndvi_scale": self.ndvi_scale,
             "ndvi_quantile": self.ndvi_quantile,
+            "seed_corridor_m": self.seed_corridor_m,
             "support_override": self.support_override,
             "distance_scale_m": self.distance_scale_m,
             "elevation_scale_m": self.elevation_scale_m,

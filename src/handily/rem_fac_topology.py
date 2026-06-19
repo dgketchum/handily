@@ -74,6 +74,43 @@ def _sample_line_values(
     return np.asarray(interp(pts[:, ::-1]), dtype=np.float64)
 
 
+def _sample_corridor_values(
+    line,
+    interp: RegularGridInterpolator,
+    spacing_m: float,
+    corridor_m: float,
+) -> np.ndarray:
+    """Sample ``interp`` over a buffered swath spanning the reach laterally.
+
+    At each along-line station the local centerline tangent is estimated, and
+    the raster is sampled along the perpendicular transect at lateral offsets
+    spaced ``spacing_m`` apart out to ``±corridor_m``. Returns the flattened
+    swath values (NaN outside the raster). Used so a reach whose centerline runs
+    down a bare channel still sees the wet/vegetated valley floor beside it.
+    """
+    total_m = float(line.length)
+    s_vals = _line_s_values(total_m, float(spacing_m))
+    base = shapely.get_coordinates(shapely.line_interpolate_point(line, s_vals))
+    if base.shape[0] >= 2:
+        # Discrete centerline tangent (direction only; magnitude is normalized).
+        tang = np.gradient(base, axis=0)
+    else:
+        c0 = np.asarray(line.coords[0], dtype=np.float64)
+        c1 = np.asarray(line.coords[-1], dtype=np.float64)
+        tang = (c1 - c0).reshape(1, 2)
+    tlen = np.hypot(tang[:, 0], tang[:, 1])
+    tlen[tlen < 1e-9] = 1.0
+    # Unit normal = tangent rotated +90 deg: (tx, ty) -> (-ty, tx).
+    nx = -tang[:, 1] / tlen
+    ny = tang[:, 0] / tlen
+    n_side = max(int(round(float(corridor_m) / float(spacing_m))), 1)
+    offsets = np.linspace(-float(corridor_m), float(corridor_m), 2 * n_side + 1)
+    px = base[:, 0][:, None] + nx[:, None] * offsets[None, :]
+    py = base[:, 1][:, None] + ny[:, None] * offsets[None, :]
+    pts_yx = np.column_stack([py.ravel(), px.ravel()])
+    return np.asarray(interp(pts_yx), dtype=np.float64)
+
+
 def build_fac_topology(
     streams_gdf: gpd.GeoDataFrame,
     elev_da: xr.DataArray,
@@ -285,13 +322,24 @@ def estimate_reach_seed_strength(
     ndvi_quantile: float = 0.9,
     ndvi_mid: float = 0.35,
     ndvi_scale: float = 0.06,
+    seed_corridor_m: float = 0.0,
     support_override: float = 1.0,
 ) -> gpd.GeoDataFrame:
-    """Estimate wet seed strength per FAC reach from raw NDVI and hard support."""
+    """Estimate wet seed strength per FAC reach from raw NDVI and hard support.
+
+    The NDVI quantile is taken over the reach centerline when
+    ``seed_corridor_m == 0`` (legacy), or over a buffered swath of width
+    ``±seed_corridor_m`` when positive — the latter lets valley-floor reaches
+    whose channel itself is bare pick up adjacent irrigated/vegetated ground.
+    Hard support is always sampled on the centerline only, to avoid pulling in
+    off-channel open water.
+    """
     if not (0.0 < ndvi_quantile <= 1.0):
         raise ValueError("ndvi_quantile must be in (0, 1]")
     if ndvi_scale <= 0.0:
         raise ValueError("ndvi_scale must be > 0")
+    if seed_corridor_m < 0.0:
+        raise ValueError("seed_corridor_m must be >= 0")
     ndvi_interp = _build_raster_interp(ndvi_da)
     support_interp = (
         _build_raster_interp(support_da) if support_da is not None else None
@@ -304,7 +352,12 @@ def estimate_reach_seed_strength(
     seed = np.zeros(len(out), dtype=np.float64)
 
     for i, row in enumerate(out.itertuples(index=False)):
-        vals = _sample_line_values(row.geometry, ndvi_interp, sample_spacing_m)
+        if seed_corridor_m > 0.0:
+            vals = _sample_corridor_values(
+                row.geometry, ndvi_interp, sample_spacing_m, seed_corridor_m
+            )
+        else:
+            vals = _sample_line_values(row.geometry, ndvi_interp, sample_spacing_m)
         good = np.isfinite(vals)
         if np.any(good):
             q = float(np.nanquantile(vals[good], ndvi_quantile))
