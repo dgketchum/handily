@@ -103,3 +103,26 @@ def test_station_smoothing_suppresses_spike(channel_grids):
         base_smooth_stations=5,
     )
     assert smooth["base_elev_m"].max() == pytest.approx(100.0)
+
+
+def test_station_smoothing_preserves_graded_channel():
+    # A rolling low quantile over absolute elevation depresses steep channels.
+    # Smoothing should remove local residual spikes without changing the grade.
+    dem = np.full((7, 7), 105.0)
+    channel = np.array([130.0, 125.0, 120.0, 115.0, 110.0, 105.0, 100.0])
+    dem[:, 3] = channel
+    dem_da = _grid_da(dem)
+
+    pts = [(35.0, 65.0 - 10.0 * i) for i in range(5)]
+    strips = _strips(pts)
+    raw = _attach_fac_strip_elevations(strips, dem_da)
+    smooth = _attach_fac_strip_elevations(
+        strips,
+        dem_da,
+        base_smooth_stations=5,
+    )
+    np.testing.assert_allclose(
+        smooth["base_elev_m"].to_numpy(),
+        raw["base_elev_m"].to_numpy(),
+        atol=1e-9,
+    )

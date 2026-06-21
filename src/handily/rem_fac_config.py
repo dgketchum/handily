@@ -51,6 +51,7 @@ CONFIG_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "ndvi_quantile",
         "seed_corridor_m",
         "support_override",
+        "seed_from_nhd_class",
     ),
     "propagation": (
         "distance_scale_m",
@@ -167,6 +168,11 @@ class FacRemConfig:
     ndvi_mid: float = 0.20
     ndvi_scale: float = 0.06
     ndvi_quantile: float = 0.9
+    # When true, the soft wet seed comes from each reach's NHD perenniality
+    # class (streams ``nhd_class`` column) instead of an NDVI raster — the
+    # static CONUS path with no per-AOI imagery. rem_fac builds the per-reach
+    # [0,1] override and relaxes the NDVI/NAIP head-solve gate.
+    seed_from_nhd_class: bool = False
     # Lateral half-width (m) of the swath sampled for the NDVI seed quantile.
     # 0.0 = legacy centerline-only sampling. When > 0, the seed evidence is
     # sampled across perpendicular transects spanning ±seed_corridor_m so a

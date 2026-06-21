@@ -588,3 +588,47 @@ def test_solve_channel_heads_dry_headwaters_detach():
     heads = solve_channel_heads(topo, d_min_off_support_m=0.5)
     by_id = heads.set_index("stream_id")
     assert (by_id["head_depth_m"] >= 0.5 - 1e-6).all()
+
+
+def test_build_channel_heads_overrides_realign_by_stream_id():
+    """Seed/drainage overrides must key on stream_id, not input row order.
+
+    The topology rebuild sorts reaches by stream_id and drops non-core columns,
+    so an override passed as a positional array must be realigned. We assert the
+    per-stream_id result is invariant to input row order: a positional bug would
+    map the wrong override to a reach and change its solved head depth.
+    """
+    elev = _sloped_elev()
+    seed_by_sid = {1: 0.05, 2: 0.05, 3: 0.9}
+    da_by_sid = {1: 1.0, 2: 10.0, 3: 600.0}
+    kw = dict(
+        sample_spacing_m=0.5,
+        distance_scale_m=2.0,
+        elevation_scale_m=2.0,
+        down_distance_scale_m=2.0,
+        rmax_min_m=0.5,
+        rmax_max_m=2.0,
+    )
+
+    def run(streams):
+        seed = np.array([seed_by_sid[int(s)] for s in streams["stream_id"]])
+        drain = np.array([da_by_sid[int(s)] for s in streams["stream_id"]])
+        heads = build_channel_heads(
+            streams,
+            elev,
+            None,
+            reach_seed_override=seed,
+            reach_drainage_override=drain,
+            **kw,
+        )
+        return heads.set_index("stream_id")["head_depth_m"].to_dict()
+
+    ordered = run(_chain_streams())
+    shuffled = run(_chain_streams().iloc[[2, 0, 1]].reset_index(drop=True))
+
+    assert set(ordered) == set(shuffled) == {1, 2, 3}
+    for sid in ordered:
+        assert np.isclose(ordered[sid], shuffled[sid]), (
+            f"reach {sid} depth differs by input order "
+            f"({ordered[sid]:.4f} vs {shuffled[sid]:.4f}) -> override misaligned"
+        )

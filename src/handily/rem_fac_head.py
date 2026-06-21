@@ -326,10 +326,12 @@ def solve_channel_heads(
 def build_channel_heads(
     streams_gdf: gpd.GeoDataFrame,
     elev_da: xr.DataArray,
-    ndvi_da: xr.DataArray,
+    ndvi_da: xr.DataArray | None,
     support_da: xr.DataArray | None = None,
     fac_da: xr.DataArray | None = None,
     *,
+    reach_seed_override: np.ndarray | None = None,
+    reach_drainage_override: np.ndarray | None = None,
     node_precision: int = 3,
     sample_spacing_m: float = 20.0,
     ndvi_quantile: float = 0.9,
@@ -384,13 +386,49 @@ def build_channel_heads(
     # propagation decay scaling and the order/area hard pin below.
     topo.streams = compute_strahler_from_topology(topo)
 
-    if fac_da is not None:
+    if reach_drainage_override is not None:
+        # Authoritative drainage area (e.g. NHDPlus totdasqkm) — preferred over
+        # the windowed FAC, which undercounts a big river at the HUC8 inlet
+        # because its upstream basin lies outside the window. Realign by
+        # stream_id like the seed override.
+        reach_drainage_override = np.asarray(reach_drainage_override, dtype=np.float64)
+        if len(reach_drainage_override) != len(streams_gdf):
+            raise ValueError(
+                "reach_drainage_override length must match streams_gdf "
+                f"({len(reach_drainage_override)} != {len(streams_gdf)})"
+            )
+        sid_to_da = dict(
+            zip(streams_gdf["stream_id"].astype(int), reach_drainage_override)
+        )
+        topo.streams["drainage_km2"] = np.array(
+            [sid_to_da[int(sid)] for sid in topo.streams["stream_id"]],
+            dtype=np.float64,
+        )
+    elif fac_da is not None:
         LOGGER.info("Sampling reach drainage area from flow accumulation")
         topo.streams["drainage_km2"] = sample_reach_drainage_km2(
             topo.streams, fac_da, sample_spacing_m=sample_spacing_m
         )
 
     LOGGER.info("Estimating wet-anchor strengths")
+    # ``reach_seed_override`` arrives aligned to the input ``streams_gdf``; the
+    # topology rebuild sorts reaches by stream_id and drops non-core columns, so
+    # realign the override to ``topo.streams`` order via stream_id before use.
+    topo_override = None
+    if reach_seed_override is not None:
+        reach_seed_override = np.asarray(reach_seed_override, dtype=np.float64)
+        if len(reach_seed_override) != len(streams_gdf):
+            raise ValueError(
+                "reach_seed_override length must match streams_gdf "
+                f"({len(reach_seed_override)} != {len(streams_gdf)})"
+            )
+        sid_to_seed = dict(
+            zip(streams_gdf["stream_id"].astype(int), reach_seed_override)
+        )
+        topo_override = np.array(
+            [sid_to_seed[int(sid)] for sid in topo.streams["stream_id"]],
+            dtype=np.float64,
+        )
     topo.streams = estimate_reach_seed_strength(
         topo.streams,
         ndvi_da,
@@ -401,6 +439,7 @@ def build_channel_heads(
         ndvi_scale=ndvi_scale,
         seed_corridor_m=seed_corridor_m,
         support_override=support_override,
+        reach_seed_override=topo_override,
     )
 
     LOGGER.info("Propagating wet influence upstream")

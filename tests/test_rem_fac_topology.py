@@ -63,6 +63,60 @@ def test_estimate_reach_seed_strength_uses_support_override():
     assert vals[3] < 0.5
 
 
+def test_reach_seed_override_replaces_ndvi():
+    # With an override and no NDVI raster, the soft seed IS the override.
+    streams = _toy_streams()
+    seeded = estimate_reach_seed_strength(
+        streams,
+        None,
+        reach_seed_override=np.array([0.9, 0.4, 0.05]),
+    )
+    vals = dict(zip(seeded["stream_id"], seeded["seed_strength"]))
+    assert vals[1] == 0.9
+    assert vals[2] == 0.4
+    assert vals[3] == 0.05
+
+
+def test_reach_seed_override_still_honors_hard_support():
+    # A low override is overridden upward by a hard-support hit.
+    streams = _toy_streams()
+    support = _grid(np.zeros((3, 5), dtype=np.float64))
+    support.values[2, 0] = 1.0
+    support.values[2, 1] = 1.0
+    seeded = estimate_reach_seed_strength(
+        streams,
+        None,
+        support_da=support,
+        sample_spacing_m=0.5,
+        reach_seed_override=np.array([0.05, 0.05, 0.05]),
+    )
+    vals = dict(zip(seeded["stream_id"], seeded["seed_strength"]))
+    assert vals[1] == 1.0  # support pin wins over the low override
+    assert vals[2] == 0.05  # no support -> keeps override
+
+
+def test_estimate_reach_seed_strength_requires_ndvi_or_override():
+    streams = _toy_streams()
+    try:
+        estimate_reach_seed_strength(streams, None)
+    except ValueError as e:
+        assert "ndvi_da or reach_seed_override" in str(e)
+    else:
+        raise AssertionError("expected ValueError when both ndvi and override are None")
+
+
+def test_reach_seed_override_length_mismatch_raises():
+    streams = _toy_streams()
+    try:
+        estimate_reach_seed_strength(
+            streams, None, reach_seed_override=np.array([0.9, 0.4])
+        )
+    except ValueError as e:
+        assert "length must match" in str(e)
+    else:
+        raise AssertionError("expected ValueError for override length mismatch")
+
+
 def _bare_channel_green_flank_streams() -> gpd.GeoDataFrame:
     # One reach running E-W down the middle row (y=3.5) of a 7x8 grid.
     return gpd.GeoDataFrame(
