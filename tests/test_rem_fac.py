@@ -1,6 +1,5 @@
 import geopandas as gpd
 import numpy as np
-import geopandas as gpd
 import rioxarray  # noqa: F401
 import xarray as xr
 
@@ -158,5 +157,9 @@ def test_fill_sparse_sections_idw_fills_within_radius():
         radius_m=60.0,
         power=1.0,
     )
-    assert int(np.isfinite(filled_da.values).sum()) > int(np.isfinite(sparse_da.values).sum())
-    assert int(np.isfinite(rem_da.values).sum()) == int(np.isfinite(filled_da.values).sum())
+    assert int(np.isfinite(filled_da.values).sum()) > int(
+        np.isfinite(sparse_da.values).sum()
+    )
+    assert int(np.isfinite(rem_da.values).sum()) == int(
+        np.isfinite(filled_da.values).sum()
+    )

@@ -315,7 +315,7 @@ def sample_reach_drainage_km2(
 
 def estimate_reach_seed_strength(
     streams_gdf: gpd.GeoDataFrame,
-    ndvi_da: xr.DataArray,
+    ndvi_da: xr.DataArray | None,
     support_da: xr.DataArray | None = None,
     *,
     sample_spacing_m: float = 20.0,
@@ -324,6 +324,7 @@ def estimate_reach_seed_strength(
     ndvi_scale: float = 0.06,
     seed_corridor_m: float = 0.0,
     support_override: float = 1.0,
+    reach_seed_override: np.ndarray | None = None,
 ) -> gpd.GeoDataFrame:
     """Estimate wet seed strength per FAC reach from raw NDVI and hard support.
 
@@ -333,6 +334,12 @@ def estimate_reach_seed_strength(
     whose channel itself is bare pick up adjacent irrigated/vegetated ground.
     Hard support is always sampled on the centerline only, to avoid pulling in
     off-channel open water.
+
+    When ``reach_seed_override`` is given (a per-reach [0, 1] array aligned to
+    ``streams_gdf``), it replaces the NDVI-derived soft seed entirely — used for
+    the static CONUS build where no per-AOI imagery exists and the soft seed
+    comes from NHD perenniality class. ``ndvi_da`` may be ``None`` in that case;
+    hard support (if supplied) is still applied on top.
     """
     if not (0.0 < ndvi_quantile <= 1.0):
         raise ValueError("ndvi_quantile must be in (0, 1]")
@@ -340,7 +347,18 @@ def estimate_reach_seed_strength(
         raise ValueError("ndvi_scale must be > 0")
     if seed_corridor_m < 0.0:
         raise ValueError("seed_corridor_m must be >= 0")
-    ndvi_interp = _build_raster_interp(ndvi_da)
+    if reach_seed_override is not None:
+        reach_seed_override = np.asarray(reach_seed_override, dtype=np.float64)
+        if len(reach_seed_override) != len(streams_gdf):
+            raise ValueError(
+                "reach_seed_override length must match streams_gdf "
+                f"({len(reach_seed_override)} != {len(streams_gdf)})"
+            )
+    elif ndvi_da is None:
+        raise ValueError(
+            "estimate_reach_seed_strength requires ndvi_da or reach_seed_override"
+        )
+    ndvi_interp = _build_raster_interp(ndvi_da) if ndvi_da is not None else None
     support_interp = (
         _build_raster_interp(support_da) if support_da is not None else None
     )
@@ -352,19 +370,24 @@ def estimate_reach_seed_strength(
     seed = np.zeros(len(out), dtype=np.float64)
 
     for i, row in enumerate(out.itertuples(index=False)):
-        if seed_corridor_m > 0.0:
-            vals = _sample_corridor_values(
-                row.geometry, ndvi_interp, sample_spacing_m, seed_corridor_m
-            )
+        if reach_seed_override is not None:
+            seed_ndvi = float(reach_seed_override[i])
         else:
-            vals = _sample_line_values(row.geometry, ndvi_interp, sample_spacing_m)
-        good = np.isfinite(vals)
-        if np.any(good):
-            q = float(np.nanquantile(vals[good], ndvi_quantile))
-            ndvi_p[i] = q
-            seed_ndvi = 1.0 / (1.0 + np.exp(-(q - float(ndvi_mid)) / float(ndvi_scale)))
-        else:
-            seed_ndvi = 0.0
+            if seed_corridor_m > 0.0:
+                vals = _sample_corridor_values(
+                    row.geometry, ndvi_interp, sample_spacing_m, seed_corridor_m
+                )
+            else:
+                vals = _sample_line_values(row.geometry, ndvi_interp, sample_spacing_m)
+            good = np.isfinite(vals)
+            if np.any(good):
+                q = float(np.nanquantile(vals[good], ndvi_quantile))
+                ndvi_p[i] = q
+                seed_ndvi = 1.0 / (
+                    1.0 + np.exp(-(q - float(ndvi_mid)) / float(ndvi_scale))
+                )
+            else:
+                seed_ndvi = 0.0
         seed_val = float(seed_ndvi)
         if support_interp is not None:
             svals = _sample_line_values(row.geometry, support_interp, sample_spacing_m)

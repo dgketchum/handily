@@ -528,6 +528,8 @@ def _generate_strip_rows_for_chunk(
     tangent_step_m: float,
     min_hit_dist_m: float,
     halo_n: int = 0,
+    naked_fill_m: float = 0.0,
+    max_crossing_strip_m: float = 0.0,
 ) -> list[dict]:
     assert _WORKER_STATE is not None
     out: list[dict] = []
@@ -599,10 +601,29 @@ def _generate_strip_rows_for_chunk(
                 )
 
                 if stream_hit is not None and stream_hit[0] < boundary_d:
+                    stream_d = float(stream_hit[0])
+                else:
+                    stream_d = float("inf")
+
+                # Keep connectors that survive the crossing-filter limit, but
+                # replace any farther stream hit (or no stream hit) with a
+                # bounded flat local anchor when naked_fill_m is enabled.  That
+                # preserves wide-valley interreach strips while still providing
+                # local burns in steep, stream-free side directions.
+                keep_limit = (
+                    max_crossing_strip_m if max_crossing_strip_m > 0.0 else float("inf")
+                )
+                if stream_d < float("inf") and stream_d <= keep_limit:
                     hit_type = "interreach"
-                    dist_m = float(stream_hit[0])
+                    dist_m = stream_d
                     endpoint_xy = stream_hit[1]
                     target_reach_id = int(stream_hit[2])
+                elif naked_fill_m > 0.0:
+                    flat_len = float(min(naked_fill_m, boundary_d))
+                    hit_type = "naked"
+                    dist_m = flat_len
+                    endpoint_xy = base_xy + base_dir * flat_len
+                    target_reach_id = -1
                 else:
                     hit_type = "edge"
                     dist_m = float(boundary_d)
@@ -754,9 +775,9 @@ def _attach_fac_strip_elevations(
     base_elev = dem_interp(np.column_stack([base_xy[:, 1], base_xy[:, 0]]))
 
     if base_smooth_stations > 1:
-        # Smooth the per-station base profile along each reach with a rolling
-        # low quantile keyed on s_m, so residual bank contamination and
-        # station-to-station jitter don't stamp a noisy water surface.
+        # Smooth residuals around each reach's longitudinal grade, rather than
+        # absolute elevation.  A rolling low quantile on absolute elevation
+        # biases steep reaches downward by metres over a 5-station window.
         df = pd.DataFrame(
             {
                 "sid": strips["stream_id"].to_numpy(),
@@ -765,11 +786,33 @@ def _attach_fac_strip_elevations(
             }
         )
         stations = df.drop_duplicates(["sid", "s"]).sort_values(["sid", "s"]).copy()
-        stations["e_sm"] = stations.groupby("sid")["e"].transform(
-            lambda s: s.rolling(
+
+        def _smooth_grade_residuals(grp: pd.DataFrame) -> pd.Series:
+            s = grp["s"].to_numpy(dtype=np.float64)
+            e = grp["e"].to_numpy(dtype=np.float64)
+            finite = np.isfinite(s) & np.isfinite(e)
+            if finite.sum() >= 2 and np.nanmax(s[finite]) > np.nanmin(s[finite]):
+                sf = s[finite]
+                ef = e[finite]
+                ds = np.diff(sf)
+                de = np.diff(ef)
+                ok = np.abs(ds) > 1e-12
+                slope = float(np.nanmedian(de[ok] / ds[ok])) if ok.any() else 0.0
+                intercept = float(np.nanmedian(ef - slope * sf))
+                trend = slope * s + intercept
+            else:
+                fill = float(np.nanmedian(e[finite])) if finite.any() else 0.0
+                trend = np.full_like(e, fill, dtype=np.float64)
+            resid = pd.Series(e - trend, index=grp.index)
+            resid_sm = resid.rolling(
                 base_smooth_stations, center=True, min_periods=1
             ).quantile(0.25)
-        )
+            return pd.Series(trend, index=grp.index) + resid_sm
+
+        smoothed = [
+            _smooth_grade_residuals(grp) for _sid, grp in stations.groupby("sid")
+        ]
+        stations["e_sm"] = pd.concat(smoothed).sort_index()
         lut = stations.set_index(["sid", "s"])["e_sm"]
         base_elev = lut.loc[pd.MultiIndex.from_arrays([df["sid"], df["s"]])].to_numpy()
 
@@ -847,10 +890,8 @@ def _attach_fac_strip_head_depth_offset(
             strips.loc[idx_ir, "endpoint_elev_m"].values - ep_depths
         )
 
-    # Edge and halo strips: endpoint = base (same reach depth)
-    edge_or_halo = (
-        strips["hit_type"].eq("edge") | strips["hit_type"].eq("halo")
-    ).to_numpy()
+    # Edge, halo, and naked strips: endpoint = base (flat, same reach depth)
+    edge_or_halo = strips["hit_type"].isin(("edge", "halo", "naked")).to_numpy()
     if edge_or_halo.any():
         strips.loc[edge_or_halo, "endpoint_elev_m"] = strips.loc[
             edge_or_halo, "base_elev_m"
@@ -899,6 +940,8 @@ def generate_fac_strips(
     fac_da: xr.DataArray | None = None,
     base_fac_snap_cells: int = 0,
     base_smooth_stations: int = 0,
+    naked_fill_m: float = 0.0,
+    max_crossing_strip_m: float = 0.0,
 ) -> gpd.GeoDataFrame:
     if field is None:
         field = build_orientation_field(dem_da)
@@ -998,6 +1041,8 @@ def generate_fac_strips(
             tangent_step_m,
             min_hit_dist_m,
             halo_n=halo_n,
+            naked_fill_m=naked_fill_m,
+            max_crossing_strip_m=max_crossing_strip_m,
         )
     else:
         chunk_size = max(1, int(np.ceil(len(records) / (workers * 4))))
@@ -1028,6 +1073,8 @@ def generate_fac_strips(
                     tangent_step_m,
                     min_hit_dist_m,
                     halo_n,
+                    naked_fill_m,
+                    max_crossing_strip_m,
                 ): len(chunk)
                 for chunk in chunks
             }
@@ -1356,6 +1403,37 @@ def fill_sparse_sections_idw(
     return filled_da, rem_da
 
 
+# NHD perenniality class -> soft wet-seed strength [0, 1] for the static CONUS
+# build (no per-AOI imagery). Perennial channels are reliably wet; canals and
+# artificial paths carry water; intermittent/ephemeral progressively less.
+_NHD_CLASS_SEED = {
+    "perennial": 0.9,
+    "canal_ditch": 0.6,
+    "artificial_path": 0.6,
+    "intermittent": 0.4,
+    "ephemeral": 0.05,
+    "other": 0.2,
+}
+_NHD_CLASS_SEED_DEFAULT = 0.2
+
+
+def _nhd_class_seed_override(streams) -> np.ndarray:
+    """Per-reach [0,1] soft seed from the streams ``nhd_class`` column."""
+    if "nhd_class" not in streams.columns:
+        raise ValueError(
+            "seed_from_nhd_class=True requires a 'nhd_class' column on streams"
+        )
+    classes = streams["nhd_class"].astype(str).str.lower()
+    mapped = classes.map(_NHD_CLASS_SEED)
+    n_unmapped = int(mapped.isna().sum())
+    if n_unmapped:
+        print(
+            f"  NHD-class seed: {n_unmapped}/{len(classes)} reaches with "
+            f"unrecognized class -> default {_NHD_CLASS_SEED_DEFAULT}"
+        )
+    return mapped.fillna(_NHD_CLASS_SEED_DEFAULT).to_numpy(dtype=float)
+
+
 def _effective_config_from_args(args: argparse.Namespace):
     from handily.rem_fac_config import FacRemConfig
 
@@ -1376,6 +1454,7 @@ def _effective_config_from_args(args: argparse.Namespace):
         "min_hit_dist_m": args.min_hit_dist_m,
         "min_strahler": args.min_strahler,
         "max_crossing_strip_m": args.max_crossing_strip_m,
+        "naked_fill_m": args.naked_fill_m,
         "halo_n": args.halo_n,
         "workers": args.workers,
         "burn_res_m": args.burn_res_m,
@@ -1384,6 +1463,7 @@ def _effective_config_from_args(args: argparse.Namespace):
         "post_smooth_m": args.post_smooth_m,
         "base_fac_snap_cells": args.base_fac_snap_cells,
         "base_smooth_stations": args.base_smooth_stations,
+        "seed_from_nhd_class": getattr(args, "seed_from_nhd_class", False),
     }
     kwargs.update(args.head_solve_kwargs)
     return FacRemConfig(**kwargs)
@@ -1429,6 +1509,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-hit-dist-m", type=float, default=None)
     parser.add_argument("--min-strahler", type=int, default=None)
     parser.add_argument("--max-crossing-strip-m", type=float, default=None)
+    parser.add_argument("--naked-fill-m", type=float, default=None)
     parser.add_argument("--halo-n", type=int, default=None)
     parser.add_argument("--burn-res-m", type=float, default=None)
     parser.add_argument("--idw-radius-m", type=float, default=None)
@@ -1480,6 +1561,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             cli.min_strahler = cfg.min_strahler
         if cli.max_crossing_strip_m is None:
             cli.max_crossing_strip_m = cfg.max_crossing_strip_m
+        if cli.naked_fill_m is None:
+            cli.naked_fill_m = cfg.naked_fill_m
         if cli.halo_n is None:
             cli.halo_n = cfg.halo_n
         if cli.burn_res_m is None:
@@ -1498,6 +1581,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             cli.workers = cfg.workers
         # Stash head-solve kwargs from config for main() to use.
         cli.head_solve_kwargs = cfg.head_solve_kwargs()
+        cli.seed_from_nhd_class = cfg.seed_from_nhd_class
     else:
         # No config — use hardcoded module defaults for paths/geometry.
         if cli.dem_path is None:
@@ -1520,6 +1604,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             cli.min_strahler = 0
         if cli.max_crossing_strip_m is None:
             cli.max_crossing_strip_m = 0.0
+        if cli.naked_fill_m is None:
+            cli.naked_fill_m = 0.0
         if cli.halo_n is None:
             cli.halo_n = 0
         if cli.burn_res_m is None:
@@ -1537,6 +1623,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if cli.workers is None:
             cli.workers = DEFAULT_WORKERS
         cli.head_solve_kwargs = {}
+        cli.seed_from_nhd_class = False
 
     return cli
 
@@ -1599,10 +1686,13 @@ def main(argv: list[str] | None = None) -> None:
         fac_da=fac_da,
         base_fac_snap_cells=args.base_fac_snap_cells,
         base_smooth_stations=args.base_smooth_stations,
+        naked_fill_m=args.naked_fill_m,
+        max_crossing_strip_m=args.max_crossing_strip_m,
     )
     print(
         f"  strips: {len(strips)} "
         f"({int((strips['hit_type'] == 'interreach').sum())} interreach, "
+        f"{int((strips['hit_type'] == 'naked').sum())} naked, "
         f"{int((strips['hit_type'] == 'edge').sum())} edge)"
     )
     strips_before_filter = len(strips)
@@ -1618,19 +1708,38 @@ def main(argv: list[str] | None = None) -> None:
         "count": int(len(strips)),
         "removed_long_crossing": int(strips_before_filter - len(strips)),
         "interreach": int((strips["hit_type"] == "interreach").sum()),
+        "naked": int((strips["hit_type"] == "naked").sum()),
         "edge": int((strips["hit_type"] == "edge").sum()),
     }
 
     strips.to_file(args.out_dir / "fac_normals_cross_sections.fgb", driver="FlatGeobuf")
 
-    if args.naip_path is not None or args.ndvi_path is not None:
+    if (
+        args.naip_path is not None
+        or args.ndvi_path is not None
+        or args.seed_from_nhd_class
+    ):
         from handily.rem_fac_head import build_channel_heads
 
         print("Running channel-head longitudinal solve")
         t0 = perf_counter()
         _x, _y = _axes_from_bounds(tuple(dem_da.rio.bounds()), args.burn_res_m)
         _dem20 = sample_dem_to_grid(dem_da, _x, _y)
-        if args.ndvi_path is not None:
+        ndvi_da = None
+        reach_seed_override = None
+        reach_drainage_override = None
+        if args.seed_from_nhd_class:
+            # Static CONUS path: soft wet seed from NHD perenniality class, no
+            # NDVI raster. NDVI flags take precedence if both are supplied.
+            reach_seed_override = _nhd_class_seed_override(streams)
+            print(
+                f"  NHD-class seed: {len(reach_seed_override)} reaches, "
+                f"mean={float(np.nanmean(reach_seed_override)):.3f}"
+            )
+            if "drainage_km2" in streams.columns:
+                # Prefer authoritative NHD drainage (totdasqkm) over windowed FAC.
+                reach_drainage_override = streams["drainage_km2"].to_numpy(dtype=float)
+        elif args.ndvi_path is not None:
             # Prebuilt NDVI grid (e.g. evidence/ndvi_20m.tif from
             # build_basin_naip_evidence.py) — used as-is.
             ndvi_da = rioxarray.open_rasterio(args.ndvi_path).squeeze("band", drop=True)
@@ -1667,6 +1776,8 @@ def main(argv: list[str] | None = None) -> None:
             ndvi_da,
             support_da=support_da,
             fac_da=fac_da,
+            reach_seed_override=reach_seed_override,
+            reach_drainage_override=reach_drainage_override,
             **args.head_solve_kwargs,
         )
         heads.to_file(args.out_dir / "fac_channel_heads.fgb", driver="FlatGeobuf")
