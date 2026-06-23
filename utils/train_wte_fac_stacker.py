@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import logging
 import sys
@@ -44,24 +45,56 @@ log = logging.getLogger("train_wte_fac_stacker")
 
 FEATURES = "/data/ssd2/handily/conus/stacker/wte_fac_features.parquet"
 JANSSEN = "/nas/gwx/janssen/V1_140.tif"
-MA_STATES = (
-    "/nas/gwx/wtd_states/wtd_montana.tif",
-    "/nas/gwx/wtd_states/wtd_new_mexico.tif",
-    "/nas/gwx/wtd_states/wtd_texas.tif",
-)
-FEATURE_COLS = (
+# All per-state Ma WTD rasters (CONUS coverage; sample_ma coalesces the first finite
+# value per well across states -- states don't overlap, so a well takes its own state's
+# value). Globbed so new states are picked up automatically.
+MA_STATES = tuple(sorted(glob.glob("/nas/gwx/wtd_states/wtd_*.tif")))
+# Feature tiers (mirror notes/CONUS_DTW_STACKER.md). Ablations share ONE footprint
+# (the need mask below always requires the FULL set finite), so level0/relief/full are
+# compared on an identical well population -- the difference is only which columns the
+# HGB sees, never which wells it sees.
+LEVEL0 = (
     "wte_dtw",
     "fac_rem_dtw_m",
+    "wte_support_dist_m",
+    "land_surface_elev_m",
+)
+RELIEF = LEVEL0 + (
     "elev_above_coarse_m",  # artifact-deep flag: well perched above its 2 km cell mean
     "slope_deg",
     "tri_100m",
     "dist_to_stream_m",
     "log_drainage_area",
-    "wte_support_dist_m",
-    "land_surface_elev_m",
+)
+FULL = RELIEF + (
     "aridity_index",  # real-deep flag: arid basin (low P/PET) -> genuinely deep table
     "mean_annual_precip_mm",
 )
+# ETRM water-balance fluxes: the dynamic-flux test of the real-deep hypothesis static
+# gridMET aridity failed. recharge integrates P-ET-runoff (low recharge -> no water
+# reaching the table -> genuinely deep); ETa flags where water is actually consumed
+# (shallow/accessible table). NOT in the footprint mask (see FEATURE_COLS), so the well
+# population is identical to the no-ETRM run -- ETRM enters only as NaN-tolerant columns
+# the HGB may or may not use, isolating its marginal value.
+ETRM = (
+    "etrm_recharge_mm",
+    "etrm_eta_mm",
+    "etrm_runoff_mm",
+)
+RELIEF_ETRM = RELIEF + ETRM
+FULL_ETRM = FULL + ETRM
+FEATURE_SETS = {
+    "level0": LEVEL0,
+    "relief": RELIEF,
+    "full": FULL,
+    "relief_etrm": RELIEF_ETRM,
+    "full_etrm": FULL_ETRM,
+}
+# Superset for the finite-feature footprint mask (kept fixed across ablations so every
+# tier is scored on an identical well population). Deliberately FULL, NOT FULL_ETRM:
+# requiring ETRM finite would shrink/shift the population and break comparability with
+# the prior relief baseline; ETRM is NaN-tolerant in the HGB instead.
+FEATURE_COLS = FULL
 BENCH_SOURCES = ("nwis", "ngwmn")  # Janssen/Ma training set -> independent footprint
 MIN_FOLD_N = 50
 
@@ -163,6 +196,7 @@ def build(
     features_path: str,
     out_dir: str,
     *,
+    feature_cols=FEATURE_COLS,
     janssen=JANSSEN,
     ma_states=MA_STATES,
     random_k: int = 5,
@@ -172,12 +206,19 @@ def build(
     out.mkdir(parents=True, exist_ok=True)
     df = pd.read_parquet(features_path)
     df = df[df.fac_covered].copy()
-    # need finite features + target for the stacker
+    # need finite target + the FULL feature superset, so every ablation (level0/relief/
+    # full) trains and evals on the IDENTICAL well population (footprint fixed; only the
+    # columns fed to the HGB change).
     need = df.mean_dtw.notna()
     for c in FEATURE_COLS:
         need &= df[c].notna()
     df = df[need].reset_index(drop=True)
-    log.info("ConusFAC-covered wells with complete features: %d", len(df))
+    log.info(
+        "ConusFAC-covered wells with complete features: %d (feature set: %s, %d cols)",
+        len(df),
+        [k for k, v in FEATURE_SETS.items() if v == tuple(feature_cols)] or ["custom"],
+        len(feature_cols),
+    )
 
     lon, lat = df.longitude.to_numpy(), df.latitude.to_numpy()
     df["pred_ConusWTE"] = df.wte_dtw
@@ -191,9 +232,9 @@ def build(
         len(df),
     )
 
-    oof, keep, eligible = oof_blocked(df, FEATURE_COLS, "mean_dtw", "huc4", MIN_FOLD_N)
+    oof, keep, eligible = oof_blocked(df, feature_cols, "mean_dtw", "huc4", MIN_FOLD_N)
     df["pred_Stacker"] = oof
-    df["pred_Stacker_rand"] = oof_random(df, FEATURE_COLS, "mean_dtw", random_k, seed)
+    df["pred_Stacker_rand"] = oof_random(df, feature_cols, "mean_dtw", random_k, seed)
     n_drop = int((~keep).sum())
     log.info(
         "blocked folds (huc4 >= %d): %s | dropped %d wells in tiny blocks",
@@ -255,14 +296,14 @@ def build(
     # CONUS-wide (feature order = FEATURE_COLS).
     import joblib
 
-    final = _model().fit(ev[list(FEATURE_COLS)].to_numpy(), ev.mean_dtw.to_numpy())
+    final = _model().fit(ev[list(feature_cols)].to_numpy(), ev.mean_dtw.to_numpy())
     joblib.dump(
-        {"model": final, "feature_cols": list(FEATURE_COLS)}, out / "stacker_hgb.joblib"
+        {"model": final, "feature_cols": list(feature_cols)}, out / "stacker_hgb.joblib"
     )
     run = {
         "n_eval": int(len(ev)),
         "n_independent": int(indep.sum()),
-        "feature_cols": list(FEATURE_COLS),
+        "feature_cols": list(feature_cols),
         "blocked_folds": list(map(str, eligible)),
         "n_dropped_tiny_blocks": n_drop,
         "feature_importance_permutation": None,
@@ -331,12 +372,20 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--features", default=FEATURES)
     p.add_argument("--janssen", default=JANSSEN)
     p.add_argument("--out-dir", default="/data/ssd2/handily/conus/stacker/stacker_eval")
+    p.add_argument(
+        "--feature-set",
+        choices=sorted(FEATURE_SETS),
+        default="relief",
+        help="feature tier fed to the HGB (footprint fixed across tiers): "
+        "level0 | relief (default; aridity twice shown NEGATIVE) | full (+aridity expt)",
+    )
     p.add_argument("--random-k", type=int, default=5)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     build(
         args.features,
         args.out_dir,
+        feature_cols=FEATURE_SETS[args.feature_set],
         janssen=args.janssen,
         random_k=args.random_k,
         seed=args.seed,

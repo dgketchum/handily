@@ -71,6 +71,14 @@ DIST_STREAM = f"{COV_DIR}/dist_to_stream_m.tif"
 # high-relief artifact-deep wells.
 GRIDMET_AI = f"{COV_DIR}/gridmet_aridity_index.tif"
 GRIDMET_P = f"{COV_DIR}/gridmet_mean_annual_precip_mm.tif"
+# ETRM water-balance fluxes (CONUS 5070 1 km, 2020-2024 mean -> sample at x5070/y5070).
+# The flux test of the real-deep hypothesis static aridity failed: recharge integrates
+# P-ET-runoff, so low recharge flags genuinely deep regional tables (no water reaching
+# the table) while ETa flags where water is actually used (shallow/accessible table).
+ETRM_DIR = "/nas/etrm/conus/recharge_250m"
+ETRM_RECHARGE = f"{ETRM_DIR}/conus_mean_recharge_2020-2024_albers1km.tif"
+ETRM_ETA = f"{ETRM_DIR}/conus_mean_eta_2020-2024_albers1km.tif"
+ETRM_RUNOFF = f"{ETRM_DIR}/conus_mean_runoff_2020-2024_albers1km.tif"
 
 
 def sample_coarse(path: str, x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -180,6 +188,9 @@ COVARIATES = (
     "log_drainage_area",
     "aridity_index",
     "mean_annual_precip_mm",
+    "etrm_recharge_mm",
+    "etrm_eta_mm",
+    "etrm_runoff_mm",
 )
 
 
@@ -193,6 +204,9 @@ def add_covariates(
     accum: str = ACCUM,
     gridmet_ai: str = GRIDMET_AI,
     gridmet_p: str = GRIDMET_P,
+    etrm_recharge: str = ETRM_RECHARGE,
+    etrm_eta: str = ETRM_ETA,
+    etrm_runoff: str = ETRM_RUNOFF,
 ) -> pd.DataFrame:
     """Sample the regime discriminators that separate artifact-deep from real-deep.
 
@@ -227,6 +241,10 @@ def add_covariates(
     # gridMET aridity is EPSG:4326 -> sample at lon/lat (NOT 5070 metres).
     df["aridity_index"] = sample_coarse(gridmet_ai, lon, lat)
     df["mean_annual_precip_mm"] = sample_coarse(gridmet_p, lon, lat)
+    # ETRM fluxes are EPSG:5070 1 km -> sample at x5070/y5070 (nodata -9999 -> NaN).
+    df["etrm_recharge_mm"] = sample_coarse(etrm_recharge, x, y)
+    df["etrm_eta_mm"] = sample_coarse(etrm_eta, x, y)
+    df["etrm_runoff_mm"] = sample_coarse(etrm_runoff, x, y)
     for c in COVARIATES:
         n = int(df[c].notna().sum())
         log.info(
@@ -302,6 +320,9 @@ def build(
         "log_drainage_area",
         "aridity_index",
         "mean_annual_precip_mm",
+        "etrm_recharge_mm",
+        "etrm_eta_mm",
+        "etrm_runoff_mm",
     ]
     out = df[cols].copy()
     out["fac_covered"] = out.fac_rem_dtw_m.notna()
