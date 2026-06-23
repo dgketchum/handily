@@ -8,12 +8,14 @@ NDVI (and Kcb = NDVI * 1.25 downstream for a soil-water-balance model) gives the
 stacker a vegetation-water-use covariate the relief/aridity features cannot supply.
 
 Source: Microsoft Planetary Computer (free, no Earth Engine quota). Collection
-`modis-13Q1-061` (MOD13Q1, Terra, 250 m, 16-day Maximum-Value Composite), POR
-2000-02-18 -> present. Each composite is already cloud-minimized (MVC); we further
-mask `pixel_reliability` (keep 0 good / 1 marginal; drop 2 snow-ice, 3 cloud, 255
-fill) and the NDVI fill (-3000) / out-of-range, then average per season across the
-full POR. We never store the archive -- we stream each composite, accumulate per-tile
-sum/count, and discard.
+`modis-13Q1-061` (250 m, 16-day Maximum-Value Composite) serves BOTH Terra (MOD13Q1)
+and Aqua (MYD13Q1) granules; `--platform` selects which (default `terra` = MOD13Q1
+only, the single 16-day series; `both` interleaves to an effective 8-day sampling).
+`--datetime` selects the window (default 2020-2025). Each composite is already
+cloud-minimized (MVC); we further mask `pixel_reliability` (keep 0 good / 1 marginal;
+drop 2 snow-ice, 3 cloud, 255 fill) and the NDVI fill (-3000) / out-of-range, then
+average per season across the window. We never store the archive -- we stream each
+composite, accumulate per-tile sum/count, and discard.
 
 Pipeline:
   1. Search MPC for all MOD13Q1 composites intersecting CONUS over the POR.
@@ -58,7 +60,8 @@ NDVI_ASSET = "250m_16_days_NDVI"
 REL_ASSET = "250m_16_days_pixel_reliability"
 
 CONUS_BBOX = (-125.0, 24.0, -66.5, 49.5)
-DATETIME = "2000-01-01/2025-12-31"  # complete years; partial years bias season means
+DATETIME = "2020-01-01/2025-12-31"  # window; partial years bias season means slightly
+PLATFORM = "terra"  # "terra"=MOD13Q1, "aqua"=MYD13Q1, "both"=interleaved (8-day eff.)
 
 NDVI_FILL = -3000
 NDVI_MIN, NDVI_MAX = -2000, 10000  # valid VI range; scale 1e-4
@@ -80,6 +83,18 @@ TARGET_RES = 250.0
 
 _TILE_RE = re.compile(r"\.(h\d\dv\d\d)\.")
 _DATE_RE = re.compile(r"\.A(\d{4})(\d{3})\.")
+_PRODUCT_RE = re.compile(r"^(MOD|MYD)13Q1\.")
+
+
+def granule_platform(item_id: str) -> str:
+    """Platform from the product token: MOD13Q1 -> 'terra', MYD13Q1 -> 'aqua'.
+
+    The `modis-13Q1-061` collection mixes both; this lets us keep one series.
+    """
+    m = _PRODUCT_RE.match(item_id)
+    if not m:
+        raise ValueError(f"no MOD/MYD13Q1 product token in item id: {item_id}")
+    return "terra" if m.group(1) == "MOD" else "aqua"
 
 
 def tile_id(item_id: str) -> str:
@@ -209,16 +224,22 @@ def accumulate_tile(tile: str, records: list[dict], tile_dir: str) -> dict:
     return {"tile": tile, "status": "ok", "used": used, "skipped": skipped}
 
 
-def list_records(bbox, datetime_str) -> dict:
-    """Search MPC and group unsigned (ndvi, rel) href records by MODIS tile."""
+def list_records(bbox, datetime_str, platform: str = PLATFORM) -> dict:
+    """Search MPC and group unsigned (ndvi, rel) href records by MODIS tile.
+
+    platform: "terra"/"aqua" keep only that series; "both" interleaves them.
+    """
     cat = Client.open(STAC_URL)  # unsigned; we sign per-read (long run, SAS expiry)
     search = cat.search(collections=[COLLECTION], bbox=bbox, datetime=datetime_str)
     by_tile: dict[str, list[dict]] = defaultdict(list)
-    n = 0
+    n = dropped = 0
     for it in search.items():
         try:
             t = tile_id(it.id)
         except ValueError:
+            continue
+        if platform != "both" and granule_platform(it.id) != platform:
+            dropped += 1
             continue
         by_tile[t].append(
             {
@@ -230,7 +251,13 @@ def list_records(bbox, datetime_str) -> dict:
         n += 1
         if n % 1000 == 0:
             log.info("listed %d composites (%d tiles)", n, len(by_tile))
-    log.info("total %d composites over %d tiles", n, len(by_tile))
+    log.info(
+        "total %d composites over %d tiles (platform=%s, dropped %d other-platform)",
+        n,
+        len(by_tile),
+        platform,
+        dropped,
+    )
     return dict(by_tile)
 
 
@@ -278,11 +305,12 @@ def build(
     *,
     bbox=CONUS_BBOX,
     datetime_str: str = DATETIME,
+    platform: str = PLATFORM,
     workers: int = 4,
     tile_dir: str | None = None,
 ) -> dict[str, str]:
     tile_dir = tile_dir or f"{out_dir}/modis_ndvi_tiles"
-    by_tile = list_records(bbox, datetime_str)
+    by_tile = list_records(bbox, datetime_str, platform=platform)
     results = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futs = {
@@ -309,12 +337,14 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out-dir", default=OUT_DIR)
     p.add_argument("--datetime", default=DATETIME)
+    p.add_argument("--platform", choices=["terra", "aqua", "both"], default=PLATFORM)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--tile-dir", default=None)
     args = p.parse_args(argv)
     build(
         args.out_dir,
         datetime_str=args.datetime,
+        platform=args.platform,
         workers=args.workers,
         tile_dir=args.tile_dir,
     )
