@@ -12,6 +12,16 @@ is drawn in feet to match the Nevada slide, with the phreatophyte zone marked at
 15 m / 49 ft. Residual = predicted - observed (well); negative = product too
 shallow (the deep-arid-basin failure mode).
 
+POPULATION (name it; do NOT conflate with score_janssen_vs_ma.py): confinement
+here is the GWX national v2 classifier's ``unconfined`` / ``unconfined_marginal``
+classes, so nm_ose IS counted unconfined and the non-NWIS panel runs ~34k wells
+(~33.5k nm_ose). The consolidated-layer pipeline (build_nm_validation_layer.py /
+score_janssen_vs_ma.py) instead HAND-ASSIGNS confinement and holds OSE driller
+logs out as 'unknown' screening, headlining only ~839 study/monitoring wells —
+a different scientific claim. Never compare the two n's / MADs without naming the
+population. Independence is "non-NWIS", not proven-independent of Ma (see
+gwx_wells.py).
+
 Confinement: only ``unconfined`` / ``unconfined_marginal`` enter the figure
 (depth-to-water = depth to the *unconfined* table). The NM window is defined by
 the state-clipped Ma raster footprint (``--nm-mask``), so out-of-state wells
@@ -328,6 +338,14 @@ def main() -> None:
     fig_without = out_dir / f"{args.tag}_vs_nm_gwx_nwis_split_without_nmose.png"
     report = {
         "product_label": args.product_label,
+        "population": (
+            "GWX national v2 classifier, confinement_class in "
+            "{unconfined, unconfined_marginal}; nm_ose IS counted unconfined "
+            "(~33.5k of the non-NWIS panel). DISTINCT from the hand-assigned "
+            "consolidated layer (build_nm_validation_layer.py), which holds OSE "
+            "out as 'unknown' screening (~839-well headline). 'non-NWIS' here is "
+            "not proven-independent of Ma."
+        ),
         "pred_raster": args.pred,
         "nm_mask_raster": args.nm_mask,
         "gwx_index": args.gwx_index,

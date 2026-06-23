@@ -16,8 +16,13 @@ import rasterio
 from pyproj import Transformer
 from shapely.geometry import Point
 
-# National GWX well index (confinement-labeled). nwis/ngwmn are Ma/Janssen
-# training sources -> excluded from the independent comparison set.
+# National GWX well index (confinement-labeled). nwis/ngwmn are the *direct*
+# USGS training source for Ma/Janssen and are excluded from the comparison set.
+# NOTE: source != nwis does NOT by itself prove independence from Ma -- the Ma
+# 2026 product also trained on Fan et al. wells, Jasechko CA/TX data, and ~20k
+# stream-dummy cells. Treat the non-NWIS set as "non-NWIS" (defensible-but-
+# unproven independence for Ma; stronger for Janssen, whose US real-obs source
+# is USGS gwlevels), not as proven-independent, absent a training-set dedup.
 GWX_INDEX = "/data/ssd2/gwx/products/current/wells.geoparquet"
 WT_CLASSES = ("unconfined", "unconfined_marginal")
 DEPTH_BANDS = ((0, 2), (2, 5), (5, 10), (10, 30), (30, 1e9))
