@@ -8,12 +8,23 @@ import pytest
 from utils.build_modis_ndvi_climatology import (
     NDVI_FILL,
     granule_month,
+    granule_platform,
     scaled_ndvi,
     season_of,
     seasonal_mean,
     tile_id,
     valid_mask,
 )
+
+
+def test_granule_platform():
+    assert granule_platform("MOD13Q1.A2015209.h10v04.061.x") == "terra"
+    assert granule_platform("MYD13Q1.A2015209.h10v04.061.x") == "aqua"
+
+
+def test_granule_platform_missing():
+    with pytest.raises(ValueError):
+        granule_platform("MCD43A4.A2015209.h10v04.061.x")
 
 
 def test_tile_id():
