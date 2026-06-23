@@ -64,6 +64,13 @@ def main() -> None:
     )
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--fac-rem", required=True)
+    p.add_argument(
+        "--pred-label",
+        default="FAC",
+        help="label for the --fac-rem predictor under test (e.g. WTE for the "
+        "regional water-table surface); names its pred_/resid_ columns and the "
+        "<label>_well_residuals.fgb output",
+    )
     p.add_argument("--streams", required=True, help="FAC streams_regional.fgb")
     p.add_argument("--ma", required=True, help="Ma WTD raster (benchmark)")
     p.add_argument(
@@ -107,7 +114,7 @@ def main() -> None:
 
     lon = wells["longitude"].to_numpy()
     lat = wells["latitude"].to_numpy()
-    preds = {"FAC": args.fac_rem, "Ma": args.ma}
+    preds = {args.pred_label: args.fac_rem, "Ma": args.ma}
     for spec in args.janssen:
         label, path = spec.split("=", 1)
         preds[label] = path
@@ -183,7 +190,8 @@ def main() -> None:
         *[f"resid_{label}" for label in preds],
         "geometry",
     ]
-    cw[keep_cols].to_file(out_dir / "fac_well_residuals.fgb", driver="FlatGeobuf")
+    resid_name = f"{args.pred_label.lower()}_well_residuals.fgb"
+    cw[keep_cols].to_file(out_dir / resid_name, driver="FlatGeobuf")
 
     run = {
         "fac_rem": args.fac_rem,
@@ -203,7 +211,10 @@ def main() -> None:
 
     # Console summary.
     src_note = f"incl {sorted(include)}" if include else f"excl {sorted(exclude)}"
-    print(f"\n=== FAC vs benchmarks on {len(cw)} GWX unconfined wells ({src_note}) ===")
+    print(
+        f"\n=== {args.pred_label} vs benchmarks on {len(cw)} GWX unconfined wells "
+        f"({src_note}) ==="
+    )
     for gt in ("all", "setting", "well_class", "obs_depth", "fac_dist_stream"):
         sl = summary[summary["group_type"] == gt]
         for g in sl["group"].unique():
@@ -214,7 +225,7 @@ def main() -> None:
                     line += f"  {label} MAD={r['mad_m'].iloc[0]:5.2f} bias={r['bias_m'].iloc[0]:+5.2f}"
             print(line)
         print()
-    log.info("Wrote %s and fac_well_residuals.fgb", summary_path)
+    log.info("Wrote %s and %s", summary_path, resid_name)
 
 
 if __name__ == "__main__":
