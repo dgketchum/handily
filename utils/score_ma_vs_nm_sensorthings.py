@@ -113,6 +113,10 @@ def main():
     g = gpd.GeoDataFrame(
         w, geometry=gpd.points_from_xy(w["lon"], w["lat"]), crs="EPSG:4326"
     )
+    # Product-agnostic per-site reduction (all in-NM sites, BEFORE any Ma
+    # footprint filter) so downstream inventories (build_nm_validation_layer.py)
+    # are not conditioned on Ma coverage. The Ma-scored CSV below stays Ma-paired.
+    g.drop(columns="geometry").to_csv(OUT / "nm_sensorthings_sites.csv", index=False)
     g["ma_dtw_m"] = sample_ma(g)
     g = g[g["ma_dtw_m"].notna()].copy()
     g.drop(columns="geometry").to_csv(OUT / "ma_vs_nm_sensorthings.csv", index=False)

@@ -1,22 +1,42 @@
-"""Consolidate every NWIS-independent NM water-table observation we have into one
+"""Consolidate every non-NWIS NM water-table observation we have into one
 validation layer, score Ma against it, and write it ready for FAC-prior scoring.
 
-Sources unioned (all NWIS-independent, DTW positive-down in meters):
+POPULATION (name it; do NOT conflate with score_ma_vs_nm_gwx.py): confinement
+here is HAND-ASSIGNED per source/basin (not the GWX v2 classifier). The
+water-table headline is the confinement=='unconfined' subset (ABQ-basin study +
+SensorThings); OSE driller logs are held out as confinement='unknown'
+screening-grade. score_ma_vs_nm_gwx.py instead uses the GWX national classifier
+and counts nm_ose AS unconfined (a ~34k-well non-NWIS panel) -- a different
+scientific claim. Never compare the two n's / MADs without naming which
+population produced them.
+
+Sources unioned (all non-NWIS, DTW positive-down in meters):
   - ose_driller     : NM OSE POD driller logs, depth_wate (genuine drill-time DTW;
                       static_lev is a redundant dup, dropped). 100k+ wells, no
-                      confinement typing -> confinement='unknown'.
+                      confinement typing -> confinement='unknown' (screening).
   - nm_sensorthings : NM Water Data telemetry (BernCo/CABQ/OSE-Roswell/PVACD/EBID/
-                      SanAcacia), per-site median DTW reduced from 1.36M obs.
+                      SanAcacia), per-site median DTW. Read from the PRODUCT-
+                      AGNOSTIC reduction (nm_sensorthings_sites.csv) so the
+                      inventory is not conditioned on Ma coverage.
                       ABQ-basin = unconfined; Roswell basin = artesian (confined).
   - eastern_abq_*   : USGS ScienceBase deep ABQ-basin water table (KAFB/SNL/CABQ/
                       AECOM source rows only), unconfined.
   - sfgas_2016      : Santa Fe Group deep production-zone wells, unconfined.
 
-Two national WTD baselines are sampled at every well and stored as columns:
+DE-DUPLICATION: rows are collapsed to unique 6-decimal lon/lat sites (median
+DTW) before sampling, so cross-source re-reports (e.g. a well in both the 2008
+and 2016 ABQ tables, or STA + study) do not over-count support.
+
+INDEPENDENCE (softened): these wells are non-NWIS, but source != nwis does not
+prove independence from Ma -- the Ma 2026 product also trained on Fan et al.
+wells, Jasechko CA/TX data, and ~20k stream-dummy cells. Independence is
+defensible-but-unproven for Ma; stronger for Janssen (US real-obs = USGS
+gwlevels). Treat as "non-NWIS", not "independent".
+
+Two national WTD baselines are sampled at every site and stored as columns:
   ma_dtw_m / resid_m              : Ma et al. WTD (resid = ma - observed)
   janssen_v1_dtw_m / janssen_v1_resid_m : Janssen et al. (UBC) V1 (real-obs-only
       XGBoost; the deep-basin-best of V1/V2/V3, see score_janssen_vs_ma.py).
-Both trained on USGS NWIS, so these non-NWIS wells are independent of both.
 Residual = predicted - observed (positive => product too deep). Output:
   nm_independent_validation_wells.{geoparquet,csv} + _summary.json
 """
@@ -37,7 +57,7 @@ JANSSEN_V1 = "/nas/gwx/janssen/V1_140.tif"
 BASELINES = ("ma_dtw_m", "janssen_v1_dtw_m")
 STUD = Path("/nas/gwx/studies/nm_independent_wells")
 STA_CSV = Path(
-    "/data/ssd2/handily/nm/regional/ma_nwis_statewide/ma_vs_nm_sensorthings.csv"
+    "/data/ssd2/handily/nm/regional/ma_nwis_statewide/nm_sensorthings_sites.csv"
 )
 OUT = Path("/data/ssd2/handily/nm/regional/ma_nwis_statewide")
 NM = dict(lon=(-109.1, -102.9), lat=(31.2, 37.1))
@@ -189,12 +209,49 @@ def study():
     return out[out["dtw_m"].between(0, 600)]
 
 
+def dedupe_sites(df):
+    """Collapse to unique 6-decimal lon/lat sites (median DTW) so cross-source
+    re-reports (2008 vs 2016 ABQ tables, STA vs study) don't over-count support.
+    Confinement is resolved by priority -- a typed label (artesian_confined,
+    then unconfined) wins over 'unknown'; cross-confinement coincidences are
+    logged (verified: 1 such site in the current NM layer)."""
+    df = df.copy()
+    df["n_obs"] = pd.to_numeric(df.get("n_obs"), errors="coerce").fillna(1)
+    df["_k"] = list(zip(df["lon"].round(6), df["lat"].round(6)))
+    rank = {"artesian_confined": 0, "unconfined": 1, "unknown": 2}
+    df["_r"] = df["confinement"].map(rank).fillna(3)
+    n_conflict = int((df.groupby("_k")["confinement"].nunique() > 1).sum())
+    df = df.sort_values("_r")  # highest-priority confinement first within a site
+    agg = (
+        df.groupby("_k", sort=False)
+        .agg(
+            lon=("lon", "first"),
+            lat=("lat", "first"),
+            dtw_m=("dtw_m", "median"),
+            n_obs=("n_obs", "sum"),
+            date=("date", "max"),
+            source=("source", "first"),
+            agency=("agency", "first"),
+            confinement=("confinement", "first"),
+            n_sites_merged=("dtw_m", "size"),
+        )
+        .reset_index(drop=True)
+    )
+    return agg, n_conflict
+
+
 def main():
     df = pd.concat([ose_driller(), sensorthings(), study()], ignore_index=True)
     df = df[df["lon"].between(*NM["lon"]) & df["lat"].between(*NM["lat"])].copy()
     df["date"] = df["date"].astype(
         "string"
     )  # OSE int + STA ISO str + study <NA> -> uniform
+    n_rows_pre_dedup = len(df)
+    df, n_conflict = dedupe_sites(df)
+    print(
+        f"sites: {n_rows_pre_dedup} rows -> {len(df)} unique 6-dp lon/lat sites "
+        f"({n_conflict} cross-confinement coincidence(s) resolved by priority)"
+    )
     g = gpd.GeoDataFrame(
         df, geometry=gpd.points_from_xy(df["lon"], df["lat"]), crs="EPSG:4326"
     )
@@ -216,9 +273,26 @@ def main():
         return {b: metrics(subset, b) for b in BASELINES}
 
     summary = {
+        "population": (
+            "consolidated NM non-NWIS layer; confinement HAND-ASSIGNED by "
+            "source/basin (NOT the GWX v2 classifier); water-table headline = "
+            "confinement=='unconfined'; OSE driller logs held out as 'unknown' "
+            "screening. Distinct from score_ma_vs_nm_gwx.py (GWX classifier, "
+            "nm_ose counted unconfined)."
+        ),
+        "independence_note": (
+            "non-NWIS, not proven-independent of Ma (Ma 2026 also trained on Fan "
+            "et al. + Jasechko CA/TX + stream-dummy cells); stronger for Janssen."
+        ),
+        "dedup": {
+            "rows_pre_dedup": n_rows_pre_dedup,
+            "unique_sites_post_dedup": int(len(df)),
+            "cross_confinement_resolved": n_conflict,
+            "sites_in_ma_footprint": int(len(g)),
+        },
         "n_total": len(g),
         "baselines": list(BASELINES),
-        "all_independent": by(g),
+        "all_non_nwis": by(g),
         "water_table_only": by(g[g["confinement"] == "unconfined"]),
         "by_source": {s: by(sub) for s, sub in g.groupby("source")},
         "by_confinement": {c: by(sub) for c, sub in g.groupby("confinement")},
