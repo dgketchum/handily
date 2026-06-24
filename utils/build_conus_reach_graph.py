@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -33,8 +34,14 @@ import pynhd
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from build_stacker_features import sample_coarse  # noqa: E402
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("build_conus_reach_graph")
+
+DEM = "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif"
+REACH_GEOM = "/data/ssd2/handily/conus/wte_gnn/nhd_flowline_geom.parquet"
 
 # VAA passthrough + derived node features (model inputs).
 REACH_FEATURE_COLS = [
@@ -58,12 +65,18 @@ REACH_FEATURE_COLS = [
 # Structurally-NaN: a reach with no upstream mainstem path is genuinely
 # disconnected, not missing data. The trainer imputes + flags these.
 REACH_STRUCTURAL_NAN_COLS = ["net_dist_mainstem_m", "log1p_net_dist_mainstem_m"]
+# Darcy edge attrs (v2): rel_elev_grad is the RGA-safe translation-invariant ∇h
+# surrogate (land-surface elevation difference between connected reach rep-points;
+# absolute elevation overfit in RGA, the *difference* does not); conductance is the
+# K surrogate from drainage area vs reach length.
 CHANNEL_EDGE_FEATURE_COLS = [
     "direction",
     "log_drainage_ratio",
     "strahler_change",
     "log1p_length_km",
     "slope",
+    "rel_elev_grad",
+    "conductance",
 ]
 # NHDPlus V2 FCode -> reach-state class.
 NHD_FCODE_CLASS = {
@@ -123,7 +136,9 @@ def build_reach_nodes(vaa: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_channel_edges(reach_nodes: pd.DataFrame) -> pd.DataFrame:
+def build_channel_edges(
+    reach_nodes: pd.DataFrame, conductance_p: float
+) -> pd.DataFrame:
     """Directed reach->reach edges from hydroseq -> dnhydroseq (+ reverse).
 
     NHDPlus hydroseq is unique per network reach; a reach flows to the reach whose
@@ -146,11 +161,15 @@ def build_channel_edges(reach_nodes: pd.DataFrame) -> pd.DataFrame:
     strah = reach_nodes["streamorde"].to_numpy("float64")
     length = reach_nodes["lengthkm"].to_numpy("float64")
     slope = reach_nodes["slope"].to_numpy("float64")
+    elev = reach_nodes["reach_elev_m"].to_numpy("float64")
 
     def frame(a: np.ndarray, b: np.ndarray, direction: int) -> pd.DataFrame:
         ratio = np.where(
             drain[a] > 0, drain[b] / np.where(drain[a] > 0, drain[a], 1), np.nan
         )
+        # carrying reach (the one physically conveying flow on this edge).
+        carry_len = np.where(direction == 1, length[a], length[b])
+        carry_drain = np.where(direction == 1, drain[a], drain[b])
         return pd.DataFrame(
             {
                 "src_reach_idx": a,
@@ -163,16 +182,48 @@ def build_channel_edges(reach_nodes: pd.DataFrame) -> pd.DataFrame:
                 ),
                 "strahler_change": strah[b] - strah[a],
                 # feature describes the reach physically carrying flow on this edge
-                "log1p_length_km": np.log1p(
-                    np.where(direction == 1, length[a], length[b])
-                ),
+                "log1p_length_km": np.log1p(carry_len),
                 "slope": np.where(direction == 1, slope[a], slope[b]),
+                # relative head gradient (dst - src) -- translation-invariant ∇h.
+                "rel_elev_grad": elev[b] - elev[a],
+                # Darcy conductance surrogate: more drainage / shorter reach = higher K.
+                "conductance": np.log1p(np.clip(carry_drain, 0, None))
+                - conductance_p * np.log1p(np.clip(carry_len, 0, None)),
             }
         )
 
     down = frame(src, dst, +1)
     up = frame(dst, src, -1)
     return pd.concat([down, up], ignore_index=True)
+
+
+def sample_reach_elev(
+    reach_nodes: pd.DataFrame, reach_geom_path: str, dem_path: str
+) -> np.ndarray:
+    """Land-surface elevation at each reach's flowline rep-point (DEM sample).
+
+    Carried as a NON-feature column: it is used only to form the relative-elevation
+    channel-edge attr (and the lateral/anchor rel-elev attrs downstream). Reaches
+    with no flowline geometry match -> NaN (structural, never fabricated).
+    """
+    # rep-point coords are plain columns -- read with pandas (geopandas rejects a
+    # column subset that omits the geometry column, which we don't need here).
+    geom = pd.read_parquet(reach_geom_path, columns=["comid", "cx", "cy"])
+    elev = sample_coarse(
+        dem_path, geom["cx"].to_numpy("float64"), geom["cy"].to_numpy("float64")
+    )
+    comid_to_elev = dict(zip(geom["comid"].to_numpy("int64"), elev))
+    out = np.array(
+        [comid_to_elev.get(c, np.nan) for c in reach_nodes["comid"].to_numpy("int64")],
+        dtype="float64",
+    )
+    log.info(
+        "reach rep-point elevation: %d/%d reaches sampled (%.1f%%)",
+        int(np.isfinite(out).sum()),
+        len(out),
+        100 * np.isfinite(out).mean(),
+    )
+    return out
 
 
 def network_distance_to_mainstem(
@@ -209,6 +260,17 @@ def main() -> None:
     ap.add_argument("--out-dir", default="/data/ssd2/handily/conus/wte_gnn/graph")
     ap.add_argument("--vaa-parquet", default=None, help="override cached VAA path")
     ap.add_argument("--mainstem-strahler", type=int, default=5)
+    ap.add_argument(
+        "--reach-geom",
+        default=REACH_GEOM,
+        help="flowline rep-points for reach elevation",
+    )
+    ap.add_argument(
+        "--dem", default=DEM, help="land-surface DEM for rel-elev edge attrs"
+    )
+    ap.add_argument(
+        "--conductance-p", type=float, default=0.5, help="length penalty in conductance"
+    )
     args = ap.parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -217,7 +279,10 @@ def main() -> None:
     log.info("loaded VAA: %d reaches", len(vaa))
 
     reach_nodes = build_reach_nodes(vaa)
-    channel_edges = build_channel_edges(reach_nodes)
+    reach_nodes["reach_elev_m"] = sample_reach_elev(
+        reach_nodes, args.reach_geom, args.dem
+    )
+    channel_edges = build_channel_edges(reach_nodes, args.conductance_p)
     net = network_distance_to_mainstem(
         reach_nodes, channel_edges, args.mainstem_strahler
     )
@@ -244,6 +309,7 @@ def main() -> None:
         "huc2",
         "totdasqkm",
         "nhd_class",
+        "reach_elev_m",
     ]
     reach_nodes[carry + REACH_FEATURE_COLS].to_parquet(out_dir / "reach_nodes.parquet")
     channel_edges[
@@ -263,11 +329,17 @@ def main() -> None:
         "channel_edge_feature_cols": CHANNEL_EDGE_FEATURE_COLS,
         "reach_carry_cols": carry,
         "mainstem_strahler": args.mainstem_strahler,
+        "conductance_p": args.conductance_p,
         "edge_schema": "directed reach->reach from hydroseq->dnhydroseq; +1 downstream, -1 reverse",
         "fcode_classes": NHD_FCODE_CLASS,
         "source": "pynhd.nhdplus_vaa() national NHDPlus V2 (cached)",
         "notes": [
             "Reaches carry NO labels (leak-free).",
+            "reach_elev_m is a carried NON-feature: used only to form the relative-"
+            "elevation edge attrs (rel_elev_grad here; lateral/anchor rel-elev "
+            "downstream). Absolute elevation is never a node feature (RGA overfit).",
+            "rel_elev_grad = land_surf[dst]-land_surf[src] (translation-invariant ∇h); "
+            "conductance = log1p(drainage) - p*log1p(length) of the carrying reach.",
             "StreamCat covariates + well/query side + lateral edges added by "
             "build_conus_graph_inputs.py on the well-relevant reach subset.",
         ],
