@@ -59,15 +59,27 @@ def fit_stats(df: pd.DataFrame, cols: list[str], mask: np.ndarray | None) -> dic
     mean = filled.mean()
     std = filled.std(ddof=0).replace(0.0, 1.0)
     # A feature that is all-NaN on the fit rows (e.g. a sparse WTE/FAC-rem column
-    # absent from one fold's TRAIN split) leaves med/mean/std NaN, which would
-    # propagate NaN through apply_stats and poison the tensor. Neutralize to
-    # med=0/mean=0/std=1 so its z-scored column is a constant 0 -- the missingness
-    # indicator (nan_cols, computed whole-df below) still carries the absence.
+    # absent from one fold's TRAIN split) leaves med/mean/std NaN. Two failure
+    # modes follow if left alone: (1) NaN propagates through apply_stats and
+    # poisons the tensor; (2) held-out rows that DO have a finite value sail
+    # through as raw, unscaled magnitudes (since med=0/mean=0/std=1 is identity)
+    # while the model's first-layer weights for that column saw only zeros during
+    # training -- so the OOF prediction rides on random init. Record these columns
+    # and force their whole z-block to 0 in apply_stats; only the missingness flag
+    # (nan_cols, whole-df below -- always includes these) carries the absence.
+    all_nan_fit_cols = [c for c in cols if sub[c].isna().all()]
     med = med.fillna(0.0)
     mean = mean.fillna(0.0)
     std = std.fillna(1.0)
     nan_cols = [c for c in cols if df[c].isna().any()]
-    return {"cols": cols, "med": med, "mean": mean, "std": std, "nan_cols": nan_cols}
+    return {
+        "cols": cols,
+        "med": med,
+        "mean": mean,
+        "std": std,
+        "nan_cols": nan_cols,
+        "all_nan_fit_cols": all_nan_fit_cols,
+    }
 
 
 def apply_stats(df: pd.DataFrame, stats: dict) -> np.ndarray:
@@ -76,6 +88,11 @@ def apply_stats(df: pd.DataFrame, stats: dict) -> np.ndarray:
     sub = df[cols].astype("float64")
     miss = sub.isna()
     z = (sub.fillna(stats["med"]) - stats["mean"]) / stats["std"]
+    # Columns with no finite value on the fit rows got no training signal; zero
+    # them for ALL rows so held-out finite magnitudes can't ride random-init
+    # weights. The missingness flag still distinguishes present vs absent.
+    if stats.get("all_nan_fit_cols"):
+        z[stats["all_nan_fit_cols"]] = 0.0
     parts = [z.to_numpy("float64")]
     if stats["nan_cols"]:
         parts.append(miss[stats["nan_cols"]].astype("float64").to_numpy())
