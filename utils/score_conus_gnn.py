@@ -6,8 +6,14 @@ residual side by side, RMSE, depth-banded and region-banded breakdowns, and
 shallow-class precision/recall -- all on a common footprint with per-predictor
 coverage.
 
+Headline metrics are always DTW (``gnn_dtw_m``/``tab_dtw_m``), so both target modes
+score on the identical panel. In dtw_residual mode the GNN DTW is the regional IDW
+prior + GNN residual; in WTE (head-target) mode it is reconstructed as
+``z_surf_well_m - gnn_wte_hat_m``. WTE runs additionally get an identity QA check
+(``abs(wte_err) == abs(dtw_err)``) and a non-headline head-space core-metrics block.
+
 Predictors compared:
-  * gnn       -- regional IDW prior + GNN residual (the model under test)
+  * gnn       -- GNN DTW under test (regional prior + residual, or z_surf - wte_hat)
   * regional  -- leave-one-HUC4-out IDW(kNN) of neighbor well DTW (the floor the
                  GNN must beat to justify the graph)
   * janssen   -- CONUS-wide modeled WTD benchmark (the bar to beat; NWIS-trained,
@@ -282,6 +288,37 @@ def main() -> None:
         int(df["is_nwis"].sum()),
     )
 
+    # Target mode (from the trainer run.json) decides only WTE-specific QA; the
+    # headline panel stays DTW-based in both modes via gnn_dtw_m/tab_dtw_m.
+    target_mode = None
+    run_json = gdir / "gnn_run.json"
+    if run_json.exists():
+        target_mode = json.loads(run_json.read_text()).get("target_mode")
+    wte_identity = None
+    if target_mode == "wte":
+        missing = [
+            c
+            for c in ("z_surf_well_m", "obs_wte_m", "gnn_wte_hat_m", "gnn_dtw_m")
+            if c not in df.columns
+        ]
+        if missing:
+            raise SystemExit(f"WTE-mode predictions missing columns: {missing}")
+        # The loss identity: z_surf is exact and shared, so |wte_hat - wte_obs|
+        # must equal |dtw_hat - dtw_obs| at every well. A non-trivial max delta
+        # means the DTW reconstruction (z_surf - wte_hat) is broken.
+        wte_err = np.abs(
+            df["gnn_wte_hat_m"].to_numpy("float64")
+            - df["obs_wte_m"].to_numpy("float64")
+        )
+        dtw_err = np.abs(
+            df["gnn_dtw_m"].to_numpy("float64") - df["obs_dtw_m"].to_numpy("float64")
+        )
+        max_delta = float(np.nanmax(np.abs(wte_err - dtw_err)))
+        log.info(
+            "WTE identity check: max |abs(wte_err) - abs(dtw_err)| = %.3e m", max_delta
+        )
+        wte_identity = {"max_abs_error_delta_m": max_delta}
+
     # standardize predictor columns
     df["gnn"] = df["gnn_dtw_m"]
     df["regional"] = df["regional_idw_dtw_oof_m"]
@@ -344,13 +381,34 @@ def main() -> None:
         else:
             log.info("Ma coverage < 50 non-NWIS wells; skipping Ma sub-panel")
 
+    # Non-headline head-space diagnostics (WTE mode only): same metrics, but in
+    # WTE units against obs_wte_m. By the identity above the GNN MAD equals its DTW
+    # MAD; the value is comparing the head priors to each other in their own space.
+    wte_core = None
+    if target_mode == "wte":
+        obs_wte = non_nwis["obs_wte_m"].to_numpy("float64")
+        wte_core = {
+            c: core_metrics(non_nwis[c].to_numpy("float64"), obs_wte)
+            for c in (
+                "gnn_wte_hat_m",
+                "regional_wte_idw_oof_m",
+                "deep_regional_wte_idw_oof_m",
+                "hand_wte_m",
+                "fac_rem_wte_m",
+            )
+            if c in non_nwis.columns
+        }
+
     summary = {
         "gnn_dir": str(gdir),
+        "target_mode": target_mode,
         "predictors": predcols,
         "common_footprint_predictors": common,
         "headline_non_nwis": headline,
         "nwis_panel": nwis_panel,
         "ma_covered_panel": ma_panel,
+        "wte_identity_check": wte_identity,
+        "wte_core_metrics": wte_core,
         "ma_specs": ma_specs,
         "metric_definitions": {
             "residual": "pred_dtw - obs_dtw (positive = predicted too deep)",

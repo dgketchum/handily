@@ -133,6 +133,17 @@ class EdgeGatedConv(MessagePassing):
 
 
 class WTEGraphNet(nn.Module):
+    """Edge-gated relaxation over the flow network.
+
+    v1 (no anchors): channel diffusion among reaches, then a lateral read to each
+    query. v2 (anchors, CONUS_GNN_V2_PLAN.md): springs/water/wetlands are Dirichlet/
+    soft boundary conditions injected to reaches BEFORE the channel layers and
+    RE-ASSERTED each layer (a weight-shared ``anchor_to_reach`` conv = holding the BC
+    value while the interior relaxes), plus a direct ``anchor_to_query`` BC to off-
+    network wells. Anchor support and the pinball auxiliary head are optional so the
+    FAC-graph trainer (``train_wte_gnn.main``) keeps its v1 construction unchanged.
+    """
+
     def __init__(
         self,
         f_reach: int,
@@ -142,8 +153,15 @@ class WTEGraphNet(nn.Module):
         hidden: int,
         n_channel_layers: int,
         dropout: float,
+        *,
+        f_anchor: int | None = None,
+        f_anchor_reach: int | None = None,
+        f_anchor_query: int | None = None,
+        pinball: bool = False,
     ) -> None:
         super().__init__()
+        self.has_anchor = f_anchor is not None
+        self.pinball = pinball
         self.reach_enc = nn.Sequential(
             nn.Linear(f_reach, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
         )
@@ -157,20 +175,66 @@ class WTEGraphNet(nn.Module):
             ]
         )
         self.lateral = EdgeGatedConv(hidden, hidden, f_lat, hidden, dropout=dropout)
+        head_in = hidden * 2
+        if self.has_anchor:
+            self.anchor_enc = nn.Sequential(
+                nn.Linear(f_anchor, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
+            )
+            # WTE mode: the anchor's head is the Dirichlet BC VALUE, injected on a
+            # dedicated value channel (fold-standardized in target space by the
+            # caller) -- NOT a generic anchor_x covariate. Additive so the metadata
+            # encoder still learns class/source/uncertainty; absent (residual mode)
+            # leaves v2 anchor behavior unchanged.
+            self.anchor_value_enc = nn.Linear(1, hidden, bias=False)
+            # weight-shared across channel layers: one param set re-applied each step.
+            self.anchor_to_reach = EdgeGatedConv(
+                hidden, hidden, f_anchor_reach, hidden, dropout=dropout
+            )
+            self.anchor_to_query = EdgeGatedConv(
+                hidden, hidden, f_anchor_query, hidden, dropout=dropout
+            )
+            head_in = hidden * 3  # [q, ctx_reach, ctx_anchor]
         self.head = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
+            nn.Linear(head_in, hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
+        if self.pinball:
+            # asymmetric (deep) auxiliary head; primary Huber head leaves the bulk.
+            self.pin_head = nn.Sequential(
+                nn.Linear(head_in, hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, 1),
+            )
 
-    def forward(self, g: dict) -> torch.Tensor:
+    def forward(self, g: dict):
         r = self.reach_enc(g["reach_x"])
-        for layer in self.channel:
-            r = r + layer(r, r, g["ch_ei"], g["ch_ea"])  # residual channel update
-        q = self.query_enc(g["query_x"])
-        ctx = self.lateral(r, q, g["lat_ei"], g["lat_ea"])
-        return self.head(torch.cat([q, ctx], dim=-1)).squeeze(-1)
+        if self.has_anchor and "anchor_x" in g:
+            a = self.anchor_enc(g["anchor_x"])
+            if "anchor_value" in g:
+                a = a + self.anchor_value_enc(g["anchor_value"].view(-1, 1))
+            # set the Dirichlet/soft BC first, then relax it along the network,
+            # re-asserting it after each channel diffusion step.
+            r = r + self.anchor_to_reach(a, r, g["ar_ei"], g["ar_ea"])
+            for layer in self.channel:
+                r = r + layer(r, r, g["ch_ei"], g["ch_ea"])
+                r = r + self.anchor_to_reach(a, r, g["ar_ei"], g["ar_ea"])
+            q = self.query_enc(g["query_x"])
+            ctx_reach = self.lateral(r, q, g["lat_ei"], g["lat_ea"])
+            ctx_anchor = self.anchor_to_query(a, q, g["aq_ei"], g["aq_ea"])
+            h = torch.cat([q, ctx_reach, ctx_anchor], dim=-1)
+        else:
+            for layer in self.channel:
+                r = r + layer(r, r, g["ch_ei"], g["ch_ea"])  # residual channel update
+            q = self.query_enc(g["query_x"])
+            ctx = self.lateral(r, q, g["lat_ei"], g["lat_ea"])
+            h = torch.cat([q, ctx], dim=-1)
+        primary = self.head(h).squeeze(-1)
+        if self.pinball:
+            return primary, self.pin_head(h).squeeze(-1)
+        return primary
 
 
 # ---------------------------------------------------------------------------
