@@ -90,12 +90,22 @@ def apply_stats(df: pd.DataFrame, stats: dict) -> np.ndarray:
     z = (sub.fillna(stats["med"]) - stats["mean"]) / stats["std"]
     # Columns with no finite value on the fit rows got no training signal; zero
     # them for ALL rows so held-out finite magnitudes can't ride random-init
-    # weights. The missingness flag still distinguishes present vs absent.
+    # weights.
     if stats.get("all_nan_fit_cols"):
         z[stats["all_nan_fit_cols"]] = 0.0
     parts = [z.to_numpy("float64")]
     if stats["nan_cols"]:
-        parts.append(miss[stats["nan_cols"]].astype("float64").to_numpy())
+        ind = miss[stats["nan_cols"]].astype("float64")
+        # An all-NaN-on-fit column was missing on every train row, so its
+        # indicator is a constant 1 during training -- the weight is degenerate
+        # with the bias. Held-out rows can be finite (indicator 0), which would
+        # have the model extrapolate that unidentifiable weight to an unseen
+        # value. Pin the indicator to its train-observed constant (1) for ALL
+        # rows so the column is a harmless constant, never a held-out surprise.
+        pin = [c for c in stats.get("all_nan_fit_cols", []) if c in ind.columns]
+        if pin:
+            ind[pin] = 1.0
+        parts.append(ind.to_numpy())
     return np.concatenate(parts, axis=1)
 
 
