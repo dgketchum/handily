@@ -233,9 +233,12 @@ def main() -> None:
     # Anchor-geometry ablation (the kill test): hand the GBM the same anchor signal
     # the GNN message-passes, as plain per-class columns. Auto-enabled when the
     # bundle carries anchors; --no-anchor-ablation runs the widened control alone.
+    # Gate on the manifest's "anchors" block (the authoritative record of whether
+    # this bundle was built with anchors), NOT on anchor_nodes.parquet existing --
+    # a stale file from a prior anchored build must never leak into a no-anchor run.
     query_cols = list(query_cols)
     anchor_cols: list[str] = []
-    if not args.no_anchor_ablation:
+    if not args.no_anchor_ablation and man.get("anchors"):
         anchor_feats, anchor_cols = build_anchor_tabular_features(
             qn, gdir, args.dem, with_head=(target_mode == TARGET_WTE)
         )
@@ -246,7 +249,9 @@ def main() -> None:
                 "anchor ablation: +%d feature cols -> %s", len(anchor_cols), anchor_cols
             )
         else:
-            log.info("no anchors in bundle: running widened control only")
+            log.info("manifest declares anchors but none loaded: widened control only")
+    elif not args.no_anchor_ablation:
+        log.info("no anchors in bundle (per manifest): running widened control only")
 
     base = qn[base_col].to_numpy("float64")
     obs = qn[obs_dtw_col].to_numpy("float64")

@@ -743,6 +743,19 @@ def main() -> None:
             len(aq),
             args.knn_anchor_query,
         )
+    else:
+        # No anchors this build: remove any stale anchor files from a prior anchored
+        # build in this dir, so the manifest ("anchors": null) and the on-disk files
+        # can never disagree (which would let the tabular control read dead anchors).
+        for stale in (
+            "anchor_nodes.parquet",
+            "anchor_to_reach_edges.parquet",
+            "anchor_to_query_edges.parquet",
+        ):
+            p = gdir / stale
+            if p.exists():
+                p.unlink()
+                log.info("removed stale anchor file: %s", p.name)
 
     # Mode-aware target metadata: the trainer/scorer read target_mode to decide how
     # to de-standardize the model's scalar output and reconstruct DTW.
