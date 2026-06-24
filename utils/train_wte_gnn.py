@@ -58,6 +58,14 @@ def fit_stats(df: pd.DataFrame, cols: list[str], mask: np.ndarray | None) -> dic
     filled = sub.fillna(med)
     mean = filled.mean()
     std = filled.std(ddof=0).replace(0.0, 1.0)
+    # A feature that is all-NaN on the fit rows (e.g. a sparse WTE/FAC-rem column
+    # absent from one fold's TRAIN split) leaves med/mean/std NaN, which would
+    # propagate NaN through apply_stats and poison the tensor. Neutralize to
+    # med=0/mean=0/std=1 so its z-scored column is a constant 0 -- the missingness
+    # indicator (nan_cols, computed whole-df below) still carries the absence.
+    med = med.fillna(0.0)
+    mean = mean.fillna(0.0)
+    std = std.fillna(1.0)
     nan_cols = [c for c in cols if df[c].isna().any()]
     return {"cols": cols, "med": med, "mean": mean, "std": std, "nan_cols": nan_cols}
 
