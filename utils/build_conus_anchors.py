@@ -557,6 +557,7 @@ def main() -> None:
             len(missing_states),
             ",".join(missing_states),
         )
+    resolved_gaps: set[tuple[str, str]] = set()
     for cls in classes:
         if cls == "wetland":
             continue  # 3DHP has no wetlands
@@ -565,14 +566,22 @@ def main() -> None:
         if not fb.empty:
             cand_parts.append(fb)
             for st in missing:
+                n_st = int((fb["state"] == st).sum())
                 coverage_rows.append(
                     {
                         "state": st,
                         "class": cls,
-                        "n_candidates": int((fb["state"] == st).sum()),
+                        "n_candidates": n_st,
                         "primary_source": "3dhp",
                     }
                 )
+                if n_st > 0:
+                    resolved_gaps.add((st, cls))
+
+    # Drop gaps the 3DHP fallback actually filled so the manifest's coverage_gaps
+    # reflects only states/classes still without any anchor source.
+    if resolved_gaps:
+        gaps = [g for g in gaps if (g["state"], g["class"]) not in resolved_gaps]
 
     if not cand_parts:
         raise SystemExit("no anchor candidates extracted for the requested classes")
