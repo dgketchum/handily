@@ -43,6 +43,7 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import pyogrio
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -90,9 +91,11 @@ TDHP_WATER_LAYER = "hydro_3dhp_all_waterbody"
 NWI_KEEP_PREFIXES = ("PEM", "PFO", "PSS", "PAB", "PUB", "L1", "L2", "R2", "R3")
 NWI_EXCLUDE_PREFIXES = ("R4", "R5")
 # Special / water-regime modifier letters that mark a non-persistent or managed
-# wetland (NWI Cowardin modifiers): b=beaver, d=partly drained, f=farmed,
-# h=diked/impounded, x=excavated, A/J=temporary, K=artificially flooded.
-NWI_EXCLUDE_MODIFIERS = ("d", "f", "x", "K")
+# wetland (NWI Cowardin modifiers): d=partly drained, f=farmed, x=excavated
+# (lowercase special modifiers); A=temporarily flooded, J=intermittently flooded,
+# K=artificially flooded (uppercase water-regime). All mark a water table that is
+# NOT a persistent surface expression, so they are excluded as BC anchors.
+NWI_EXCLUDE_MODIFIERS = ("d", "f", "x", "A", "J", "K")
 
 # Head uncertainty (m) by class -- the soft-vs-hard BC encoding. Springs pin the
 # table to the land surface (clean Dirichlet); lakes/wetlands are priors the gate
@@ -105,6 +108,10 @@ HEAD_UNCERTAINTY_MANAGED_BUMP = 1.5
 SOURCE_RANK = {"nhd_hr": 0, "nwi": 1, "3dhp": 2}  # precedence for dedup primary
 
 DEM = "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif"
+# USPS-keyed CONUS states polygon, used to clip/assign the 3DHP fallback to the
+# states that lack NHD-HR. Defaulted so the fallback materializes without an extra
+# flag; override with --state-polys. Loaded lazily (only if a fallback is needed).
+DEFAULT_STATE_POLYS = "/data/ssd2/gwx/nwis/reference/conus_states.parquet"
 ANCHOR_NODE_COLS = [
     "anchor_node_idx", "x5070", "y5070", "head_m", "head_uncertainty_m",
     "anchor_class", "source", "state", "src_fcode", "src_typelabel",
@@ -147,14 +154,16 @@ def discover_nwi_states(nwi_dir: str) -> dict[str, list[str]]:
 # Per-state, per-class candidate extraction (NHD-HR / NWI primary)
 # ---------------------------------------------------------------------------
 def _xy_5070(gdf: gpd.GeoDataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Representative-point coords in EPSG:5070 (inside polygons; .x/.y for points)."""
-    g = gdf.to_crs(5070)
-    geom = g.geometry
-    is_pt = geom.geom_type.isin(["Point", "MultiPoint"]).to_numpy()
-    rep = geom.representative_point()
-    x = np.where(is_pt, geom.x.to_numpy(), rep.x.to_numpy())
-    y = np.where(is_pt, geom.y.to_numpy(), rep.y.to_numpy())
-    return x.astype("float64"), y.astype("float64")
+    """Representative-point coords in EPSG:5070, valid for points and polygons alike.
+
+    ``representative_point()`` returns a guaranteed-interior point for polygons and
+    the point itself for Point geometries -- so it works on every geometry type. We
+    must NOT touch ``geom.x``/``geom.y`` on a polygon GeoSeries: GeoPandas evaluates
+    that attribute over the whole series before any selection, and it raises on
+    non-Point geometries (NHDWaterbody/NWI polygons).
+    """
+    rep = gdf.to_crs(5070).geometry.representative_point()
+    return rep.x.to_numpy("float64"), rep.y.to_numpy("float64")
 
 
 def _frame(
@@ -280,6 +289,30 @@ def extract_nwi_wetland(
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
+def _load_state_polys(path: str | None) -> gpd.GeoDataFrame:
+    """Load the USPS-keyed states polygon for the 3DHP fallback (normalized to a
+    ``usps`` column). Raises if a fallback is needed but the file is absent -- a
+    silent coverage gap for the non-NHD-HR states is worse than a hard stop."""
+    if not path or not os.path.exists(path):
+        raise SystemExit(
+            f"3DHP fallback needed but state polygons not found at {path!r}; "
+            "pass --state-polys <USPS-keyed states polygon>"
+        )
+    g = gpd.read_parquet(path) if path.endswith(".parquet") else gpd.read_file(path)
+    if "usps" not in g.columns:
+        for c in ("STUSPS", "STUSAB", "STATE_ABBR", "STATE", "usps_code"):
+            if c in g.columns:
+                g = g.rename(columns={c: "usps"})
+                break
+    if "usps" not in g.columns:
+        raise SystemExit(
+            f"state polygons {path!r} lack a USPS column (looked for "
+            "usps/STUSPS/STUSAB/STATE_ABBR/STATE/usps_code)"
+        )
+    g["usps"] = g["usps"].astype("string").str.upper()
+    return g
+
+
 def extract_3dhp(
     anchor_class: str,
     states: list[str],
@@ -298,17 +331,27 @@ def extract_3dhp(
             ",".join(states),
         )
         return pd.DataFrame()
+    sub = state_polys[state_polys["usps"].isin(states)]
+    if sub.empty:
+        log.warning("3DHP: no state polygons match %s; skipping", ",".join(states))
+        return pd.DataFrame()
     if anchor_class == "spring":
         layer, where = TDHP_SPRING_LAYER, "featuretypelabel = 'Spring'"
     elif anchor_class == "open_water":
-        layer, where = TDHP_WATER_LAYER, "featuretypelabel = 'Lake'"
+        # Push the area cut into the SQL WHERE so the 5.7M-feature waterbody layer
+        # is never fully materialized (NULL areasqkm rows fail the >= and drop).
+        layer = TDHP_WATER_LAYER
+        where = f"featuretypelabel = 'Lake' AND areasqkm >= {float(min_lake_sqkm)}"
     else:
         return pd.DataFrame()  # no 3DHP wetlands
-    polys = state_polys[state_polys["usps"].isin(states)].to_crs(5070)
-    g = gpd.read_file(TDHP_GPKG, layer=layer, where=where).to_crs(5070)
+    # Push the spatial cut into the read path too: a bbox in the layer's own CRS so
+    # OGR only scans features near the missing states, not all of CONUS. The sjoin
+    # below is still the precise per-state clip.
+    layer_crs = pyogrio.read_info(TDHP_GPKG, layer=layer)["crs"]
+    bbox = tuple(sub.to_crs(layer_crs).total_bounds)
+    g = gpd.read_file(TDHP_GPKG, layer=layer, where=where, bbox=bbox).to_crs(5070)
+    polys = sub.to_crs(5070)
     g = gpd.sjoin(g, polys[["usps", "geometry"]], predicate="within", how="inner")
-    if anchor_class == "open_water" and "areasqkm" in g.columns:
-        g = g[g["areasqkm"].fillna(0.0) >= min_lake_sqkm].copy()
     if g.empty:
         return pd.DataFrame()
     x, y = _xy_5070(g)
@@ -393,8 +436,9 @@ def main() -> None:
     ap.add_argument("--nwi-dir", default="/nas/irrmapper/wetlands/raw_shp")
     ap.add_argument(
         "--state-polys",
-        default=None,
-        help="optional USPS-keyed states polygon (3DHP fallback)",
+        default=DEFAULT_STATE_POLYS,
+        help="USPS-keyed states polygon for the 3DHP fallback (clips/assigns 3DHP "
+        f"features to states lacking NHD-HR); default {DEFAULT_STATE_POLYS}",
     )
     ap.add_argument(
         "--classes",
@@ -448,7 +492,6 @@ def main() -> None:
     nhd_hr = discover_nhd_hr_states(args.nhd_hr_dir)
     nwi = discover_nwi_states(args.nwi_dir)
     log.info("discovered NHD-HR states=%d, NWI states=%d", len(nhd_hr), len(nwi))
-    state_polys = gpd.read_file(args.state_polys) if args.state_polys else None
 
     # --- per-state, per-class candidate extraction (cached) -------------------
     coverage_rows: list[dict] = []
@@ -503,6 +546,17 @@ def main() -> None:
                 cand_parts.append(df)
 
     # --- 3DHP fallback for states whose primary source was absent -------------
+    # Load the states polygon lazily, only if a non-wetland class actually needs the
+    # fallback (so the all-NHD-HR case never depends on the file being present).
+    missing_states = [st for st in target_states if st not in nhd_hr]
+    needs_fallback = bool(missing_states) and any(c != "wetland" for c in classes)
+    state_polys = _load_state_polys(args.state_polys) if needs_fallback else None
+    if needs_fallback:
+        log.info(
+            "3DHP fallback for %d state(s) lacking NHD-HR: %s",
+            len(missing_states),
+            ",".join(missing_states),
+        )
     for cls in classes:
         if cls == "wetland":
             continue  # 3DHP has no wetlands
