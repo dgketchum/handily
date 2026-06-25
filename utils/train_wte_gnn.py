@@ -113,7 +113,15 @@ def apply_stats(df: pd.DataFrame, stats: dict) -> np.ndarray:
 # Edge-gated message passing
 # ---------------------------------------------------------------------------
 class EdgeGatedConv(MessagePassing):
-    """msg_ij = sigmoid(gate(x_i, x_j, e_ij)) * transform(x_j, e_ij); update(x_i, agg)."""
+    """msg_ij = sigmoid(gate(x_i, x_j, e_ij)) * transform(x_j, e_ij); update(x_i, agg).
+
+    ``directional``: give the two flow senses their OWN message+gate weights instead
+    of a single transform that must disentangle one concatenated ``direction`` feature
+    (the "hope the gate learns it" regime that under-delivered). Each edge carries a
+    ``dir_sign`` (+1 forward / -1 reverse); forward edges use msg_mlp/gate_mlp, reverse
+    edges use msg_mlp_rev/gate_mlp_rev. Non-directional construction is byte-identical
+    to before (no rev weights, dir_sign ignored), so every existing path is untouched.
+    """
 
     def __init__(
         self,
@@ -123,8 +131,10 @@ class EdgeGatedConv(MessagePassing):
         out_dim: int,
         dropout: float = 0.0,
         aggr: str = "mean",
+        directional: bool = False,
     ) -> None:
         super().__init__(aggr=aggr, flow="source_to_target")
+        self.directional = directional
         self.msg_mlp = nn.Sequential(
             nn.Linear(in_src + edge_dim, out_dim),
             nn.ReLU(),
@@ -135,6 +145,20 @@ class EdgeGatedConv(MessagePassing):
             nn.ReLU(),
             nn.Linear(out_dim, 1),
         )
+        if directional:
+            # reverse-sense edges (upstream-of / well-below-reach) get a dedicated
+            # parameter path; the aggregation + update stay shared (direction shapes
+            # only what message each neighbor sends, not how they are combined).
+            self.msg_mlp_rev = nn.Sequential(
+                nn.Linear(in_src + edge_dim, out_dim),
+                nn.ReLU(),
+                nn.Linear(out_dim, out_dim),
+            )
+            self.gate_mlp_rev = nn.Sequential(
+                nn.Linear(in_src + in_dst + edge_dim, out_dim),
+                nn.ReLU(),
+                nn.Linear(out_dim, 1),
+            )
         self.upd_mlp = nn.Sequential(
             nn.Linear(in_dst + out_dim, out_dim),
             nn.ReLU(),
@@ -149,21 +173,36 @@ class EdgeGatedConv(MessagePassing):
         x_dst: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
+        dir_sign: torch.Tensor | None = None,
     ) -> torch.Tensor:
         agg = self.propagate(
             edge_index,
             x=(x_src, x_dst),
             edge_attr=edge_attr,
+            dir_sign=dir_sign,
             size=(x_src.size(0), x_dst.size(0)),
         )
         return self.upd_mlp(torch.cat([x_dst, agg], dim=-1))
 
     def message(
-        self, x_j: torch.Tensor, x_i: torch.Tensor, edge_attr: torch.Tensor
+        self,
+        x_j: torch.Tensor,
+        x_i: torch.Tensor,
+        edge_attr: torch.Tensor,
+        dir_sign: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        g = torch.sigmoid(self.gate_mlp(torch.cat([x_i, x_j, edge_attr], dim=-1)))
+        gin = torch.cat([x_i, x_j, edge_attr], dim=-1)
+        min_ = torch.cat([x_j, edge_attr], dim=-1)
+        if self.directional and dir_sign is not None:
+            fwd = (dir_sign > 0).view(-1, 1).to(min_.dtype)
+            g = fwd * torch.sigmoid(self.gate_mlp(gin)) + (1.0 - fwd) * torch.sigmoid(
+                self.gate_mlp_rev(gin)
+            )
+            m = fwd * self.msg_mlp(min_) + (1.0 - fwd) * self.msg_mlp_rev(min_)
+        else:
+            g = torch.sigmoid(self.gate_mlp(gin))
+            m = self.msg_mlp(min_)
         self.last_gate = g.detach()
-        m = self.msg_mlp(torch.cat([x_j, edge_attr], dim=-1))
         return g * m
 
 
@@ -194,24 +233,48 @@ class WTEGraphNet(nn.Module):
         f_anchor_query: int | None = None,
         pinball: bool = False,
         fac_skip: bool = False,
+        fac_gate: bool = False,
+        directional_edges: bool = False,
     ) -> None:
         super().__init__()
+        if fac_gate and not fac_skip:
+            raise ValueError("fac_gate requires fac_skip")
         self.has_anchor = f_anchor is not None
         self.pinball = pinball
         self.fac_skip = fac_skip
+        self.fac_gate = fac_gate
+        self.directional_edges = directional_edges
+        self.last_fac_gate: torch.Tensor | None = None
         self.reach_enc = nn.Sequential(
             nn.Linear(f_reach, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
         )
         self.query_enc = nn.Sequential(
             nn.Linear(f_query, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
         )
+        # Channel + lateral message passing is flow-direction-conditioned when
+        # directional_edges is set (the trainer supplies ch_dir/lat_dir). Anchor convs
+        # stay non-directional (an anchor BC has no up/down flow sense).
         self.channel = nn.ModuleList(
             [
-                EdgeGatedConv(hidden, hidden, f_ch, hidden, dropout=dropout)
+                EdgeGatedConv(
+                    hidden,
+                    hidden,
+                    f_ch,
+                    hidden,
+                    dropout=dropout,
+                    directional=directional_edges,
+                )
                 for _ in range(n_channel_layers)
             ]
         )
-        self.lateral = EdgeGatedConv(hidden, hidden, f_lat, hidden, dropout=dropout)
+        self.lateral = EdgeGatedConv(
+            hidden,
+            hidden,
+            f_lat,
+            hidden,
+            dropout=dropout,
+            directional=directional_edges,
+        )
         head_in = hidden * 2
         if self.has_anchor:
             self.anchor_enc = nn.Sequential(
@@ -236,7 +299,25 @@ class WTEGraphNet(nn.Module):
             # ride straight to the head (un-smoothed), and the output is anchored on
             # that estimate so message passing can only CORRECT FAC, never erase its
             # sharp shallow signal (the diagnosed over-smoothing failure).
-            head_in += 2
+            if self.fac_gate:
+                # confidence gate c in (0,1) on the FAC anchor: the gate sees the query
+                # context (incl. the deep regional prior) + FAC's own predicted DTW, so
+                # it can RELEASE the anchor in the deep-regional regime where FAC
+                # saturates and let the head lean on the regional prior.
+                self.fac_gate_mlp = nn.Sequential(
+                    nn.Linear(
+                        head_in + 3, hidden
+                    ),  # h | fac_base, present, fac_pred_dtw
+                    nn.ReLU(),
+                    nn.Linear(hidden, 1),
+                )
+                # Start FIRMLY anchored (c~0.95): epoch-0 behavior == plain fac-skip (the
+                # proven shallow win), so release is opt-in with evidence rather than the
+                # default-0.5 gate halving the shallow anchor from the start.
+                nn.init.constant_(self.fac_gate_mlp[-1].bias, 3.0)
+                head_in += 4  # h | fac_base, present, fac_pred_dtw, gate
+            else:
+                head_in += 2  # h | fac_base, present
         self.head = nn.Sequential(
             nn.Linear(head_in, hidden),
             nn.ReLU(),
@@ -253,6 +334,10 @@ class WTEGraphNet(nn.Module):
             )
 
     def forward(self, g: dict):
+        # flow-direction sign per channel/lateral edge (None unless directional_edges);
+        # keyed access errors loudly if the flag is on but the trainer omitted them.
+        ch_dir = g["ch_dir"] if self.directional_edges else None
+        lat_dir = g["lat_dir"] if self.directional_edges else None
         r = self.reach_enc(g["reach_x"])
         if self.has_anchor and "anchor_x" in g:
             a = self.anchor_enc(g["anchor_x"])
@@ -262,25 +347,37 @@ class WTEGraphNet(nn.Module):
             # re-asserting it after each channel diffusion step.
             r = r + self.anchor_to_reach(a, r, g["ar_ei"], g["ar_ea"])
             for layer in self.channel:
-                r = r + layer(r, r, g["ch_ei"], g["ch_ea"])
+                r = r + layer(r, r, g["ch_ei"], g["ch_ea"], dir_sign=ch_dir)
                 r = r + self.anchor_to_reach(a, r, g["ar_ei"], g["ar_ea"])
             q = self.query_enc(g["query_x"])
-            ctx_reach = self.lateral(r, q, g["lat_ei"], g["lat_ea"])
+            ctx_reach = self.lateral(r, q, g["lat_ei"], g["lat_ea"], dir_sign=lat_dir)
             ctx_anchor = self.anchor_to_query(a, q, g["aq_ei"], g["aq_ea"])
             h = torch.cat([q, ctx_reach, ctx_anchor], dim=-1)
         else:
             for layer in self.channel:
-                r = r + layer(r, r, g["ch_ei"], g["ch_ea"])  # residual channel update
+                # residual channel update (direction-conditioned when enabled)
+                r = r + layer(r, r, g["ch_ei"], g["ch_ea"], dir_sign=ch_dir)
             q = self.query_enc(g["query_x"])
-            ctx = self.lateral(r, q, g["lat_ei"], g["lat_ea"])
+            ctx = self.lateral(r, q, g["lat_ei"], g["lat_ea"], dir_sign=lat_dir)
             h = torch.cat([q, ctx], dim=-1)
         if self.fac_skip:
             # g["fac_base"] is FAC's target-estimate standardized in THIS fold's target
             # space (0 where FAC is absent); g["fac_present"] is the 0/1 coverage flag.
             fb = g["fac_base"].view(-1, 1)
             pres = g["fac_present"].view(-1, 1)
-            h = torch.cat([h, fb, pres], dim=-1)
-            skip = (pres * fb).squeeze(-1)  # FAC estimate where present, else 0
+            if self.fac_gate:
+                # gate on FAC's own predicted DTW: full anchor where FAC is shallow/
+                # reliable, released where FAC saturates (deep-regional regime).
+                fpd = g["fac_pred_dtw"].view(-1, 1)
+                c = torch.sigmoid(
+                    self.fac_gate_mlp(torch.cat([h, fb, pres, fpd], dim=-1))
+                )
+                self.last_fac_gate = c.detach()
+                h = torch.cat([h, fb, pres, fpd, c], dim=-1)
+                skip = (pres * c * fb).squeeze(-1)
+            else:
+                h = torch.cat([h, fb, pres], dim=-1)
+                skip = (pres * fb).squeeze(-1)  # FAC estimate where present, else 0
         else:
             skip = 0.0
         primary = self.head(h).squeeze(-1) + skip

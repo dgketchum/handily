@@ -136,20 +136,35 @@ def _native_to_dtw(native: np.ndarray, base: np.ndarray, mode: str) -> np.ndarra
     return base - native if mode in HEAD_SPACE_MODES else base + native
 
 
-def _fac_feat(fac_raw, fac_present, y_c: float, y_s: float, device) -> dict:
+def _fac_feat(
+    fac_raw,
+    fac_present,
+    y_c: float,
+    y_s: float,
+    device,
+    fac_pred_dtw=None,
+    pdtw_c: float = 0.0,
+    pdtw_s: float = 1.0,
+) -> dict:
     """FAC bypass tensors standardized into THIS fold's target space.
 
     The FAC anomaly is FAC's own estimate of the (head-space) target, so standardizing
     it by the fold's (y_c, y_s) puts it on the same scale as the model's standardized
     output -- the model then predicts ``fac_base + correction``. Absent FAC is set to 0
-    (the presence flag carries that info, so the skip contributes nothing there)."""
+    (the presence flag carries that info, so the skip contributes nothing there).
+    ``fac_pred_dtw`` (FAC's own predicted DTW = base - fac_raw) feeds the confidence
+    gate, standardized by its own train-fold (pdtw_c, pdtw_s)."""
     base = np.where(fac_present, (fac_raw - y_c) / y_s, 0.0)
-    return {
+    out = {
         "fac_base": torch.as_tensor(base, dtype=torch.float32, device=device),
         "fac_present": torch.as_tensor(
             fac_present.astype("float32"), dtype=torch.float32, device=device
         ),
     }
+    if fac_pred_dtw is not None:
+        gsig = np.where(fac_present, (fac_pred_dtw - pdtw_c) / pdtw_s, 0.0)
+        out["fac_pred_dtw"] = torch.as_tensor(gsig, dtype=torch.float32, device=device)
+    return out
 
 
 def _huber_delta_std(args, mode: str, y_s: float) -> float:
@@ -341,6 +356,13 @@ def main() -> None:
         "sharp shallow signal; head-space targets (wte / wte_residual) only",
     )
     p.add_argument(
+        "--fac-gate",
+        action="store_true",
+        help="learned confidence gate on the FAC anchor (requires --fac-skip): the gate "
+        "sees FAC's own predicted DTW and RELEASES the anchor in the deep-regional regime "
+        "where FAC saturates, letting the regional prior + graph carry deep wells",
+    )
+    p.add_argument(
         "--shallow-weight",
         type=float,
         default=1.0,
@@ -349,6 +371,16 @@ def main() -> None:
         "by the more numerous deep wells in the Huber average",
     )
     p.add_argument("--shallow-thresh-m", type=float, default=5.0)
+    p.add_argument(
+        "--directional-edges",
+        action="store_true",
+        help="flow-direction-conditioned message passing: channel edges route by their "
+        "+1/-1 direction and lateral edges by sign(well_surf - reach_elev) through "
+        "SEPARATE message+gate weights, so direction gets a dedicated parameter path "
+        "instead of one concatenated feature the single transform must disentangle. "
+        "Uses columns already in the bundle (no rebuild); the production arm is the "
+        "no-flag default.",
+    )
     args = p.parse_args()
 
     gdir = Path(args.graph_dir)
@@ -432,7 +464,8 @@ def main() -> None:
     use_anchors = bool(anchor_block) and not args.no_anchors
     an = ar = aq = None
     anchor_cols = ar_cols = aq_cols = None
-    anchor_head_m = None  # WTE-mode Dirichlet BC values (fold-standardized per fold)
+    anchor_head_m = None  # TARGET_WTE absolute-head BC (fold-standardized per fold)
+    anchor_anom = None  # TARGET_WTE_RESIDUAL per-fold head-anomaly BC {fold: array}
     if use_anchors:
         anchor_cols = anchor_block["anchor_feature_cols"]
         ar_cols = anchor_block["anchor_reach_edge_feature_cols"]
@@ -451,6 +484,20 @@ def main() -> None:
                     f"{int((~np.isfinite(anchor_head_m)).sum())} non-finite anchor "
                     f"{bc_col} (WTE Dirichlet BC value)"
                 )
+        elif target_mode == TARGET_WTE_RESIDUAL:
+            # Residual-space BC: one head-anomaly column (anchor_head - R_f) per fold.
+            anom_cols = anchor_block.get("anchor_bc_anom_cols")
+            if anom_cols:
+                anchor_anom = {
+                    int(c.rsplit("_", 1)[1]): an[c].to_numpy("float64")
+                    for c in anom_cols
+                }
+                for fk, v in anchor_anom.items():
+                    if not np.isfinite(v).all():
+                        raise SystemExit(
+                            f"{int((~np.isfinite(v)).sum())} non-finite anchor BC "
+                            f"anomaly (fold {fk})"
+                        )
         ar = pd.read_parquet(gdir / "anchor_to_reach_edges.parquet")
         aq = pd.read_parquet(gdir / "anchor_to_query_edges.parquet")
         ar = prune_anchor_reach_edges(ar, old2new)
@@ -462,6 +509,9 @@ def main() -> None:
         )
     elif anchor_block and args.no_anchors:
         log.info("bundle has anchors but --no-anchors set: running v1 (ablation)")
+    # Dirichlet BC value present on a dedicated channel (absolute head for TARGET_WTE,
+    # per-fold residual anomaly for TARGET_WTE_RESIDUAL); standardized per fold below.
+    has_anchor_bc = anchor_head_m is not None or anchor_anom is not None
 
     # --- constant graph tensors -----------------------------------------------
     reach_stats = fit_stats(rn, reach_cols, None)
@@ -496,6 +546,32 @@ def main() -> None:
         "lat_ei": lat_ei,
         "lat_ea": lat_ea,
     }
+    # Flow-direction sign per edge (row-aligned with ch_ea/lat_ea), from columns
+    # already in the bundle: channel `direction` (+1 down / -1 reverse, never NaN) and
+    # lateral sign(well_surf - reach_elev) (well-above-reach +1 / below -1). A rare
+    # NaN rel-elev (DEM gap; ~<1% per the build) routes to +1 (the dominant gaining-
+    # stream/valley case), the same harmless default the median-imputed feature gets.
+    if args.directional_edges:
+        ch_direction = ce["direction"].to_numpy("float64")
+        rel = le["rel_elev_query_reach_m"].to_numpy("float64")
+        lat_sign = np.where(np.nan_to_num(rel, nan=0.0) >= 0, 1.0, -1.0)
+        graph_tensors |= {
+            "ch_dir": torch.as_tensor(
+                np.where(ch_direction > 0, 1.0, -1.0),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "lat_dir": torch.as_tensor(lat_sign, dtype=torch.float32, device=device),
+        }
+        log.info(
+            "directional edges ON: channel +%d/-%d; lateral well-above %d / below %d "
+            "(%d rel-elev NaN -> +1)",
+            int((ch_direction > 0).sum()),
+            int((ch_direction < 0).sum()),
+            int((lat_sign > 0).sum()),
+            int((lat_sign < 0).sum()),
+            int((~np.isfinite(rel)).sum()),
+        )
     f_anchor = f_ar = f_aq = None
     if use_anchors:
         anchor_x = torch.as_tensor(
@@ -556,7 +632,10 @@ def main() -> None:
 
     # --- FAC raw-skip: FAC's own (head-space) target-estimate as the output anchor ---
     fac_skip = args.fac_skip
-    fac_raw = fac_present = None
+    fac_gate = args.fac_gate
+    fac_raw = fac_present = fac_pred_dtw = None
+    if fac_gate and not fac_skip:
+        raise SystemExit("--fac-gate requires --fac-skip")
     if fac_skip:
         if target_mode == TARGET_WTE_RESIDUAL:
             fac_base_col = FAC_REM_WTE_ANOM_COL  # (z_surf - fac_rem_dtw) - R
@@ -572,12 +651,17 @@ def main() -> None:
         fac_raw = qn[fac_base_col].to_numpy("float64")
         fac_present = np.isfinite(fac_raw)
         log.info(
-            "fac-skip ON: anchor col %s, %d/%d wells carry FAC (%.1f%%)",
+            "fac-skip ON: anchor col %s, %d/%d wells carry FAC (%.1f%%)%s",
             fac_base_col,
             int(fac_present.sum()),
             len(qn),
             100.0 * fac_present.mean(),
+            " | gate ON" if fac_gate else "",
         )
+        if fac_gate:
+            # FAC's own predicted DTW; in head-space base - fac_raw == fac_rem_dtw.
+            # The gate keys on this to release the anchor when FAC predicts deep.
+            fac_pred_dtw = np.where(fac_present, base - fac_raw, np.nan)
 
     # --- depth-aware loss weighting: upweight the shallow band (FAC's gold) ---------
     sample_w_t = None
@@ -596,6 +680,7 @@ def main() -> None:
 
     f_ch, f_lat = ch_ea.shape[1], lat_ea.shape[1]
     native_oof = np.full(len(qn), np.nan)
+    gate_oof = np.full(len(qn), np.nan) if fac_gate else None
     fold_log: list[dict] = []
     huber_delta_std_by_fold: list[float] = []
 
@@ -622,6 +707,8 @@ def main() -> None:
             f_anchor_query=f_aq,
             pinball=args.pinball,
             fac_skip=fac_skip,
+            fac_gate=fac_gate,
+            directional_edges=args.directional_edges,
         ).to(device)
 
     if device.startswith("cuda"):
@@ -629,10 +716,18 @@ def main() -> None:
         yc0 = float(np.median(target))
         ys0 = float(1.4826 * np.median(np.abs(target - yc0)) or 1.0)
         if fac_skip:
-            probe_feat |= _fac_feat(fac_raw, fac_present, yc0, ys0, device)
-        if anchor_head_m is not None:
+            if fac_gate:
+                pc0 = float(np.nanmedian(fac_pred_dtw))
+                ps0 = float(1.4826 * np.nanmedian(np.abs(fac_pred_dtw - pc0)) or 1.0)
+                probe_feat |= _fac_feat(
+                    fac_raw, fac_present, yc0, ys0, device, fac_pred_dtw, pc0, ps0
+                )
+            else:
+                probe_feat |= _fac_feat(fac_raw, fac_present, yc0, ys0, device)
+        if has_anchor_bc:
+            bc0 = anchor_head_m if anchor_head_m is not None else anchor_anom[int(folds[0])]
             probe_feat["anchor_value"] = torch.as_tensor(
-                (anchor_head_m - yc0) / ys0, dtype=torch.float32, device=device
+                (bc0 - yc0) / ys0, dtype=torch.float32, device=device
             )
         y_probe = torch.as_tensor(
             (target - yc0) / ys0, dtype=torch.float32, device=device
@@ -668,12 +763,21 @@ def main() -> None:
         )
         feat = {**graph_tensors, "query_x": query_x}
         if fac_skip:
-            feat |= _fac_feat(fac_raw, fac_present, y_c, y_s, device)
+            if fac_gate:
+                trp = tr & fac_present
+                pc = float(np.median(fac_pred_dtw[trp]))
+                ps = float(1.4826 * np.median(np.abs(fac_pred_dtw[trp] - pc)) or 1.0)
+                feat |= _fac_feat(
+                    fac_raw, fac_present, y_c, y_s, device, fac_pred_dtw, pc, ps
+                )
+            else:
+                feat |= _fac_feat(fac_raw, fac_present, y_c, y_s, device)
         # WTE Dirichlet BC value, standardized in THIS fold's target space (so the
         # injected head sits on the same scale as the standardized model output).
-        if anchor_head_m is not None:
+        if has_anchor_bc:
+            bc_raw = anchor_head_m if anchor_head_m is not None else anchor_anom[int(f)]
             feat["anchor_value"] = torch.as_tensor(
-                (anchor_head_m - y_c) / y_s, dtype=torch.float32, device=device
+                (bc_raw - y_c) / y_s, dtype=torch.float32, device=device
             )
         huber_delta_std_by_fold.append(float(_huber_delta_std(args, target_mode, y_s)))
 
@@ -691,6 +795,8 @@ def main() -> None:
             f_anchor_query=f_aq,
             pinball=args.pinball,
             fac_skip=fac_skip,
+            fac_gate=fac_gate,
+            directional_edges=args.directional_edges,
         ).to(device)
         native, best_mad, best_epoch = train_fold(
             model,
@@ -708,6 +814,9 @@ def main() -> None:
             device,
             sample_w_t,
         )
+        if fac_gate and model.last_fac_gate is not None:
+            # last_fac_gate is from train_fold's final full-batch forward (all queries).
+            gate_oof[test] = model.last_fac_gate.cpu().numpy().reshape(-1)[test]
         del model, query_x, y_std, feat
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
@@ -739,6 +848,17 @@ def main() -> None:
             f"{int((~np.isfinite(native_oof)).sum())} queries got no OOF prediction"
         )
 
+    if fac_gate:
+        # Verify the mechanism: the gate should RELEASE (c->0) for deep wells. Log the
+        # OOF gate value by observed-depth band (deep release = the intended behavior).
+        bands = [(0, 2), (2, 5), (5, 10), (10, 30), (30, np.inf)]
+        msg = "; ".join(
+            f"{lo}-{hi if hi != np.inf else '+'}m c={np.nanmean(gate_oof[m]):.2f}(n={int(m.sum())})"
+            for lo, hi in bands
+            if (m := (obs_dtw >= lo) & (obs_dtw < hi) & fac_present).any()
+        )
+        log.info("fac-gate mean OOF gate by obs-depth: %s", msg)
+
     gnn_dtw = _native_to_dtw(native_oof, base, target_mode)
     # Common scoring columns (DTW + the named regional/deep DTW priors + benchmarks),
     # so the scorer's predictor set is identical across modes.
@@ -757,6 +877,8 @@ def main() -> None:
         "hand_m": qn["hand_m"].to_numpy(),
         "gnn_dtw_m": gnn_dtw,
     }
+    if fac_gate:
+        out_cols["fac_gate_c"] = gate_oof  # learned anchor confidence (diagnostic)
     identity_max = None
     if target_mode in HEAD_SPACE_MODES:
         # wte_hat is the absolute head (wte) or R + residual_hat (wte_residual).
@@ -840,6 +962,7 @@ def main() -> None:
             "enabled": bool(fac_skip),
             "anchor_col": fac_base_col if fac_skip else None,
             "wells_with_fac": int(fac_present.sum()) if fac_skip else None,
+            "confidence_gate": bool(fac_gate),
         },
         "depth_aware_loss": {
             "shallow_weight": args.shallow_weight,
@@ -847,6 +970,7 @@ def main() -> None:
             if args.shallow_weight != 1.0
             else None,
         },
+        "directional_edges": bool(args.directional_edges),
         "target_mode": target_mode,
         "native_prediction_col": man.get(
             "native_prediction_col",
