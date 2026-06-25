@@ -15,7 +15,9 @@ ownership/rasterization workflow.
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rioxarray
+import shapely
 import xarray as xr
 import rasterio
 from rasterio.enums import Resampling as RioResampling
@@ -34,6 +37,7 @@ from rasterio.warp import reproject
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import distance_transform_edt, gaussian_filter
 from scipy.signal import fftconvolve
+from scipy.spatial import cKDTree
 from shapely import STRtree
 from shapely import from_wkb
 from shapely.geometry import LineString, Polygon, shape
@@ -53,6 +57,53 @@ DEFAULT_GAUSSIAN_SIGMA_PX = 3.0
 DEFAULT_IDW_RADIUS_M = 200.0
 DEFAULT_IDW_POWER = 1.0
 DEFAULT_WORKERS = 1
+
+# Tolerance (m) for treating two reach endpoints as the same junction node.
+_JUNCTION_TOL = 1.0
+
+# Scalar columns every strip row carries (geometry is rebuilt from the
+# base/endpoint coordinates in the parent process, never pickled from workers).
+_STRIP_COLUMNS = (
+    "reach_id",
+    "stream_id",
+    "strahler",
+    "station_id",
+    "s_m",
+    "side",
+    "hit_type",
+    "target_reach_id",
+    "dist_m",
+    "base_x",
+    "base_y",
+    "endpoint_x",
+    "endpoint_y",
+    "angle_deg",
+    "orientation_source",
+    "slope_mag",
+)
+
+# Opt-in strip profiling (Phase 0). Set HANDILY_STRIP_PROFILE=1 to accumulate
+# per-call timing/candidate counts for the two strip hot paths. Workers inherit
+# the env, accumulate locally, and return the counters to the parent.
+_STRIP_PROFILE_ENABLED = os.environ.get("HANDILY_STRIP_PROFILE") == "1"
+
+
+def _new_strip_profile() -> dict[str, float]:
+    return {
+        "boundary_calls": 0,
+        "boundary_time_s": 0.0,
+        "stream_calls": 0,
+        "stream_time_s": 0.0,
+        "stream_tree_hits": 0,
+        "stream_accepted": 0,
+    }
+
+
+def _merge_strip_profile(dst: dict[str, float], src: dict[str, float] | None) -> None:
+    if src is None:
+        return
+    for k, v in src.items():
+        dst[k] = dst.get(k, 0) + v
 
 
 def _match_transform(match_da: xr.DataArray) -> Affine:
@@ -444,7 +495,9 @@ def _first_boundary_hit(
     aoi_boundary,
     max_ray_dist_m: float,
     min_hit_dist_m: float,
+    prof: dict | None = None,
 ) -> tuple[float, np.ndarray] | None:
+    t0 = perf_counter() if prof is not None else 0.0
     ray_end = anchor_xy + max_ray_dist_m * direction
     ray = LineString([tuple(anchor_xy), tuple(ray_end)])
     ix = ray.intersection(aoi_boundary)
@@ -458,9 +511,11 @@ def _first_boundary_hit(
         if d < best_d:
             best_d = d
             best_xy = np.array([px, py], dtype=np.float64)
-    if best_xy is None:
-        return None
-    return best_d, best_xy
+    result = None if best_xy is None else (best_d, best_xy)
+    if prof is not None:
+        prof["boundary_calls"] += 1
+        prof["boundary_time_s"] += perf_counter() - t0
+    return result
 
 
 def _first_stream_hit(
@@ -472,11 +527,18 @@ def _first_stream_hit(
     stream_geoms: list[LineString],
     stream_ids: list[int],
     min_hit_dist_m: float,
+    prof: dict | None = None,
 ) -> tuple[float, np.ndarray, int] | None:
+    t0 = perf_counter() if prof is not None else 0.0
     best_d = float("inf")
     best_xy: np.ndarray | None = None
     best_rid = -1
-    for idx in stream_tree.query(ray_geom):
+    n_accept = 0
+    # predicate="intersects" returns only geometries that actually cross the ray,
+    # not every bbox-overlap candidate -- the Python intersection() loop then
+    # only runs on true crossings.
+    candidates = stream_tree.query(ray_geom, predicate="intersects")
+    for idx in candidates:
         target_rid = int(stream_ids[idx])
         if target_rid == source_reach_id:
             continue
@@ -488,13 +550,18 @@ def _first_stream_hit(
             d = float(np.hypot(vec[0], vec[1]))
             if d < min_hit_dist_m or float(vec @ direction) <= 0.0:
                 continue
+            n_accept += 1
             if d < best_d:
                 best_d = d
                 best_xy = np.array([px, py], dtype=np.float64)
                 best_rid = target_rid
-    if best_xy is None:
-        return None
-    return best_d, best_xy, best_rid
+    result = None if best_xy is None else (best_d, best_xy, best_rid)
+    if prof is not None:
+        prof["stream_calls"] += 1
+        prof["stream_time_s"] += perf_counter() - t0
+        prof["stream_tree_hits"] += len(candidates)
+        prof["stream_accepted"] += n_accept
+    return result
 
 
 def _init_strip_worker(
@@ -522,6 +589,41 @@ def _init_strip_worker(
     }
 
 
+def _line_tangents_batch(
+    line: LineString,
+    s_vals: np.ndarray,
+    step_m: float,
+) -> np.ndarray:
+    """Vectorized :func:`_line_tangent` for every station on one reach.
+
+    Returns an ``(n, 2)`` array of unit tangents (NaN rows where the local
+    chord degenerates). Bit-for-bit matches the per-station scalar helper: the
+    same ``half`` window, the same ``s0``/``s1`` clamp + degenerate fallback,
+    and the same ``_normalize`` semantics (NaN when the chord length <= 1e-12).
+    """
+    total = float(line.length)
+    n = len(s_vals)
+    if total <= 1e-6:
+        return np.full((n, 2), np.nan, dtype=np.float64)
+    half = min(step_m, max(total / 4.0, 1.0))
+    s0 = np.maximum(0.0, s_vals - half)
+    s1 = np.minimum(total, s_vals + half)
+    bad = s1 <= s0 + 1e-6
+    if bad.any():
+        s0 = np.where(bad, np.maximum(0.0, s_vals - 1.0), s0)
+        s1 = np.where(bad, np.minimum(total, s_vals + 1.0), s1)
+    p0 = shapely.get_coordinates(shapely.line_interpolate_point(line, s0))
+    p1 = shapely.get_coordinates(shapely.line_interpolate_point(line, s1))
+    tx = p1[:, 0] - p0[:, 0]
+    ty = p1[:, 1] - p0[:, 1]
+    norm = np.hypot(tx, ty)
+    tang = np.full((n, 2), np.nan, dtype=np.float64)
+    ok = norm > 1e-12
+    tang[ok, 0] = tx[ok] / norm[ok]
+    tang[ok, 1] = ty[ok] / norm[ok]
+    return tang
+
+
 def _generate_strip_rows_for_chunk(
     records: list[dict],
     station_spacing_m: float,
@@ -530,9 +632,10 @@ def _generate_strip_rows_for_chunk(
     halo_n: int = 0,
     naked_fill_m: float = 0.0,
     max_crossing_strip_m: float = 0.0,
-) -> list[dict]:
+) -> tuple[list[dict], dict | None]:
     assert _WORKER_STATE is not None
     out: list[dict] = []
+    prof = _new_strip_profile() if _STRIP_PROFILE_ENABLED else None
     down_x_interp = _WORKER_STATE["down_x_interp"]
     down_y_interp = _WORKER_STATE["down_y_interp"]
     slope_interp = _WORKER_STATE["slope_interp"]
@@ -544,23 +647,52 @@ def _generate_strip_rows_for_chunk(
 
     halo_half_len = station_spacing_m * 8.0
 
+    # Phase 1: cap the stream probe (the expensive STRtree query), not the
+    # boundary probe. A stream hit beyond max_crossing_strip_m is reclassified
+    # (naked/edge) anyway, so the stream ray never needs to be longer than the
+    # keep limit; when uncapped (max_crossing_strip_m == 0) fall back to the full
+    # diagonal so the legacy "nearest stream, however far" behavior is kept. The
+    # boundary probe stays the full diagonal in both modes (a single ring
+    # intersection is cheap), so the legacy None -> skip miss semantics are
+    # preserved exactly for base points near or outside the AOI edge.
+    keep_limit = max_crossing_strip_m if max_crossing_strip_m > 0.0 else float("inf")
+    stream_ray_len = (
+        float(max_crossing_strip_m)
+        if max_crossing_strip_m > 0.0
+        else float(max_ray_dist_m)
+    )
+    naked_mode = naked_fill_m > 0.0
+
     for rec in records:
         line = rec["geometry"]
         if line is None or line.is_empty or float(line.length) <= 1e-6:
             continue
+        reach_id = int(rec["reach_id"])
+        stream_id = int(rec["stream_id"])
+        strahler = rec["strahler"]
         s_vals = _station_s_values(line, station_spacing_m)
         n_on_stream = len(s_vals)
-        for station_id, s_m in enumerate(s_vals):
-            base_pt = line.interpolate(float(s_m))
-            base_xy = np.array([float(base_pt.x), float(base_pt.y)], dtype=np.float64)
-            tangent = _line_tangent(line, float(s_m), tangent_step_m)
+
+        # Phase 2.3: batch every per-station sample for this reach -- one
+        # vectorized interpolate for the base points, one for the tangents, and
+        # one call per orientation/slope grid.
+        base_pts = shapely.get_coordinates(shapely.line_interpolate_point(line, s_vals))
+        tangents = _line_tangents_batch(line, s_vals, tangent_step_m)
+        samples = np.column_stack([base_pts[:, 1], base_pts[:, 0]])
+        down_x_all = down_x_interp(samples)
+        down_y_all = down_y_interp(samples)
+        slope_all = slope_interp(samples)
+
+        for station_id_i in range(n_on_stream):
+            tangent = tangents[station_id_i]
             if not np.isfinite(tangent[0]):
                 continue
+            base_xy = base_pts[station_id_i]
+            s_m = float(s_vals[station_id_i])
 
-            sample = np.array([[base_xy[1], base_xy[0]]], dtype=np.float64)
-            down_x = float(down_x_interp(sample)[0])
-            down_y = float(down_y_interp(sample)[0])
-            slope_mag = float(slope_interp(sample)[0])
+            down_x = float(down_x_all[station_id_i])
+            down_y = float(down_y_all[station_id_i])
+            slope_mag = float(slope_all[station_id_i])
             if np.isfinite(down_x) and np.isfinite(down_y):
                 normal = _normalize(np.array([-down_y, down_x], dtype=np.float64))
                 orient_src = "aspect" if np.isfinite(normal[0]) else "tangent_fallback"
@@ -578,27 +710,46 @@ def _generate_strip_rows_for_chunk(
             for base_dir in (normal, -normal):
                 cross = float(tangent[0] * base_dir[1] - tangent[1] * base_dir[0])
                 side = "left" if cross > 0.0 else "right"
+
+                # --- Boundary distance (full-diagonal probe, both modes) ---
                 boundary_hit = _first_boundary_hit(
                     base_xy,
                     base_dir,
                     aoi_boundary,
                     max_ray_dist_m,
                     min_hit_dist_m,
+                    prof,
                 )
                 if boundary_hit is None:
                     continue
                 boundary_d, boundary_xy = boundary_hit
-                ray_geom = LineString([tuple(base_xy), tuple(boundary_xy)])
-                stream_hit = _first_stream_hit(
-                    base_xy,
-                    base_dir,
-                    int(rec["reach_id"]),
-                    ray_geom,
-                    stream_tree,
-                    stream_geoms,
-                    stream_ids,
-                    min_hit_dist_m,
-                )
+
+                # --- Stream hit, ray only as long as it needs to be (Phase 1.3) ---
+                # When the boundary clamps the ray, reuse the exact boundary
+                # intersection point so the ray is bit-identical to the legacy
+                # base->boundary ray; only when the keep-limit clamps it first do
+                # we reconstruct a shorter endpoint from the distance.
+                if boundary_d <= stream_ray_len:
+                    ray_len = boundary_d
+                    ray_end = boundary_xy
+                else:
+                    ray_len = stream_ray_len
+                    ray_end = base_xy + base_dir * stream_ray_len
+                if ray_len <= min_hit_dist_m:
+                    stream_hit = None
+                else:
+                    ray_geom = LineString([tuple(base_xy), tuple(ray_end)])
+                    stream_hit = _first_stream_hit(
+                        base_xy,
+                        base_dir,
+                        reach_id,
+                        ray_geom,
+                        stream_tree,
+                        stream_geoms,
+                        stream_ids,
+                        min_hit_dist_m,
+                        prof,
+                    )
 
                 if stream_hit is not None and stream_hit[0] < boundary_d:
                     stream_d = float(stream_hit[0])
@@ -610,15 +761,12 @@ def _generate_strip_rows_for_chunk(
                 # bounded flat local anchor when naked_fill_m is enabled.  That
                 # preserves wide-valley interreach strips while still providing
                 # local burns in steep, stream-free side directions.
-                keep_limit = (
-                    max_crossing_strip_m if max_crossing_strip_m > 0.0 else float("inf")
-                )
                 if stream_d < float("inf") and stream_d <= keep_limit:
                     hit_type = "interreach"
                     dist_m = stream_d
                     endpoint_xy = stream_hit[1]
                     target_reach_id = int(stream_hit[2])
-                elif naked_fill_m > 0.0:
+                elif naked_mode:
                     flat_len = float(min(naked_fill_m, boundary_d))
                     hit_type = "naked"
                     dist_m = flat_len
@@ -635,11 +783,11 @@ def _generate_strip_rows_for_chunk(
                 )
                 out.append(
                     {
-                        "reach_id": int(rec["reach_id"]),
-                        "stream_id": int(rec["stream_id"]),
-                        "strahler": rec["strahler"],
-                        "station_id": int(station_id),
-                        "s_m": float(s_m),
+                        "reach_id": reach_id,
+                        "stream_id": stream_id,
+                        "strahler": strahler,
+                        "station_id": int(station_id_i),
+                        "s_m": s_m,
                         "side": side,
                         "hit_type": hit_type,
                         "target_reach_id": int(target_reach_id),
@@ -651,7 +799,6 @@ def _generate_strip_rows_for_chunk(
                         "angle_deg": angle_deg,
                         "orientation_source": orient_src,
                         "slope_mag": slope_mag,
-                        "geometry": LineString([tuple(base_xy), tuple(endpoint_xy)]),
                     }
                 )
 
@@ -687,9 +834,9 @@ def _generate_strip_rows_for_chunk(
                 sid = n_on_stream + end_idx * halo_n + h_i
                 out.append(
                     {
-                        "reach_id": int(rec["reach_id"]),
-                        "stream_id": int(rec["stream_id"]),
-                        "strahler": rec["strahler"],
+                        "reach_id": reach_id,
+                        "stream_id": stream_id,
+                        "strahler": strahler,
                         "station_id": int(sid),
                         "s_m": float(ref_s),
                         "side": side,
@@ -703,10 +850,9 @@ def _generate_strip_rows_for_chunk(
                         "angle_deg": angle_deg,
                         "orientation_source": "halo",
                         "slope_mag": np.nan,
-                        "geometry": LineString([tuple(base_xy), tuple(ep_xy)]),
                     }
                 )
-    return out
+    return out, prof
 
 
 def _snap_points_to_fac_max(
@@ -928,6 +1074,121 @@ def _remove_long_crossing_strips(
     return strips.drop(index=list(drop)).reset_index(drop=True)
 
 
+def _terminal_endpoints(
+    stream_geoms: list[LineString],
+    stream_ids: list[int],
+    tol: float = _JUNCTION_TOL,
+) -> tuple[set[int], set[int]]:
+    """Reach ids whose start/end node is not shared with any other reach.
+
+    A start node is terminal when no other endpoint (start or end, of any reach)
+    lies within *tol*; symmetrically for end nodes. Uses a cKDTree on the
+    stacked endpoints so the test is true Euclidean distance -- not a rounded
+    grid hash -- and runs in O(n log n) instead of the former O(n^2) all-pairs
+    loop.
+    """
+    n = len(stream_geoms)
+    terminal_start_set: set[int] = set()
+    terminal_end_set: set[int] = set()
+    if n == 0:
+        return terminal_start_set, terminal_end_set
+
+    starts = np.empty((n, 2), dtype=np.float64)
+    ends = np.empty((n, 2), dtype=np.float64)
+    for i, geom in enumerate(stream_geoms):
+        coords = np.asarray(geom.coords, dtype=np.float64)
+        starts[i] = coords[0, :2]
+        ends[i] = coords[-1, :2]
+
+    points = np.vstack([starts, ends])
+    tree = cKDTree(points)
+    neighbors = tree.query_ball_point(points, r=tol)
+    for i in range(n):
+        # query_ball_point always returns the queried point itself; a lone
+        # self-match means the node is isolated (> tol from every other node).
+        if len(neighbors[i]) == 1:
+            terminal_start_set.add(stream_ids[i])
+        if len(neighbors[n + i]) == 1:
+            terminal_end_set.add(stream_ids[i])
+    return terminal_start_set, terminal_end_set
+
+
+def _estimate_record_weight(rec: dict, station_spacing_m: float, halo_n: int) -> int:
+    """Approximate strip count a reach will emit -- the load-balance weight."""
+    geom = rec["geometry"]
+    length = float(geom.length) if geom is not None and not geom.is_empty else 0.0
+    n_stations = max(2, int(length / station_spacing_m) + 2)
+    weight = n_stations * 2
+    if halo_n > 0:
+        weight += halo_n * (
+            int(bool(rec.get("terminal_start"))) + int(bool(rec.get("terminal_end")))
+        )
+    return weight
+
+
+def _pack_records_into_bins(
+    records: list[dict],
+    n_bins: int,
+    station_spacing_m: float,
+    halo_n: int,
+) -> list[list[dict]]:
+    """Greedy longest-processing-time packing of reaches into balanced bins.
+
+    Sorting by descending estimated strip count and dropping each reach into the
+    currently-lightest bin keeps one long mainstem reach from stranding a worker
+    long after the others finish. Output order is irrelevant -- the final strip
+    sort restores a deterministic order -- and station ids are assigned per reach
+    inside the worker, so packing never changes the strips themselves.
+    """
+    weights = [_estimate_record_weight(r, station_spacing_m, halo_n) for r in records]
+    order = sorted(range(len(records)), key=lambda i: weights[i], reverse=True)
+    bins: list[list[dict]] = [[] for _ in range(n_bins)]
+    heap = [(0, b) for b in range(n_bins)]
+    heapq.heapify(heap)
+    for i in order:
+        load, b = heapq.heappop(heap)
+        bins[b].append(records[i])
+        heapq.heappush(heap, (load + weights[i], b))
+    return [b for b in bins if b]
+
+
+def _strips_geodataframe_from_rows(rows: list[dict], crs) -> gpd.GeoDataFrame:
+    """Assemble the strip GeoDataFrame from geometry-free worker rows.
+
+    Workers return only scalar columns (no Shapely objects to pickle across the
+    process boundary); each strip geometry is exactly the base->endpoint segment,
+    rebuilt here in one vectorized ``shapely.linestrings`` call.
+    """
+    if not rows:
+        empty = {c: pd.Series([], dtype="float64") for c in _STRIP_COLUMNS}
+        return gpd.GeoDataFrame(empty, geometry=gpd.GeoSeries([], crs=crs), crs=crs)
+    df = pd.DataFrame(rows)
+    coords = np.stack(
+        [
+            df["base_x"].to_numpy(dtype=np.float64),
+            df["base_y"].to_numpy(dtype=np.float64),
+            df["endpoint_x"].to_numpy(dtype=np.float64),
+            df["endpoint_y"].to_numpy(dtype=np.float64),
+        ],
+        axis=1,
+    ).reshape(-1, 2, 2)
+    geom = shapely.linestrings(coords)
+    return gpd.GeoDataFrame(df, geometry=geom, crs=crs)
+
+
+def _print_strip_profile(prof: dict) -> None:
+    print(
+        "  [strip-profile] "
+        f"boundary: {prof.get('boundary_calls', 0)} calls / "
+        f"{prof.get('boundary_time_s', 0.0):.2f}s; "
+        f"stream: {prof.get('stream_calls', 0)} calls / "
+        f"{prof.get('stream_time_s', 0.0):.2f}s; "
+        f"tree-hits={prof.get('stream_tree_hits', 0)} "
+        f"accepted={prof.get('stream_accepted', 0)}",
+        flush=True,
+    )
+
+
 def generate_fac_strips(
     streams_gdf: gpd.GeoDataFrame,
     dem_da: xr.DataArray,
@@ -965,49 +1226,7 @@ def generate_fac_strips(
     aoi_boundary = field.aoi_polygon.boundary
 
     # Identify terminal endpoints (headwaters/outlets not shared with another reach)
-    _JUNCTION_TOL = 1.0  # metres
-    all_starts = []
-    all_ends = []
-    all_rids = []
-    for geom, rid in zip(stream_geoms, stream_ids):
-        coords = np.array(geom.coords)
-        all_starts.append(coords[0, :2])
-        all_ends.append(coords[-1, :2])
-        all_rids.append(rid)
-    all_starts = np.array(all_starts, dtype=np.float64)
-    all_ends = np.array(all_ends, dtype=np.float64)
-    n_streams = len(all_starts)
-
-    terminal_start_set: set[int] = set()
-    terminal_end_set: set[int] = set()
-    for i in range(n_streams):
-        # Check if start[i] is near any other stream's start or end
-        dists_to_starts = np.hypot(
-            all_starts[:, 0] - all_starts[i, 0], all_starts[:, 1] - all_starts[i, 1]
-        )
-        dists_to_ends = np.hypot(
-            all_ends[:, 0] - all_starts[i, 0], all_ends[:, 1] - all_starts[i, 1]
-        )
-        dists_to_starts[i] = np.inf  # exclude self
-        if (
-            dists_to_starts.min() > _JUNCTION_TOL
-            and dists_to_ends.min() > _JUNCTION_TOL
-        ):
-            terminal_start_set.add(all_rids[i])
-
-        # Check if end[i] is near any other stream's start or end
-        dists_to_starts2 = np.hypot(
-            all_starts[:, 0] - all_ends[i, 0], all_starts[:, 1] - all_ends[i, 1]
-        )
-        dists_to_ends2 = np.hypot(
-            all_ends[:, 0] - all_ends[i, 0], all_ends[:, 1] - all_ends[i, 1]
-        )
-        dists_to_ends2[i] = np.inf  # exclude self
-        if (
-            dists_to_starts2.min() > _JUNCTION_TOL
-            and dists_to_ends2.min() > _JUNCTION_TOL
-        ):
-            terminal_end_set.add(all_rids[i])
+    terminal_start_set, terminal_end_set = _terminal_endpoints(stream_geoms, stream_ids)
 
     records = [
         {
@@ -1023,6 +1242,7 @@ def generate_fac_strips(
     ]
 
     rows: list[dict] = []
+    total_prof = _new_strip_profile() if _STRIP_PROFILE_ENABLED else None
     if workers <= 1:
         global _WORKER_STATE
         _WORKER_STATE = {
@@ -1035,7 +1255,7 @@ def generate_fac_strips(
             "down_y_interp": field.down_y_interp,
             "slope_interp": field.slope_interp,
         }
-        rows = _generate_strip_rows_for_chunk(
+        rows, prof = _generate_strip_rows_for_chunk(
             records,
             station_spacing_m,
             tangent_step_m,
@@ -1044,11 +1264,13 @@ def generate_fac_strips(
             naked_fill_m=naked_fill_m,
             max_crossing_strip_m=max_crossing_strip_m,
         )
+        if total_prof is not None:
+            _merge_strip_profile(total_prof, prof)
     else:
-        chunk_size = max(1, int(np.ceil(len(records) / (workers * 4))))
-        chunks = [
-            records[i : i + chunk_size] for i in range(0, len(records), chunk_size)
-        ]
+        # Phase 2.2: greedy load-balanced bins instead of contiguous slices so a
+        # single long mainstem reach cannot strand a worker in the tail.
+        n_bins = min(len(records), max(workers * 8, 1))
+        chunks = _pack_records_into_bins(records, n_bins, station_spacing_m, halo_n)
         stream_wkbs = [geom.wkb for geom in stream_geoms]
         with ProcessPoolExecutor(
             max_workers=workers,
@@ -1080,8 +1302,10 @@ def generate_fac_strips(
             }
             completed = 0
             for fut in as_completed(futs):
-                chunk_rows = fut.result()
+                chunk_rows, chunk_prof = fut.result()
                 rows.extend(chunk_rows)
+                if total_prof is not None:
+                    _merge_strip_profile(total_prof, chunk_prof)
                 completed += futs[fut]
                 print(
                     f"  processed {completed}/{len(records)} reaches, "
@@ -1089,7 +1313,10 @@ def generate_fac_strips(
                     flush=True,
                 )
 
-    strips = gpd.GeoDataFrame(rows, geometry="geometry", crs=work.crs)
+    if total_prof is not None:
+        _print_strip_profile(total_prof)
+
+    strips = _strips_geodataframe_from_rows(rows, work.crs)
     if not strips.empty:
         strips = strips.sort_values(["reach_id", "side", "station_id"]).reset_index(
             drop=True
@@ -1154,6 +1381,144 @@ def build_fac_wedges(strips: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(rows, geometry="geometry", crs=strips.crs)
 
 
+def _strip_endpoint_arrays(
+    strips: gpd.GeoDataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(base_x, base_y, endpoint_x, endpoint_y) for every strip.
+
+    Prefers the explicit endpoint columns (always present on strips from
+    :func:`generate_fac_strips`); falls back to the first/last vertex of each
+    geometry for callers that pass a bare geometry GeoDataFrame.
+    """
+    cols = ("base_x", "base_y", "endpoint_x", "endpoint_y")
+    if all(c in strips.columns for c in cols):
+        return (
+            strips["base_x"].to_numpy(dtype=np.float64),
+            strips["base_y"].to_numpy(dtype=np.float64),
+            strips["endpoint_x"].to_numpy(dtype=np.float64),
+            strips["endpoint_y"].to_numpy(dtype=np.float64),
+        )
+    geoms = strips.geometry.values
+    coords, index = shapely.get_coordinates(geoms, return_index=True)
+    n = len(geoms)
+    first_pos = np.searchsorted(index, np.arange(n), side="left")
+    last_pos = np.searchsorted(index, np.arange(n), side="right") - 1
+    return (
+        coords[first_pos, 0],
+        coords[first_pos, 1],
+        coords[last_pos, 0],
+        coords[last_pos, 1],
+    )
+
+
+def _rasterize_sparse_sections_from_arrays(
+    base_x: np.ndarray,
+    base_y: np.ndarray,
+    endpoint_x: np.ndarray,
+    endpoint_y: np.ndarray,
+    base_elev: np.ndarray,
+    endpoint_elev: np.ndarray,
+    x_vals: np.ndarray,
+    y_vals: np.ndarray,
+    sample_budget: int = 8_000_000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-cell min/count burn of straight base->endpoint strips.
+
+    Vectorized replacement for the per-strip ``np.minimum.at`` loop. Sampling
+    each strip, rounding to cells, and the per-cell reduction are bit-for-bit
+    identical to sampling the equivalent 2-vertex LineString with
+    ``_sample_section_pixels`` (``ts`` reproduces ``np.linspace(0, total, n)``
+    exactly), and min/count are order-independent, so fusing every strip's
+    samples into one sorted reduction changes nothing but speed. Strips are
+    processed in ``sample_budget``-sized batches so peak memory is bounded even
+    when long edge strips emit thousands of samples each.
+    """
+    ny, nx = len(y_vals), len(x_vals)
+    min_arr = np.full((ny, nx), np.inf, dtype=np.float64)
+    count_arr = np.zeros((ny, nx), dtype=np.float64)
+
+    bx = np.asarray(base_x, dtype=np.float64)
+    by = np.asarray(base_y, dtype=np.float64)
+    ex = np.asarray(endpoint_x, dtype=np.float64)
+    ey = np.asarray(endpoint_y, dtype=np.float64)
+    be = np.asarray(base_elev, dtype=np.float64)
+    ee = np.asarray(endpoint_elev, dtype=np.float64)
+
+    res_x = abs(float(x_vals[1] - x_vals[0]))
+    res_y = abs(float(y_vals[1] - y_vals[0]))
+    x0 = float(x_vals[0])
+    y0 = float(y_vals[0])
+    step = min(res_x, res_y) * 0.5
+
+    # sqrt(dx^2 + dy^2), not np.hypot: the per-strip reference computes segment
+    # length this way (seg_len = sqrt(dx**2 + dy**2) -> cum_len), and hypot differs
+    # by ~1 ULP, which would perturb local_t -> sampled elevation by ~1 ULP.
+    total = np.sqrt((ex - bx) ** 2 + (ey - by) ** 2)
+    keep = np.isfinite(be) & np.isfinite(ee) & (total >= 1e-6)
+    sel_all = np.nonzero(keep)[0]
+    if sel_all.size == 0:
+        return min_arr, count_arr
+    n_samp_all = np.maximum(2, np.ceil(total[sel_all] / step).astype(np.int64) + 1)
+
+    flat_min = min_arr.ravel()
+    flat_cnt = count_arr.ravel()
+
+    i = 0
+    n_strips = sel_all.size
+    while i < n_strips:
+        # Grow the batch until the next strip would exceed the sample budget; a
+        # single strip larger than the budget still forms its own batch.
+        budget = 0
+        j = i
+        while j < n_strips and (j == i or budget + int(n_samp_all[j]) <= sample_budget):
+            budget += int(n_samp_all[j])
+            j += 1
+        sel = sel_all[i:j]
+        ni = n_samp_all[i:j]
+        m = sel.size
+        total_n = int(ni.sum())
+
+        totb = total[sel]
+        dxb = ex[sel] - bx[sel]
+        dyb = ey[sel] - by[sel]
+        deb = ee[sel] - be[sel]
+
+        offsets = np.zeros(m + 1, dtype=np.int64)
+        np.cumsum(ni, out=offsets[1:])
+        strip_of = np.repeat(np.arange(m), ni)
+        within = np.arange(total_n, dtype=np.int64) - offsets[strip_of]
+        # ts reproduces np.linspace(0, total, ni) exactly (start=0): ts = k*step_i
+        # with the final sample pinned to total.
+        step_i = totb / (ni - 1)
+        ts = within * step_i[strip_of]
+        ts[offsets[1:] - 1] = totb
+        local_t = ts / totb[strip_of]
+        sx = bx[sel][strip_of] + local_t * dxb[strip_of]
+        sy = by[sel][strip_of] + local_t * dyb[strip_of]
+        elev = be[sel][strip_of] + local_t * deb[strip_of]
+
+        cols = np.round((sx - x0) / res_x).astype(np.intp)
+        rows = np.round((y0 - sy) / res_y).astype(np.intp)
+        valid = (
+            (rows >= 0) & (rows < ny) & (cols >= 0) & (cols < nx) & np.isfinite(elev)
+        )
+        i = j
+        if not valid.any():
+            continue
+        flat = rows[valid] * nx + cols[valid]
+        ev = elev[valid]
+        order = np.argsort(flat, kind="stable")
+        fs = flat[order]
+        es = ev[order]
+        uniq, starts = np.unique(fs, return_index=True)
+        mins = np.minimum.reduceat(es, starts)
+        counts = np.diff(np.append(starts, len(fs)))
+        flat_min[uniq] = np.minimum(flat_min[uniq], mins)
+        flat_cnt[uniq] += counts
+
+    return min_arr, count_arr
+
+
 def rasterize_sparse_sections_20m(
     strips: gpd.GeoDataFrame,
     dem_da: xr.DataArray,
@@ -1161,21 +1526,22 @@ def rasterize_sparse_sections_20m(
 ) -> tuple[xr.DataArray, xr.DataArray]:
     x_vals, y_vals = _axes_from_bounds(tuple(dem_da.rio.bounds()), res_m)
     ny, nx = len(y_vals), len(x_vals)
-    min_arr = np.full((ny, nx), np.inf, dtype=np.float64)
-    count_arr = np.zeros((ny, nx), dtype=np.float64)
 
-    for row in strips.itertuples():
-        g = row.geometry
-        be = float(row.base_elev_m)
-        ee = float(row.endpoint_elev_m)
-        if g is None or g.is_empty or not np.isfinite(be) or not np.isfinite(ee):
-            continue
-        result = _sample_section_pixels(g, be, ee, x_vals, y_vals)
-        if result is None:
-            continue
-        rows, cols, elevs = result
-        np.minimum.at(min_arr, (rows, cols), elevs)
-        np.add.at(count_arr, (rows, cols), 1.0)
+    if strips.empty:
+        min_arr = np.full((ny, nx), np.inf, dtype=np.float64)
+        count_arr = np.zeros((ny, nx), dtype=np.float64)
+    else:
+        bx, by, ex, ey = _strip_endpoint_arrays(strips)
+        min_arr, count_arr = _rasterize_sparse_sections_from_arrays(
+            bx,
+            by,
+            ex,
+            ey,
+            strips["base_elev_m"].to_numpy(dtype=np.float64),
+            strips["endpoint_elev_m"].to_numpy(dtype=np.float64),
+            x_vals,
+            y_vals,
+        )
 
     ws = np.full((ny, nx), np.nan, dtype=np.float64)
     mask = count_arr > 0.0
@@ -1343,6 +1709,16 @@ def fill_sparse_sections_idw(
     post_smooth_m: float = 0.0,
     dem_min_da: xr.DataArray | None = None,
 ) -> tuple[xr.DataArray, xr.DataArray]:
+    """Strip-fill IDW: local inverse-distance fill of the sparse channel
+    cross-section strips inside the shallow FAC-REM solve (radius ~1 km).
+
+    This is the FAC pipeline's *strip-fill IDW* and is unrelated to the *WTE
+    IDW* in ``build_wte_regional_prior.py`` (k-NN interpolation of well
+    water-table elevations across a basin). They share only the acronym.
+
+    Returns ``(ws, rem)`` — a water-SURFACE elevation and the REM depth
+    (``DEM − ws``). The water surface is an elevation, not a depth.
+    """
     sparse = np.asarray(sparse_ws_da.values, dtype=np.float64)
     counts = np.asarray(sparse_count_da.values, dtype=np.float64)
     dem20 = np.asarray(dem20_da.values, dtype=np.float64)
@@ -1457,6 +1833,7 @@ def _effective_config_from_args(args: argparse.Namespace):
         "naked_fill_m": args.naked_fill_m,
         "halo_n": args.halo_n,
         "workers": args.workers,
+        "write_strip_debug": args.write_strip_debug,
         "burn_res_m": args.burn_res_m,
         "idw_radius_m": args.idw_radius_m,
         "idw_power": args.idw_power,
@@ -1518,6 +1895,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-fac-snap-cells", type=int, default=None)
     parser.add_argument("--base-smooth-stations", type=int, default=None)
     parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument(
+        "--strip-debug",
+        dest="write_strip_debug",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="write the diagnostic fac_normals_cross_sections.fgb strip layer "
+        "(--no-strip-debug skips it; default on, off in the CONUS builder)",
+    )
     parser.add_argument("--naip-path", type=Path, default=None)
     parser.add_argument("--ndvi-path", type=Path, default=None)
     parser.add_argument("--support-path", type=Path, default=None)
@@ -1579,6 +1964,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             cli.base_smooth_stations = cfg.base_smooth_stations
         if cli.workers is None:
             cli.workers = cfg.workers
+        if cli.write_strip_debug is None:
+            cli.write_strip_debug = cfg.write_strip_debug
         # Stash head-solve kwargs from config for main() to use.
         cli.head_solve_kwargs = cfg.head_solve_kwargs()
         cli.seed_from_nhd_class = cfg.seed_from_nhd_class
@@ -1622,6 +2009,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             cli.base_smooth_stations = 0
         if cli.workers is None:
             cli.workers = DEFAULT_WORKERS
+        if cli.write_strip_debug is None:
+            cli.write_strip_debug = True
         cli.head_solve_kwargs = {}
         cli.seed_from_nhd_class = False
 
@@ -1698,11 +2087,18 @@ def main(argv: list[str] | None = None) -> None:
     strips_before_filter = len(strips)
     if args.max_crossing_strip_m > 0:
         n_before = len(strips)
-        strips = _remove_long_crossing_strips(strips, args.max_crossing_strip_m)
-        print(
-            f"  crossing filter (>{args.max_crossing_strip_m:.0f} m): "
-            f"removed {n_before - len(strips)}, kept {len(strips)}"
-        )
+        long_mask = strips["dist_m"].to_numpy(dtype=float) > args.max_crossing_strip_m
+        if long_mask.any():
+            strips = _remove_long_crossing_strips(strips, args.max_crossing_strip_m)
+            print(
+                f"  crossing filter (>{args.max_crossing_strip_m:.0f} m): "
+                f"removed {n_before - len(strips)}, kept {len(strips)}"
+            )
+        else:
+            print(
+                f"  crossing filter (>{args.max_crossing_strip_m:.0f} m): "
+                "no long strips"
+            )
     diagnostics["strips"] = {
         "count_before_filter": int(strips_before_filter),
         "count": int(len(strips)),
@@ -1712,7 +2108,12 @@ def main(argv: list[str] | None = None) -> None:
         "edge": int((strips["hit_type"] == "edge").sum()),
     }
 
-    strips.to_file(args.out_dir / "fac_normals_cross_sections.fgb", driver="FlatGeobuf")
+    if args.write_strip_debug:
+        strips.to_file(
+            args.out_dir / "fac_normals_cross_sections.fgb", driver="FlatGeobuf"
+        )
+    else:
+        print("  skipping fac_normals_cross_sections.fgb (--no-strip-debug)")
 
     if (
         args.naip_path is not None
@@ -1854,8 +2255,11 @@ def main(argv: list[str] | None = None) -> None:
         sparse_hd_da.rio.to_raster(
             args.out_dir / f"fac_head_depth_sparse_{res_tag}.tif"
         )
+        # hd_idw_ws_da is the strip-fill-IDW WATER-SURFACE ELEVATION (DEM minus
+        # this gives the REM depth), NOT a depth. Name the file accordingly so it
+        # is never confused with the REM depth or the regional WTE surface.
         hd_idw_ws_da.rio.to_raster(
-            args.out_dir / f"fac_head_depth_idw_fill_{res_tag}.tif"
+            args.out_dir / f"fac_rem_water_surface_{res_tag}.tif"
         )
         hd_idw_rem_da.rio.to_raster(args.out_dir / f"fac_head_depth_rem_{res_tag}.tif")
         print(f"Wrote fac_head_depth_rem_{res_tag}.tif")
