@@ -1,0 +1,49 @@
+# Canonical scalable / NHD-free FAC-REM recipe (CONUS-wide, regime-general).
+#
+# THE accepted recipe for the scalable 10 m FAC-REM (WBT DEM-derived streams +
+# MODIS-JJA NDVI seed + JRC GSW permanent-water support). On 2026-06-25 this exact
+# parameter set produced good FAC-REM across montane MT (Ruby, Beaverhead, Big Hole)
+# AND arid NM/NV (Rio Grande ABQ, Upper Humboldt) -- it is regime-general, not
+# arid-tuned, so it is applied everywhere with no per-region adjustment.
+#
+# Inherits ruby_fac10_baseline.toml and overrides only what those accepted runs
+# changed from the baseline. Everything not listed here (sag targets, solver
+# weights, base distance_scale_m=4000, strip geometry, etc.) is inherited.
+#
+# Default profile for utils/build_scalable_fac_rem.py. Per-region/per-HUC8 configs
+# inherit this and supply only [paths]; ad-hoc CLI flags overlay on top.
+#
+# Validate ONLY against GWX unconfined/marginal wells + NHD springs
+# (utils/validate_fac_gwx_wells.py); never against Ma.
+
+profile = "ruby_fac10_baseline.toml"
+
+[seed]
+# Bare valley-floor / desert NDVI sigmoid (vs the S2 wetness recentering in the
+# baseline). Low mid + tight scale separates the irrigated/riparian floor from
+# desert and forested upland.
+ndvi_mid = 0.23
+ndvi_scale = 0.035
+
+[strips]
+# Longer cross-section reach for the wide, sparsely-channeled valleys the dense
+# WBT network still leaves gappy; bounded naked-fill so inter-channel cells get a
+# water surface instead of nodata.
+max_crossing_strip_m = 2000.0
+naked_fill_m = 300.0
+
+[raster]
+idw_radius_m = 450.0
+
+[propagation]
+# down_distance_scale_m tightened from the 20000 default (base leaves it unset);
+# elevation/strahler scales relaxed for the longer mainstems.
+down_distance_scale_m = 8000.0
+elevation_scale_m = 15.0
+strahler_distance_scale = 1.0
+
+[solver]
+# Diverted/losing semi-arid mainstems: table sits ~1.5 m below the bed; keep a
+# minimum off-support depth so dry uplands don't pin to 0.
+below_bed_offset_m = 1.5
+d_min_off_support_m = 1.0

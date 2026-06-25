@@ -1,10 +1,13 @@
-"""Build a scalable, NHD-free FAC-REM for any region in CONUS.
+"""Build a scalable, NHD-free FAC-REM for one region or a statewide HUC8 batch.
 
-Reproduces the accepted Mesilla recipe (configs/rem/nm_mesilla_modis_gsw.toml,
-the best regional FAC-REM so far) end to end from CONUS-available substrate only
--- no LiDAR, no NAIP, no NHD. Every input is derived from sources that exist
-everywhere in the lower 48, so the same command works for any HUC8, AOI polygon,
-or bounding box.
+Runs the accepted regime-general 10 m FAC-REM recipe end to end from
+CONUS-available substrate only -- no LiDAR, no NAIP, no NHD. Every input is derived
+from sources that exist everywhere in the lower 48, so the same command works for
+any HUC8, AOI polygon, bounding box, or whole state. The recipe lives in the default
+profile ``configs/rem/profiles/conus_fac_rem_scalable.toml`` (the 2026-06-25 values
+verified across montane MT + arid NM/NV); it is the single source of truth, and the
+``--ndvi-*`` / ``--*-scale-m`` / etc. flags are a pure override layer (default None =
+inherit the profile). It is NOT arid-specific.
 
 Pipeline (each stage is idempotent -- existing outputs are reused unless --force):
 
@@ -22,17 +25,24 @@ Pipeline (each stage is idempotent -- existing outputs are reused unless --force
                 thresholded to PERMANENT water (occurrence >= --occ-threshold),
                 nearest-matched to the DEM grid. Isolates the perennial mainstem
                 and excludes flood-irrigation (the NAIP-NDWI failure mode).
-  5. CONFIG   : write a rem_fac TOML inheriting the FAC10 profile, with the
-                arid-regime overrides (defaults below = the accepted Mesilla
-                values) and [paths] pointing at the built inputs.
+  5. CONFIG   : write a rem_fac TOML inheriting the scalable profile (+ any explicit
+                CLI overrides) with [paths] pointing at the built inputs.
   6. RUN      : invoke ``python -m handily.rem_fac`` as a subprocess (skip with
                 --no-run) -> fac_head_depth_rem_10m.tif (depth) +
                 fac_rem_water_surface_10m.tif (elevation).
 
-Region is given exactly one of:
+Single region -- exactly one of:
   --huc8 CODE          resolve the polygon from the WBD HUC8 layer.
   --aoi PATH           a polygon vector file (any CRS) -> reprojected to 5070.
   --bbox MINX MINY MAXX MAXY [--bbox-crs EPSG]   an explicit box.
+
+Statewide / batch -- either of (switches to batch mode):
+  --state NM [MT NV ...]   every HUC8 touching these states (national WBD layer).
+  --huc8-list FILE         one HUC8 code per line.
+  Each HUC8 -> <out-root>/<huc8>/; a shared <out-root>/dem_tiles/ cache is reused
+  across HUC8s; done HUC8s (marker + REM raster) are skipped on rerun; large
+  re-derivable intermediates are deleted on success (--keep-intermediates opts out);
+  one HUC8 failure never aborts the batch (rerun retries the failures).
 
 Validate the result ONLY against GWX unconfined/marginal wells + NHD springs
 (utils/validate_fac_gwx_wells.py); never against Ma. Two knobs widen the filled
@@ -44,20 +54,22 @@ regional tables (see notes/regional_fac_rem.md).
 
 Examples
 --------
-Reproduce Mesilla exactly:
+Reproduce one basin (bare command = the canonical profile recipe):
   uv run python utils/build_scalable_fac_rem.py --huc8 13030102 --name mesilla_repro
 
-A new basin from a bbox:
-  uv run python utils/build_scalable_fac_rem.py --bbox -107.0 32.0 -106.5 32.6 \
-      --name some_basin --out-dir /data/ssd2/handily/scalable_fac_rem/some_basin
+Whole state of New Mexico:
+  uv run python utils/build_scalable_fac_rem.py --state NM \
+      --out-root /data/ssd2/handily/nm/fac_rem
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import geopandas as gpd
@@ -74,14 +86,49 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("build_scalable_fac_rem")
 
 REPO = Path(__file__).resolve().parents[1]
-DEFAULT_PROFILE = REPO / "configs/rem/profiles/ruby_fac10_baseline.toml"
+DEFAULT_PROFILE = REPO / "configs/rem/profiles/conus_fac_rem_scalable.toml"
 
 # CONUS substrate (exists everywhere in the lower 48).
 HUC8_POLYS = "/data/ssd2/handily/conus/wte_gnn/huc8_polys.parquet"
+# Authoritative national HUC8 layer for batch selection: carries the
+# pipe-separated `states` column AND the 5070 geometry, so a per-state batch
+# needs no other lookup.
+WBD_HUC8 = "/nas/hydrography/HUC_Boundaries/wbd_national/wbdhu8_5070.parquet"
 MODIS_JJA = "/data/ssd2/handily/conus/covariates/modis_ndvi_jja_mean.tif"
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 
 REM_RASTER = "fac_head_depth_rem_10m.tif"  # depth product rem_fac writes
+WS_RASTER = "fac_rem_water_surface_10m.tif"  # strip-fill water SURFACE (elevation)
+DONE_MARKER = ".fac_rem_done"  # per-HUC8 completion sentinel (JSON)
+
+# Large, fully re-derivable intermediates deleted after a HUC8 succeeds (statewide
+# disk control). Products (REM depth + water surface), the generated config,
+# fac_rem_run.json, the seed/support evidence rasters, streams_regional.fgb, and
+# basin_boundary.fgb are KEPT. The shared dem_tiles/ cache is kept until the whole
+# batch finishes (it is not per-HUC8).
+_CLEANUP_REGION = (
+    # per-HUC8 DEM clip + build_regional_dem scratch
+    "dem_10m.tif",
+    "dem_10m.vrt",
+    "basin_cutline.fgb",
+    # WhiteboxTools FAC intermediates (compute_regional_fac)
+    "dem_10m_filled.tif",
+    "d8_pointer.tif",
+    "flow_accumulation.tif",
+    "streams_10m.tif",
+    "stream_order.tif",
+    "streams_raw.shp",
+    "streams_raw.shx",
+    "streams_raw.dbf",
+    "streams_raw.prj",
+    "streams_raw.cpg",
+)
+# rem_fac burn intermediates (live in the rem output dir alongside the products).
+_CLEANUP_REM = (
+    "fac_head_depth_sparse_10m.tif",
+    "fac_normals_smoothed_dem.tif",
+    "fac_normals_cross_sections.fgb",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -220,40 +267,62 @@ def write_config(
     rem_out: Path,
     args,
 ) -> Path:
-    """Write a rem_fac TOML: FAC10 profile + arid-regime overrides + [paths]."""
-    raster_block = ""
-    if args.idw_radius_m is not None:
-        raster_block = f"\n[raster]\nidw_radius_m = {args.idw_radius_m}\n"
+    """Write a rem_fac TOML inheriting the profile, overlaying ONLY explicitly-set
+    recipe overrides + the runtime worker count + [paths].
 
-    cfg_path.write_text(
-        f"# Auto-generated by utils/build_scalable_fac_rem.py for '{args.name}'.\n"
-        f"# Scalable / NHD-free FAC-REM (WBT streams + MODIS-JJA seed + JRC GSW\n"
-        f"# support). Reproduces the accepted Mesilla recipe. Validate ONLY against\n"
-        f"# GWX unconfined wells + NHD springs, never against Ma.\n\n"
-        f'profile = "{profile}"\n\n'
-        "[seed]\n"
-        f"ndvi_mid = {args.ndvi_mid}\n"
-        f"ndvi_scale = {args.ndvi_scale}\n\n"
-        "[strips]\n"
-        f"max_crossing_strip_m = {args.max_crossing_strip_m}\n"
-        f"naked_fill_m = {args.naked_fill_m}\n"
-        f"workers = {args.workers}\n"
-        f"{raster_block}\n"
-        "[propagation]\n"
-        f"down_distance_scale_m = {args.down_distance_scale_m}\n"
-        f"elevation_scale_m = {args.elevation_scale_m}\n"
-        f"strahler_distance_scale = {args.strahler_distance_scale}\n\n"
-        "[solver]\n"
-        f"below_bed_offset_m = {args.below_bed_offset_m}\n"
-        f"d_min_off_support_m = {args.d_min_off_support_m}\n\n"
-        "[paths]\n"
-        f'dem_path = "{dem_path}"\n'
-        f'streams_path = "{streams_path}"\n'
-        f'fac_path = "{fac_path}"\n'
-        f'ndvi_path = "{seed_path}"\n'
-        f'support_path = "{support_path}"\n'
-        f'out_dir = "{rem_out}"\n'
-    )
+    The profile (default ``conus_fac_rem_scalable.toml``) is the single source of
+    truth for the recipe. Each recipe knob's argparse default is ``None``; a block
+    or key is emitted here only when the operator passed a value, so an unset knob
+    inherits from the profile and the CLI is a pure override layer. (Previously the
+    argparse defaults were baked into every generated config, silently overriding
+    the profile -- which is how the defaults became the de-facto recipe.)
+    """
+    # (section, key, value) for every override the operator explicitly set.
+    overrides: dict[str, dict[str, object]] = {}
+
+    def put(section: str, key: str, value):
+        if value is not None:
+            overrides.setdefault(section, {})[key] = value
+
+    put("seed", "ndvi_mid", args.ndvi_mid)
+    put("seed", "ndvi_scale", args.ndvi_scale)
+    put("strips", "max_crossing_strip_m", args.max_crossing_strip_m)
+    put("strips", "naked_fill_m", args.naked_fill_m)
+    # workers is a runtime knob (never affects output); always pin it explicitly.
+    overrides.setdefault("strips", {})["workers"] = args.workers
+    put("raster", "idw_radius_m", args.idw_radius_m)
+    put("propagation", "down_distance_scale_m", args.down_distance_scale_m)
+    put("propagation", "elevation_scale_m", args.elevation_scale_m)
+    put("propagation", "strahler_distance_scale", args.strahler_distance_scale)
+    put("solver", "below_bed_offset_m", args.below_bed_offset_m)
+    put("solver", "d_min_off_support_m", args.d_min_off_support_m)
+
+    lines = [
+        f"# Auto-generated by utils/build_scalable_fac_rem.py for '{args.name}'.",
+        "# Scalable / NHD-free FAC-REM (WBT streams + MODIS-JJA seed + JRC GSW",
+        "# support). Recipe is defined by the inherited profile; only explicit CLI",
+        "# overrides + [paths] appear below. Validate ONLY against GWX unconfined",
+        "# wells + NHD springs, never against Ma.",
+        "",
+        f'profile = "{profile}"',
+        "",
+    ]
+    for section, kv in overrides.items():
+        lines.append(f"[{section}]")
+        for key, value in kv.items():
+            lines.append(f"{key} = {value}")
+        lines.append("")
+    lines += [
+        "[paths]",
+        f'dem_path = "{dem_path}"',
+        f'streams_path = "{streams_path}"',
+        f'fac_path = "{fac_path}"',
+        f'ndvi_path = "{seed_path}"',
+        f'support_path = "{support_path}"',
+        f'out_dir = "{rem_out}"',
+        "",
+    ]
+    cfg_path.write_text("\n".join(lines))
     log.info("wrote config %s", cfg_path)
     return cfg_path
 
@@ -263,80 +332,19 @@ def write_config(
 # ---------------------------------------------------------------------------
 
 
-def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    # Region (exactly one)
-    p.add_argument("--huc8", help="HUC8 code (resolved from the WBD HUC8 layer)")
-    p.add_argument("--aoi", help="polygon vector file (any CRS)")
-    p.add_argument(
-        "--bbox", nargs=4, type=float, metavar=("MINX", "MINY", "MAXX", "MAXY")
-    )
-    p.add_argument(
-        "--bbox-crs", default="EPSG:4326", help="CRS of --bbox (default EPSG:4326)"
-    )
-    p.add_argument("--name", help="region label for output naming")
-    p.add_argument(
-        "--out-dir",
-        help="region working dir (default /data/ssd2/handily/scalable_fac_rem/<name>)",
-    )
+def build_one_region(
+    poly, name: str, out_dir: Path, args, *, dem_tiles_dir: Path | None = None
+) -> Path | None:
+    """Build the scalable 10 m FAC-REM for one region.
 
-    # Inputs
-    p.add_argument(
-        "--profile", default=str(DEFAULT_PROFILE), help="rem_fac profile TOML"
-    )
-    p.add_argument(
-        "--modis-jja", default=MODIS_JJA, help="MODIS-JJA NDVI climatology raster"
-    )
-    p.add_argument("--halo-km", type=float, default=5.0, help="DEM/streams halo (km)")
-    p.add_argument(
-        "--stream-threshold", type=int, default=5000, help="WBT extract_streams cells"
-    )
-    p.add_argument(
-        "--occ-threshold",
-        type=int,
-        default=90,
-        help="GSW permanent-water occurrence %%",
-    )
-    p.add_argument(
-        "--workers",
-        type=int,
-        default=32,
-        help="parallelism for WBT FAC + rem_fac strip-gen (worker count never "
-        "affects output, only runtime)",
-    )
-
-    # Arid-regime overrides (defaults = the accepted Mesilla values)
-    p.add_argument("--ndvi-mid", type=float, default=0.23)
-    p.add_argument("--ndvi-scale", type=float, default=0.035)
-    p.add_argument("--max-crossing-strip-m", type=float, default=1500.0)
-    p.add_argument("--naked-fill-m", type=float, default=300.0)
-    p.add_argument(
-        "--idw-radius-m", type=float, default=None, help="override profile IDW radius"
-    )
-    p.add_argument("--down-distance-scale-m", type=float, default=8000.0)
-    p.add_argument("--elevation-scale-m", type=float, default=15.0)
-    p.add_argument("--strahler-distance-scale", type=float, default=1.0)
-    p.add_argument("--below-bed-offset-m", type=float, default=1.5)
-    p.add_argument("--d-min-off-support-m", type=float, default=1.0)
-
-    # Control
-    p.add_argument(
-        "--no-run", action="store_true", help="prep inputs + write config, skip rem_fac"
-    )
-    p.add_argument(
-        "--force", action="store_true", help="rebuild seed/support even if present"
-    )
-    args = p.parse_args(argv)
-
-    poly, name = resolve_region(args)
+    Returns the REM depth raster path on success, or ``None`` when ``--no-run``
+    (inputs + config prepped, rem_fac skipped). Raises ``RuntimeError`` on any hard
+    failure (no DEM tiles, rem_fac non-zero, missing output) so a batch caller can
+    catch it with ``except Exception`` and keep going (``SystemExit`` would not be
+    caught and would abort the batch).
+    """
     args.name = name
-    out_dir = (
-        Path(args.out_dir)
-        if args.out_dir
-        else Path(f"/data/ssd2/handily/scalable_fac_rem/{name}")
-    )
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     log.info("name=%s out_dir=%s", name, out_dir)
 
@@ -344,11 +352,15 @@ def main(argv: list[str] | None = None) -> None:
     halo = poly.buffer(halo_m)
     bbox_wgs84 = tuple(gpd.GeoSeries([halo], crs=5070).to_crs(4326).total_bounds)
 
-    # 1. DEM
-    dem_tiles = out_dir / "dem_tiles"
+    # 1. DEM. In a batch, dem_tiles_dir is the shared out-root cache so adjacent
+    # HUC8 halos reuse downloaded 3DEP tiles (download_3dep_10m_tiles is
+    # concurrency-safe: per-PID temp + atomic rename + skip-if-exists).
+    dem_tiles = (
+        Path(dem_tiles_dir) if dem_tiles_dir is not None else out_dir / "dem_tiles"
+    )
     tiles = regional_fac.download_3dep_10m_tiles(bbox_wgs84, dem_tiles)
     if not tiles:
-        raise SystemExit(f"no 3DEP tiles for bbox {bbox_wgs84} (border/ocean?)")
+        raise RuntimeError(f"no 3DEP tiles for bbox {bbox_wgs84} (border/ocean?)")
     dem_path = out_dir / "dem_10m.tif"
     regional_fac.build_regional_dem(
         tiles,
@@ -397,9 +409,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.no_run:
         log.info("--no-run: inputs + config ready. Run rem_fac with:")
         log.info("  uv run python -m handily.rem_fac --config %s --no-strip-debug", cfg)
-        return
+        return None
 
-    # 6. rem_fac
+    # 6. rem_fac (fresh subprocess so one failure is isolated)
     rem_out.mkdir(parents=True, exist_ok=True)
     run_log = out_dir / "rem_fac.log"
     log.info("running rem_fac (log: %s) ...", run_log)
@@ -417,17 +429,259 @@ def main(argv: list[str] | None = None) -> None:
             stderr=subprocess.STDOUT,
         )
     if proc.returncode != 0:
-        raise SystemExit(f"rem_fac failed (rc={proc.returncode}); see {run_log}")
+        raise RuntimeError(f"rem_fac failed (rc={proc.returncode}); see {run_log}")
 
     rem_path = rem_out / REM_RASTER
     if not rem_path.exists():
-        raise SystemExit(f"rem_fac produced no REM raster at {rem_path}")
+        raise RuntimeError(f"rem_fac produced no REM raster at {rem_path}")
     log.info("done -> %s", rem_path)
     log.info(
         "pull for QGIS: rsync -rav zoran:%s ~%s",
         rem_out,
         str(rem_out).replace("/data/ssd2", "/data", 1),
     )
+    return rem_path
+
+
+# ---------------------------------------------------------------------------
+# Batch mode (statewide / HUC8-list)
+# ---------------------------------------------------------------------------
+
+
+def resolve_batch_huc8s(args) -> list[tuple[str, object]]:
+    """Return [(huc8, poly_5070), ...] for --state and/or --huc8-list.
+
+    Both codes and geometry come from the authoritative national WBD HUC8 layer
+    (``WBD_HUC8``), whose ``states`` column is a pipe-separated list of the state
+    abbreviations a HUC8 touches.
+    """
+    gdf = gpd.read_parquet(WBD_HUC8)
+    if "huc8" not in gdf.columns:
+        raise SystemExit(f"{WBD_HUC8} lacks a 'huc8' column")
+    if gdf.crs is None or gdf.crs.to_epsg() != 5070:
+        gdf = gdf.to_crs(5070)
+    gdf = gdf.drop_duplicates("huc8").set_index("huc8")
+
+    codes: list[str] = []
+    if args.huc8_list:
+        codes += [
+            ln.strip()
+            for ln in Path(args.huc8_list).read_text().splitlines()
+            if ln.strip() and not ln.startswith("#")
+        ]
+    if args.state:
+        want = {s.upper() for s in args.state}
+        touched = gdf["states"].fillna("").str.upper().str.split("|")
+        mask = touched.apply(lambda lst: bool(want.intersection(lst)))
+        codes += gdf.index[mask].tolist()
+
+    seen: set[str] = set()
+    targets: list[tuple[str, object]] = []
+    for c in codes:
+        if c in seen:
+            continue
+        seen.add(c)
+        if c not in gdf.index:
+            log.warning("HUC8 %s not in %s -> skip", c, WBD_HUC8)
+            continue
+        targets.append((c, gdf.loc[c, "geometry"]))
+    if not targets:
+        raise SystemExit("no HUC8 targets resolved (check --state / --huc8-list)")
+    return targets
+
+
+def _write_marker(marker: Path, huc8: str, profile: str, rem_path: Path) -> None:
+    """Write the per-HUC8 completion sentinel only after the REM raster is on disk."""
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps(
+            {
+                "huc8": huc8,
+                "profile": str(profile),
+                "rem_path": str(rem_path),
+                "built_at": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+    )
+
+
+def _cleanup_region(out_dir: Path, rem_path: Path) -> None:
+    """Delete large re-derivable intermediates after a HUC8 succeeds. Keeps the
+    products, generated config, fac_rem_run.json, seed/support evidence,
+    streams_regional.fgb, and basin_boundary.fgb."""
+    removed = 0
+    for name in _CLEANUP_REGION:
+        p = out_dir / name
+        if p.exists():
+            p.unlink()
+            removed += 1
+    rem_dir = rem_path.parent
+    for name in _CLEANUP_REM:
+        p = rem_dir / name
+        if p.exists():
+            p.unlink()
+            removed += 1
+    log.info("cleaned %d intermediates in %s", removed, out_dir)
+
+
+def run_batch(args) -> None:
+    """Iterate the resolved HUC8 set, build each, resume-skip the done ones, and
+    tally built/skipped/failed. One HUC8 failure never aborts the batch."""
+    out_root = Path(args.out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+    shared_tiles = out_root / "dem_tiles"  # reused across HUC8s
+    targets = resolve_batch_huc8s(args)
+    log.info("batch: %d HUC8 target(s) -> %s", len(targets), out_root)
+
+    built = skipped = failed = 0
+    failed_ids: list[str] = []
+    for huc8, poly in targets:
+        out_dir = out_root / huc8
+        marker = out_dir / DONE_MARKER
+        rem_path = out_dir / "rem" / f"{huc8}_scalable" / REM_RASTER
+        if not args.force and marker.exists() and rem_path.exists():
+            log.info("[%s] done (marker + REM raster) -> skip", huc8)
+            skipped += 1
+            continue
+        # Invalidate the completion state BEFORE any (re)build so an interrupted
+        # or failed rebuild can never leave a believable-complete marker behind.
+        marker.unlink(missing_ok=True)
+        try:
+            produced = build_one_region(
+                poly, huc8, out_dir, args, dem_tiles_dir=shared_tiles
+            )
+        except Exception as e:  # noqa: BLE001 - isolate per-HUC8 failures
+            log.exception("[%s] build failed: %s", huc8, e)
+            failed += 1
+            failed_ids.append(huc8)
+            continue
+        if args.no_run:
+            skipped += 1  # prepped, not built
+            continue
+        if produced is None or not produced.exists():
+            log.error("[%s] no REM raster after build", huc8)
+            failed += 1
+            failed_ids.append(huc8)
+            continue
+        if not args.keep_intermediates:
+            _cleanup_region(out_dir, produced)
+        _write_marker(marker, huc8, args.profile, produced)
+        built += 1
+
+    log.info(
+        "batch complete: built=%d skipped=%d failed=%d (of %d)",
+        built,
+        skipped,
+        failed,
+        len(targets),
+    )
+    if failed_ids:
+        log.warning(
+            "%d failed HUC8(s) -> rerun to retry: %s", len(failed_ids), failed_ids
+        )
+
+
+def main(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    # Single region (exactly one of these); ignored in batch mode.
+    p.add_argument("--huc8", help="HUC8 code (resolved from the WBD HUC8 layer)")
+    p.add_argument("--aoi", help="polygon vector file (any CRS)")
+    p.add_argument(
+        "--bbox", nargs=4, type=float, metavar=("MINX", "MINY", "MAXX", "MAXY")
+    )
+    p.add_argument(
+        "--bbox-crs", default="EPSG:4326", help="CRS of --bbox (default EPSG:4326)"
+    )
+    p.add_argument("--name", help="region label for output naming")
+    p.add_argument(
+        "--out-dir",
+        help="single-region working dir (default /data/ssd2/handily/scalable_fac_rem/<name>)",
+    )
+
+    # Batch mode (statewide / HUC8-list). Either flag switches to batch.
+    p.add_argument(
+        "--state",
+        nargs="*",
+        help="build every HUC8 touching these state abbrevs (e.g. --state NM MT NV)",
+    )
+    p.add_argument("--huc8-list", help="file with one HUC8 code per line")
+    p.add_argument(
+        "--out-root",
+        default="/data/ssd2/handily/scalable_fac_rem",
+        help="batch root; each HUC8 -> <out-root>/<huc8>/, shared <out-root>/dem_tiles/",
+    )
+    p.add_argument(
+        "--keep-intermediates",
+        action="store_true",
+        help="batch: keep large re-derivable intermediates (default: delete on success)",
+    )
+
+    # Inputs
+    p.add_argument(
+        "--profile", default=str(DEFAULT_PROFILE), help="rem_fac profile TOML"
+    )
+    p.add_argument(
+        "--modis-jja", default=MODIS_JJA, help="MODIS-JJA NDVI climatology raster"
+    )
+    p.add_argument("--halo-km", type=float, default=5.0, help="DEM/streams halo (km)")
+    p.add_argument(
+        "--stream-threshold", type=int, default=5000, help="WBT extract_streams cells"
+    )
+    p.add_argument(
+        "--occ-threshold",
+        type=int,
+        default=90,
+        help="GSW permanent-water occurrence %%",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=32,
+        help="parallelism for WBT FAC + rem_fac strip-gen (worker count never "
+        "affects output, only runtime)",
+    )
+
+    # Recipe overrides. Default None -> inherit the profile (the single source of
+    # truth, conus_fac_rem_scalable.toml). Pass a value only to deviate from it.
+    p.add_argument("--ndvi-mid", type=float, default=None)
+    p.add_argument("--ndvi-scale", type=float, default=None)
+    p.add_argument("--max-crossing-strip-m", type=float, default=None)
+    p.add_argument("--naked-fill-m", type=float, default=None)
+    p.add_argument("--idw-radius-m", type=float, default=None)
+    p.add_argument("--down-distance-scale-m", type=float, default=None)
+    p.add_argument("--elevation-scale-m", type=float, default=None)
+    p.add_argument("--strahler-distance-scale", type=float, default=None)
+    p.add_argument("--below-bed-offset-m", type=float, default=None)
+    p.add_argument("--d-min-off-support-m", type=float, default=None)
+
+    # Control
+    p.add_argument(
+        "--no-run", action="store_true", help="prep inputs + write config, skip rem_fac"
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="rebuild even if present (seed/support; in batch, a done HUC8 too)",
+    )
+    args = p.parse_args(argv)
+
+    if args.state or args.huc8_list:
+        run_batch(args)
+        return
+
+    poly, name = resolve_region(args)
+    out_dir = (
+        Path(args.out_dir)
+        if args.out_dir
+        else Path(f"/data/ssd2/handily/scalable_fac_rem/{name}")
+    )
+    try:
+        build_one_region(poly, name, out_dir, args)
+    except RuntimeError as e:
+        raise SystemExit(str(e))
 
 
 if __name__ == "__main__":
