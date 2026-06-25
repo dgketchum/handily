@@ -67,17 +67,23 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 import planetary_computer as pc
+import rasterio
+import requests
 import rioxarray  # noqa: F401 - registers the .rio accessor
 from pystac_client import Client
+from pystac_client.exceptions import APIError
 from rasterio.enums import Resampling
+from rasterio.errors import RasterioIOError
 from shapely.geometry import box
 
 from handily import regional_fac
@@ -96,6 +102,11 @@ HUC8_POLYS = "/data/ssd2/handily/conus/wte_gnn/huc8_polys.parquet"
 WBD_HUC8 = "/nas/hydrography/HUC_Boundaries/wbd_national/wbdhu8_5070.parquet"
 MODIS_JJA = "/data/ssd2/handily/conus/covariates/modis_ndvi_jja_mean.tif"
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+# Local JRC-GSW occurrence cache (populated once by utils/cache_gsw_tiles.py).
+# When the tiles covering a region are present here, build_support reads them
+# directly and never touches MPC -- removing the per-HUC8 live-MPC dependency for
+# this static dataset. MPC stays the fallback for any region not yet cached.
+GSW_CACHE_DIR = Path("/nas/hydrography/gsw/occurrence")
 
 REM_RASTER = "fac_head_depth_rem_10m.tif"  # depth product rem_fac writes
 WS_RASTER = "fac_rem_water_surface_10m.tif"  # strip-fill water SURFACE (elevation)
@@ -179,6 +190,37 @@ def _open(path):
     return da.rio.set_spatial_dims(x_dim="x", y_dim="y")
 
 
+# MPC's STAC API and signed COG reads intermittently time out under load (observed
+# failing repeatedly 2026-06-25 -- "request exceeded the maximum allowed time"); the
+# same query succeeds on retry. Retry ONLY these known-transient classes so a
+# persistent/real error still surfaces rather than being masked.
+_TRANSIENT = (APIError, RasterioIOError, requests.exceptions.RequestException)
+
+
+def _with_retries(fn, *, what, tries=5, base_delay=3.0):
+    """Run ``fn()``, retrying transient MPC/network failures with exponential backoff.
+
+    Re-raises the last error after ``tries`` attempts (so a HUC8 with a genuinely
+    unreachable input still fails -- and, in batch mode, fails just that HUC8).
+    """
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+        except _TRANSIENT as e:
+            if attempt == tries:
+                raise
+            delay = base_delay * 2 ** (attempt - 1)
+            log.warning(
+                "%s failed (attempt %d/%d): %s -- retrying in %.0fs",
+                what,
+                attempt,
+                tries,
+                e,
+                delay,
+            )
+            time.sleep(delay)
+
+
 def build_seed(dem_path: Path, out_path: Path, modis_jja: str, force: bool) -> Path:
     """MODIS-JJA NDVI climatology -> bilinear to the DEM grid."""
     if out_path.exists() and not force:
@@ -202,6 +244,38 @@ def build_seed(dem_path: Path, out_path: Path, modis_jja: str, force: bool) -> P
     return out_path
 
 
+def _local_gsw_tiles(
+    bbox4326: tuple[float, float, float, float],
+) -> list[Path] | None:
+    """Cached GSW occurrence tiles that FULLY cover ``bbox4326`` (lon/lat).
+
+    Returns the intersecting tile paths only when their union contains the bbox, so
+    a partially-cached region falls back to MPC instead of silently dropping water
+    support over the uncovered part. Returns None when the cache is absent, empty,
+    or incomplete for this bbox.
+    """
+    if not GSW_CACHE_DIR.is_dir():
+        return None
+    tiles = sorted(GSW_CACHE_DIR.glob("*.tif"))
+    if not tiles:
+        return None
+    want = box(*bbox4326)
+    hits: list[Path] = []
+    union = None
+    for t in tiles:
+        with rasterio.open(t) as ds:
+            tb = ds.bounds
+        geom = box(tb.left, tb.bottom, tb.right, tb.top)
+        if geom.intersects(want):
+            hits.append(t)
+            union = geom if union is None else union.union(geom)
+    # buffer ~0.1 m (1e-6 deg) so float noise at the shared 10-deg tile seams does
+    # not spuriously fail the coverage test for a bbox spanning two abutting tiles.
+    if not hits or not union.buffer(1e-6).contains(want):
+        return None
+    return hits
+
+
 def build_support(
     dem_path: Path, out_path: Path, occ_threshold: int, force: bool
 ) -> Path:
@@ -217,26 +291,52 @@ def build_support(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     dem = _open(dem_path)
     bbox4326 = tuple(dem.rio.transform_bounds("EPSG:4326"))
-    log.info("support: query MPC jrc-gsw for bbox %s", bbox4326)
-    items = list(
-        Client.open(STAC_URL).search(collections=["jrc-gsw"], bbox=bbox4326).items()
-    )
-    if not items:
-        raise SystemExit(f"no jrc-gsw items for bbox {bbox4326}")
-    log.info("  %d GSW tile(s): %s", len(items), [it.id for it in items])
 
-    acc = None
-    template = None
-    for it in items:
-        href = pc.sign(it).assets["occurrence"].href
-        # occurrence 0-100 (% of valid months with water); NaN = no valid obs.
-        occ = _open(href).rio.clip_box(*bbox4326)
-        permanent = (occ >= occ_threshold).astype("uint8")
-        permanent = permanent.rio.write_crs(occ.rio.crs).rio.write_nodata(0)
-        m = permanent.rio.reproject_match(dem, resampling=Resampling.nearest)
-        m = m.fillna(0).astype("uint8")
-        template = m
-        acc = m.values if acc is None else np.maximum(acc, m.values)
+    def _accumulate(sources):
+        # Each GSW occurrence source (0-100 = % of valid months with water; NaN = no
+        # valid obs) is clipped, thresholded to permanent water, reproject_match'd to
+        # the DEM grid, and combined with a per-pixel max so a region spanning several
+        # tiles composes correctly. Shared by the local-cache and MPC paths.
+        acc = None
+        template = None
+        for src in sources:
+            occ = _open(src).rio.clip_box(*bbox4326)
+            permanent = (occ >= occ_threshold).astype("uint8")
+            permanent = permanent.rio.write_crs(occ.rio.crs).rio.write_nodata(0)
+            m = permanent.rio.reproject_match(dem, resampling=Resampling.nearest)
+            m = m.fillna(0).astype("uint8")
+            template = m
+            acc = m.values if acc is None else np.maximum(acc, m.values)
+        return template, acc
+
+    local = _local_gsw_tiles(bbox4326)
+    if local is not None:
+        log.info(
+            "support: %d local GSW tile(s) cover bbox %s -> %s",
+            len(local),
+            bbox4326,
+            [t.name for t in local],
+        )
+        template, acc = _accumulate([str(t) for t in local])
+    else:
+        log.info("support: query MPC jrc-gsw for bbox %s", bbox4326)
+
+        def _fetch():
+            # Search + sign + read + reproject as one unit so any transient failure
+            # retries from a clean STAC search (signed COG URLs expire; reproject is
+            # idempotent so redoing it is harmless).
+            items = list(
+                Client.open(STAC_URL)
+                .search(collections=["jrc-gsw"], bbox=bbox4326)
+                .items()
+            )
+            if not items:
+                # GSW tiles cover all land; empty here is a real failure, not transient.
+                raise RuntimeError(f"no jrc-gsw items for bbox {bbox4326}")
+            log.info("  %d GSW tile(s) [MPC]: %s", len(items), [it.id for it in items])
+            return _accumulate([pc.sign(it).assets["occurrence"].href for it in items])
+
+        template, acc = _with_retries(_fetch, what="MPC jrc-gsw fetch")
 
     support = template.copy(data=acc)
     support.rio.to_raster(out_path, dtype="uint8", compress="deflate", tiled=True)
@@ -332,6 +432,27 @@ def write_config(
 # ---------------------------------------------------------------------------
 
 
+def _force_clean_region(out_dir: Path) -> None:
+    """Wipe a region's derived outputs so a --force rebuild regenerates EVERY stage.
+
+    ``build_regional_dem`` / ``compute_regional_fac`` skip-if-exists and take no force
+    flag, so without this a forced rebuild would reuse the stale DEM + streams and
+    silently ignore a changed --halo-km / --stream-threshold / profile (only the seed
+    and support, which do take force, would rebuild -- on top of the old grid). Remove
+    everything except a local ``dem_tiles/`` cache (single-region layout); the batch's
+    shared tile cache lives in the out-root, outside out_dir, so it is never touched.
+    """
+    if not out_dir.is_dir():
+        return
+    for child in out_dir.iterdir():
+        if child.name == "dem_tiles":  # preserve the expensive 3DEP download cache
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
 def build_one_region(
     poly, name: str, out_dir: Path, args, *, dem_tiles_dir: Path | None = None
 ) -> Path | None:
@@ -347,6 +468,12 @@ def build_one_region(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     log.info("name=%s out_dir=%s", name, out_dir)
+
+    # --force means rebuild from scratch: clear stale derived outputs so a changed
+    # halo / threshold / profile actually takes effect (the DEM + FAC stages
+    # skip-if-exists and would otherwise reuse the old grid).
+    if args.force:
+        _force_clean_region(out_dir)
 
     halo_m = args.halo_km * 1000.0
     halo = poly.buffer(halo_m)
@@ -626,7 +753,16 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--modis-jja", default=MODIS_JJA, help="MODIS-JJA NDVI climatology raster"
     )
-    p.add_argument("--halo-km", type=float, default=5.0, help="DEM/streams halo (km)")
+    p.add_argument(
+        "--halo-km",
+        type=float,
+        default=10.0,
+        help="DEM/streams halo (km). 10 km matches the validated 2026-06-25 MT/NM/NV "
+        "runs: a wider halo captures the upland catchment that drains into the valley, "
+        "so tributaries reach the stream threshold farther upstream (denser network, "
+        "fuller strip-fill coverage) and adjacent HUC8 tiles overlap enough to heal "
+        "seams. 5 km under-covers the interior (~11% coverage loss vs the 10 km run).",
+    )
     p.add_argument(
         "--stream-threshold", type=int, default=5000, help="WBT extract_streams cells"
     )
