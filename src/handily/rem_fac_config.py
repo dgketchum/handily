@@ -36,6 +36,7 @@ CONFIG_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "naked_fill_m",
         "halo_n",
         "workers",
+        "write_strip_debug",
     ),
     "raster": (
         "burn_res_m",
@@ -155,6 +156,12 @@ class FacRemConfig:
     naked_fill_m: float = 0.0
     halo_n: int = 0
     workers: int = 1
+    # When false, skip writing the diagnostic ``fac_normals_cross_sections.fgb``
+    # strip layer. The strips are an intermediate of the burn, not a product, and
+    # materializing tens of millions of LineStrings to disk is a large, pointless
+    # cost at CONUS scale. The CONUS builder disables it; local runs keep it on
+    # for QGIS inspection.
+    write_strip_debug: bool = True
 
     # --- Raster resolution ---
     burn_res_m: float = 20.0
