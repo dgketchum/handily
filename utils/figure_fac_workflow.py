@@ -585,7 +585,7 @@ def build_paths(base: Path, version: str) -> dict:
         "heads": str(rem / "fac_channel_heads.fgb"),
         "strips": str(rem / "fac_normals_cross_sections.fgb"),
         "sparse": str(rem / "fac_head_depth_sparse_10m.tif"),
-        "idw": str(rem / "fac_head_depth_idw_fill_10m.tif"),
+        "idw": str(rem / "fac_rem_water_surface_10m.tif"),
         "rem": str(rem / "fac_head_depth_rem_10m.tif"),
         "residuals": str(base / "validation" / val / "fac_well_residuals.fgb"),
     }
