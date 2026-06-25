@@ -37,11 +37,13 @@ dependencies = [
   "pystac>=1.8",
   "requests>=2.31",
   "tqdm>=4.65",
-  "ipykernel>=7.1.0",
   "matplotlib>=3.10.8",
   "scikit-learn>=1.3",
-  "pysheds>=0.5",
   "whitebox>=2.3.6",
+  "torch==2.12.1",
+  "torch-geometric>=2.8.0",
+  "pystac-client>=0.9.0",
+  "planetary-computer>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -76,3 +78,15 @@ include = [
 dev = [
     "ruff>=0.15.6",
 ]
+
+# Pin torch to a CUDA 12.6 wheel: the default PyPI torch 2.12 is a cu130 (CUDA 13)
+# build that the system driver (12.2) is too old to initialize. cu126 is the same
+# major (12) as the driver, so minor-version compatibility applies and the GPU is
+# usable. No cu121/cu124 wheels exist for torch 2.12.
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }

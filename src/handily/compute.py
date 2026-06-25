@@ -433,53 +433,6 @@ def build_network_propagated_mask(
     return mask_da
 
 
-def compute_rem_quick(dem_da, streams_da, radius: int = 1000):
-    """Compute a quick Relative Elevation Model using a local mean water-surface base elevation."""
-    if dem_da.rio.crs is None or streams_da.rio.crs is None:
-        raise ValueError("Both DEM and streams rasters must have a valid CRS.")
-    if (
-        str(dem_da.rio.crs) != str(streams_da.rio.crs)
-        or dem_da.shape != streams_da.shape
-    ):
-        raise ValueError("DEM and streams must share grid shape and CRS.")
-
-    if int(radius) < 1:
-        raise ValueError("radius must be >= 1")
-
-    dem_np = np.asarray(dem_da.data, dtype="float32")
-    streams_np = np.asarray(streams_da.data).astype(bool)
-    if streams_np.sum() == 0:
-        raise ValueError("Stream mask has no active cells after combination.")
-
-    streams_f = streams_np.astype("float32")
-    sigma = float(radius) / 3.0
-    mean_elev_masked = ndi.gaussian_filter(
-        dem_np * streams_f, sigma=sigma, mode="nearest", truncate=3.0
-    )
-    mean_mask = ndi.gaussian_filter(
-        streams_f, sigma=sigma, mode="nearest", truncate=3.0
-    )
-    base_fallback = float(np.nanmean(dem_np[streams_np]))
-    base_elev = np.divide(
-        mean_elev_masked,
-        mean_mask,
-        out=np.full_like(mean_elev_masked, base_fallback, dtype="float32"),
-        where=mean_mask > 0,
-    )
-
-    rem_np = dem_np - base_elev
-    rem_np = np.where(rem_np < 0, 0, rem_np)
-
-    rem_da = xr.DataArray(
-        rem_np,
-        dims=dem_da.dims,
-        coords=dem_da.coords,
-        name="REM",
-        attrs={"description": "Quick REM (local mean water base; no sink filling)"},
-    )
-    return rem_da.rio.write_crs(dem_da.rio.crs, inplace=False)
-
-
 def compute_rem_edt_smooth(
     dem_da, streams_da, sigma: float = 50.0, max_dist: float | None = None
 ):
