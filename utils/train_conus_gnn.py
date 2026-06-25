@@ -35,12 +35,18 @@ from torch import nn
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_conus_graph_inputs import (  # noqa: E402
     DEEP_REGIONAL_WTE_COL,
+    FAC_REM_WTE_ANOM_COL,
     FAC_REM_WTE_COL,
     HAND_WTE_COL,
     REGIONAL_WTE_COL,
     TARGET_DTW_RESIDUAL,
     TARGET_WTE,
+    TARGET_WTE_RESIDUAL,
 )
+
+# Head-space target modes (WTE elevation OR residual-over-R): both reconstruct DTW
+# as `base - native` and carry obs_wte/z_surf; dtw_residual reconstructs `base + native`.
+HEAD_SPACE_MODES = (TARGET_WTE, TARGET_WTE_RESIDUAL)
 from train_wte_gnn import (  # noqa: E402
     WTEGraphNet,
     apply_stats,
@@ -100,24 +106,50 @@ def prune_anchor_reach_edges(ar: pd.DataFrame, old2new: np.ndarray) -> pd.DataFr
     return out
 
 
-def pinball_loss(pred: torch.Tensor, target: torch.Tensor, tau: float) -> torch.Tensor:
+def pinball_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    tau: float,
+    weight: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Quantile (pinball) loss; tau>0.5 penalizes UNDER-prediction harder.
 
     The documented deep failure is predicting deep wells too shallow (residual too
     low). With tau~0.85 on the residual target, under-prediction (e>0) is penalized
-    at tau and over-prediction at 1-tau, biasing the auxiliary head deeper.
+    at tau and over-prediction at 1-tau, biasing the auxiliary head deeper. ``weight``
+    (per-sample) gives a weighted mean (depth-aware loss); None = plain mean.
     """
     e = target - pred
-    return torch.mean(torch.maximum(tau * e, (tau - 1.0) * e))
+    el = torch.maximum(tau * e, (tau - 1.0) * e)
+    if weight is None:
+        return torch.mean(el)
+    return (el * weight).sum() / weight.sum()
 
 
 def _native_to_dtw(native: np.ndarray, base: np.ndarray, mode: str) -> np.ndarray:
     """Reconstruct DTW from the model's native prediction.
 
     dtw_residual: dtw = regional_prior + residual_hat (base = regional prior).
-    wte:          dtw = z_surf_well - wte_hat        (base = land-surface elev).
+    wte:          dtw = z_surf_well - wte_hat         (base = land-surface elev).
+    wte_residual: dtw = (z_surf - R) - resid_hat      (base = z_surf - R).
     """
-    return base - native if mode == TARGET_WTE else base + native
+    return base - native if mode in HEAD_SPACE_MODES else base + native
+
+
+def _fac_feat(fac_raw, fac_present, y_c: float, y_s: float, device) -> dict:
+    """FAC bypass tensors standardized into THIS fold's target space.
+
+    The FAC anomaly is FAC's own estimate of the (head-space) target, so standardizing
+    it by the fold's (y_c, y_s) puts it on the same scale as the model's standardized
+    output -- the model then predicts ``fac_base + correction``. Absent FAC is set to 0
+    (the presence flag carries that info, so the skip contributes nothing there)."""
+    base = np.where(fac_present, (fac_raw - y_c) / y_s, 0.0)
+    return {
+        "fac_base": torch.as_tensor(base, dtype=torch.float32, device=device),
+        "fac_present": torch.as_tensor(
+            fac_present.astype("float32"), dtype=torch.float32, device=device
+        ),
+    }
 
 
 def _huber_delta_std(args, mode: str, y_s: float) -> float:
@@ -144,14 +176,36 @@ def _combine_native(out, y_s: float, y_c: float, base: np.ndarray, mode: str, ar
 
 
 def train_fold(
-    model, feat, y_std, tr, va, base, obs_dtw, y_c, y_s, mode, eff_tau, args, device
+    model,
+    feat,
+    y_std,
+    tr,
+    va,
+    base,
+    obs_dtw,
+    y_c,
+    y_s,
+    mode,
+    eff_tau,
+    args,
+    device,
+    sample_w_t=None,
 ):
-    """Train one fold; early-stop on val DTW-MAD; return native_hat over all queries."""
+    """Train one fold; early-stop on val DTW-MAD; return native_hat over all queries.
+
+    ``sample_w_t`` (full-length, optional) re-weights the per-well training loss
+    (depth-aware loss weighting) so the shallow band is not swamped by deep wells.
+    """
     opt = torch.optim.Adam(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    huber = nn.HuberLoss(delta=_huber_delta_std(args, mode, y_s))
+    weighted = sample_w_t is not None
+    huber = nn.HuberLoss(
+        delta=_huber_delta_std(args, mode, y_s),
+        reduction="none" if weighted else "mean",
+    )
     tr_t = torch.as_tensor(tr, device=device)
+    w_tr = sample_w_t[tr_t] if weighted else None
     best_mad, best_state, best_epoch, since = np.inf, None, -1, 0
     for epoch in range(args.epochs):
         model.train()
@@ -159,11 +213,14 @@ def train_fold(
         out = model(feat)
         if args.pinball:
             primary, pin = out
-            loss = huber(
-                primary[tr_t], y_std[tr_t]
-            ) + args.pinball_weight * pinball_loss(pin[tr_t], y_std[tr_t], eff_tau)
+            hl = huber(primary[tr_t], y_std[tr_t])
+            hl = (hl * w_tr).sum() / w_tr.sum() if weighted else hl
+            loss = hl + args.pinball_weight * pinball_loss(
+                pin[tr_t], y_std[tr_t], eff_tau, w_tr
+            )
         else:
-            loss = huber(out[tr_t], y_std[tr_t])
+            hl = huber(out[tr_t], y_std[tr_t])
+            loss = (hl * w_tr).sum() / w_tr.sum() if weighted else hl
         loss.backward()
         opt.step()
         model.eval()
@@ -276,6 +333,22 @@ def main() -> None:
         default=15.0,
         help="predicted DTW above which the pinball head supersedes Huber",
     )
+    p.add_argument(
+        "--fac-skip",
+        action="store_true",
+        help="anchor the head-space output on FAC's standardized target-estimate "
+        "(raw-FAC bypass to the head) so message passing corrects, not erases, FAC's "
+        "sharp shallow signal; head-space targets (wte / wte_residual) only",
+    )
+    p.add_argument(
+        "--shallow-weight",
+        type=float,
+        default=1.0,
+        help="depth-aware loss weight applied to training wells with obs_dtw < "
+        "--shallow-thresh-m (1.0 = off); protects the shallow band from being swamped "
+        "by the more numerous deep wells in the Huber average",
+    )
+    p.add_argument("--shallow-thresh-m", type=float, default=5.0)
     args = p.parse_args()
 
     gdir = Path(args.graph_dir)
@@ -304,12 +377,13 @@ def main() -> None:
     surface_col = man.get("surface_elev_col")
     obs_wte_col = man.get("obs_wte_col")
     log.info("target_mode=%s", target_mode)
-    # WTE: too-shallow means wte_hat too HIGH, so the deep quantile is the LOW tail.
-    # tau>0.5 on the (residual/DTW) head pushes deeper; flip for the WTE head.
-    if target_mode == TARGET_WTE and args.pinball and args.pinball_tau > 0.5:
+    # Head-space modes: too-shallow means the predicted head is too HIGH, so the deep
+    # quantile is the LOW tail. tau>0.5 on the DTW/dtw-residual head pushes deeper;
+    # flip for any head-space (wte / wte_residual) head.
+    if target_mode in HEAD_SPACE_MODES and args.pinball and args.pinball_tau > 0.5:
         log.warning(
-            "WTE pinball tau>0.5 pushes head UP (shallower); using 1-tau=%.2f for "
-            "the deep head",
+            "head-space pinball tau>0.5 pushes head UP (shallower); using 1-tau=%.2f "
+            "for the deep head",
             1.0 - args.pinball_tau,
         )
         eff_tau = 1.0 - args.pinball_tau
@@ -460,26 +534,65 @@ def main() -> None:
     target = qn[target_col].to_numpy("float64")
     folds = np.array(sorted(qn[fold_col].unique()))
     blocks = qn[group_col].to_numpy()
-    # `base` is the DTW-reconstruction term: regional prior (residual) or land-
-    # surface elevation (WTE). Only the active mode's columns are required finite.
-    if target_mode == TARGET_WTE:
-        base = qn[surface_col].to_numpy("float64")
+    # `base` is the DTW-reconstruction term, named by the manifest: regional prior
+    # (dtw_residual), land-surface elevation (wte), or z_surf - R (wte_residual).
+    # Bundles predating dtw_base_col fall back to the per-mode default.
+    base_col = man.get("dtw_base_col") or (
+        surface_col if target_mode in HEAD_SPACE_MODES else man["regional_prior_col"]
+    )
+    base = qn[base_col].to_numpy("float64")
+    required = {"base": base, "obs_dtw": obs_dtw, "target": target}
+    if target_mode in HEAD_SPACE_MODES:
         obs_wte = qn[obs_wte_col].to_numpy("float64")
-        required = {
-            "surface_elev": base,
-            "obs_dtw": obs_dtw,
-            "target": target,
-            "obs_wte": obs_wte,
-        }
+        z_surf = qn[surface_col].to_numpy("float64")
+        required |= {"obs_wte": obs_wte, "z_surf": z_surf}
     else:
-        base = qn[man["regional_prior_col"]].to_numpy("float64")
-        obs_wte = None
-        required = {"regional": base, "obs_dtw": obs_dtw, "target": target}
+        obs_wte = z_surf = None
     for nm, arr in required.items():
         if not np.isfinite(arr).all():
             raise SystemExit(
                 f"{int((~np.isfinite(arr)).sum())} non-finite {nm} in query nodes"
             )
+
+    # --- FAC raw-skip: FAC's own (head-space) target-estimate as the output anchor ---
+    fac_skip = args.fac_skip
+    fac_raw = fac_present = None
+    if fac_skip:
+        if target_mode == TARGET_WTE_RESIDUAL:
+            fac_base_col = FAC_REM_WTE_ANOM_COL  # (z_surf - fac_rem_dtw) - R
+        elif target_mode == TARGET_WTE:
+            fac_base_col = FAC_REM_WTE_COL  # fac_rem water-surface ELEVATION
+        else:
+            raise SystemExit(
+                "--fac-skip requires a head-space target (wte / wte_residual); "
+                f"got {target_mode}"
+            )
+        if fac_base_col not in qn.columns:
+            raise SystemExit(f"--fac-skip: column {fac_base_col!r} not in query nodes")
+        fac_raw = qn[fac_base_col].to_numpy("float64")
+        fac_present = np.isfinite(fac_raw)
+        log.info(
+            "fac-skip ON: anchor col %s, %d/%d wells carry FAC (%.1f%%)",
+            fac_base_col,
+            int(fac_present.sum()),
+            len(qn),
+            100.0 * fac_present.mean(),
+        )
+
+    # --- depth-aware loss weighting: upweight the shallow band (FAC's gold) ---------
+    sample_w_t = None
+    if args.shallow_weight != 1.0:
+        sample_w = np.where(
+            obs_dtw < args.shallow_thresh_m, args.shallow_weight, 1.0
+        ).astype("float32")
+        sample_w_t = torch.as_tensor(sample_w, dtype=torch.float32, device=device)
+        log.info(
+            "depth-aware loss: %d/%d wells <%.0fm upweighted x%.2f",
+            int((obs_dtw < args.shallow_thresh_m).sum()),
+            len(qn),
+            args.shallow_thresh_m,
+            args.shallow_weight,
+        )
 
     f_ch, f_lat = ch_ea.shape[1], lat_ea.shape[1]
     native_oof = np.full(len(qn), np.nan)
@@ -508,12 +621,15 @@ def main() -> None:
             f_anchor_reach=f_ar,
             f_anchor_query=f_aq,
             pinball=args.pinball,
+            fac_skip=fac_skip,
         ).to(device)
 
     if device.startswith("cuda"):
         probe_feat = {**graph_tensors, "query_x": probe_x}
         yc0 = float(np.median(target))
         ys0 = float(1.4826 * np.median(np.abs(target - yc0)) or 1.0)
+        if fac_skip:
+            probe_feat |= _fac_feat(fac_raw, fac_present, yc0, ys0, device)
         if anchor_head_m is not None:
             probe_feat["anchor_value"] = torch.as_tensor(
                 (anchor_head_m - yc0) / ys0, dtype=torch.float32, device=device
@@ -551,6 +667,8 @@ def main() -> None:
             (target - y_c) / y_s, dtype=torch.float32, device=device
         )
         feat = {**graph_tensors, "query_x": query_x}
+        if fac_skip:
+            feat |= _fac_feat(fac_raw, fac_present, y_c, y_s, device)
         # WTE Dirichlet BC value, standardized in THIS fold's target space (so the
         # injected head sits on the same scale as the standardized model output).
         if anchor_head_m is not None:
@@ -572,6 +690,7 @@ def main() -> None:
             f_anchor_reach=f_ar,
             f_anchor_query=f_aq,
             pinball=args.pinball,
+            fac_skip=fac_skip,
         ).to(device)
         native, best_mad, best_epoch = train_fold(
             model,
@@ -587,6 +706,7 @@ def main() -> None:
             eff_tau,
             args,
             device,
+            sample_w_t,
         )
         del model, query_x, y_std, feat
         if device.startswith("cuda"):
@@ -638,23 +758,33 @@ def main() -> None:
         "gnn_dtw_m": gnn_dtw,
     }
     identity_max = None
-    if target_mode == TARGET_WTE:
-        # |WTE err| must equal |DTW err| since z_surf is exact and shared.
+    if target_mode in HEAD_SPACE_MODES:
+        # wte_hat is the absolute head (wte) or R + residual_hat (wte_residual).
+        # |WTE err| must equal |DTW err| since z_surf is exact and shared
+        # (gnn_dtw = z_surf - wte_hat, obs_dtw = z_surf - obs_wte).
+        r_wte = qn[REGIONAL_WTE_COL].to_numpy("float64")
+        wte_hat = native_oof if target_mode == TARGET_WTE else r_wte + native_oof
         identity_max = float(
-            np.nanmax(np.abs(np.abs(native_oof - obs_wte) - np.abs(gnn_dtw - obs_dtw)))
+            np.nanmax(np.abs(np.abs(wte_hat - obs_wte) - np.abs(gnn_dtw - obs_dtw)))
         )
         out_cols |= {
-            "z_surf_well_m": base,
+            "z_surf_well_m": z_surf,
             "obs_wte_m": obs_wte,
-            "regional_wte_idw_oof_m": qn[REGIONAL_WTE_COL].to_numpy(),
+            "regional_wte_idw_oof_m": r_wte,
             "deep_regional_wte_idw_oof_m": qn[DEEP_REGIONAL_WTE_COL].to_numpy(),
-            "hand_wte_m": qn[HAND_WTE_COL].to_numpy(),
-            "gnn_wte_hat_m": native_oof,
+            "gnn_wte_hat_m": wte_hat,
         }
+        if HAND_WTE_COL in qn.columns:
+            out_cols[HAND_WTE_COL] = qn[HAND_WTE_COL].to_numpy()
         if FAC_REM_WTE_COL in qn.columns:
             out_cols[FAC_REM_WTE_COL] = qn[FAC_REM_WTE_COL].to_numpy()
+        elif "fac_rem_dtw_m" in qn.columns:
+            # wte_residual carries fac_rem_dtw_m (registry); the head-space diagnostic
+            # wants fac_rem_wte = z_surf - fac_rem_dtw (NaN where FAC absent).
+            out_cols[FAC_REM_WTE_COL] = z_surf - qn["fac_rem_dtw_m"].to_numpy("float64")
         log.info(
-            "WTE identity check: max |abs(WTE err) - abs(DTW err)| = %.3e m",
+            "%s identity check: max |abs(WTE err) - abs(DTW err)| = %.3e m",
+            target_mode,
             identity_max,
         )
     else:
@@ -706,10 +836,23 @@ def main() -> None:
             if args.pinball
             else None,
         },
+        "fac_skip": {
+            "enabled": bool(fac_skip),
+            "anchor_col": fac_base_col if fac_skip else None,
+            "wells_with_fac": int(fac_present.sum()) if fac_skip else None,
+        },
+        "depth_aware_loss": {
+            "shallow_weight": args.shallow_weight,
+            "shallow_thresh_m": args.shallow_thresh_m
+            if args.shallow_weight != 1.0
+            else None,
+        },
         "target_mode": target_mode,
         "native_prediction_col": man.get(
             "native_prediction_col",
-            "gnn_wte_hat_m" if target_mode == TARGET_WTE else "gnn_residual_hat_m",
+            "gnn_wte_hat_m"
+            if target_mode in HEAD_SPACE_MODES
+            else "gnn_residual_hat_m",
         ),
         "dtw_reconstruction": man.get("dtw_reconstruction"),
         "huber": {
@@ -723,7 +866,7 @@ def main() -> None:
         "wte_identity_check": {
             "max_abs_difference_between_wte_and_dtw_abs_errors_m": identity_max
         }
-        if target_mode == TARGET_WTE
+        if target_mode in HEAD_SPACE_MODES
         else None,
         "folds": fold_log,
         "target_col": target_col,

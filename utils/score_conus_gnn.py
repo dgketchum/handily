@@ -44,6 +44,11 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("score_conus_gnn")
 
+# Head-space target modes: DTW is reconstructed as z_surf - wte_hat, so they get
+# the WTE identity QA check + the head-space core-metrics block. wte_residual
+# predicts a head residual over R but reconstructs the same way (wte_hat = R + resid).
+HEAD_SPACE_MODES = ("wte", "wte_residual")
+
 DEPTH_BANDS = [(0, 2), (2, 5), (5, 10), (10, 30), (30, np.inf)]
 SHALLOW_THRESHOLDS = [2.0, 5.0, 10.0]
 DEFAULT_MA = [
@@ -295,7 +300,7 @@ def main() -> None:
     if run_json.exists():
         target_mode = json.loads(run_json.read_text()).get("target_mode")
     wte_identity = None
-    if target_mode == "wte":
+    if target_mode in HEAD_SPACE_MODES:
         missing = [
             c
             for c in ("z_surf_well_m", "obs_wte_m", "gnn_wte_hat_m", "gnn_dtw_m")
@@ -334,6 +339,16 @@ def main() -> None:
     if "regional_deep_idw_dtw_oof_m" in df.columns:
         df["regional_deep"] = df["regional_deep_idw_dtw_oof_m"]
         predcols.append("regional_deep")
+
+    # FAC-REM standalone: the shallow terrain DTW prior ON ITS OWN, not just embedded
+    # as a model feature. CLAUDE.md mandates comparing FAC directly to the benchmarks
+    # on the same footprint -- otherwise a model's shallow skill is attributed to FAC
+    # without ever showing FAC alone. Reconstruct depth = z_surf - fac_rem_wte (the
+    # head-space modes carry both). Kept out of `common` so partial FAC coverage never
+    # shrinks the shared footprint; here (FAC-footprint run) it is finite everywhere.
+    if {"fac_rem_wte_m", "z_surf_well_m"}.issubset(df.columns):
+        df["fac_rem"] = df["z_surf_well_m"] - df["fac_rem_wte_m"]
+        predcols.append("fac_rem")
 
     # Tabular-fusion control: same features/folds, no message passing.
     if args.tabular_dir:
@@ -385,7 +400,7 @@ def main() -> None:
     # WTE units against obs_wte_m. By the identity above the GNN MAD equals its DTW
     # MAD; the value is comparing the head priors to each other in their own space.
     wte_core = None
-    if target_mode == "wte":
+    if target_mode in HEAD_SPACE_MODES:
         obs_wte = non_nwis["obs_wte_m"].to_numpy("float64")
         wte_core = {
             c: core_metrics(non_nwis[c].to_numpy("float64"), obs_wte)
@@ -441,6 +456,7 @@ def main() -> None:
         ]
         + (["regional_deep"] if "regional_deep" in predcols else [])
         + (["fusion"] if "fusion" in predcols else [])
+        + (["fac_rem"] if "fac_rem" in predcols else [])
         + (["ma"] if "ma" in predcols else [])
     )
     res = df[keep].copy()

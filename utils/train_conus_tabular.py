@@ -37,11 +37,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_conus_graph_inputs import (  # noqa: E402
     ANCHOR_CLASSES,
     DEM,
+    REGIONAL_WTE_COL,
     TARGET_DTW_RESIDUAL,
     TARGET_WTE,
+    TARGET_WTE_RESIDUAL,
     sample_coarse,
 )
 from train_wte_gnn import apply_stats, fit_stats  # noqa: E402
+
+# Head-space modes reconstruct DTW as `base - native` and carry obs_wte; dtw_residual
+# reconstructs `base + native`. Mirrors train_conus_gnn.HEAD_SPACE_MODES.
+HEAD_SPACE_MODES = (TARGET_WTE, TARGET_WTE_RESIDUAL)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("train_conus_tabular")
@@ -168,8 +174,9 @@ def _native_to_dtw(native: np.ndarray, base: np.ndarray, mode: str) -> np.ndarra
 
     ``dtw_residual``: native is a residual over the regional DTW prior -> base + native.
     ``wte``: native is absolute water-table elevation -> z_surf - native (base = z_surf).
+    ``wte_residual``: native is a residual over R -> (z_surf - R) - native (base = z_surf - R).
     """
-    return base - native if mode == TARGET_WTE else base + native
+    return base - native if mode in HEAD_SPACE_MODES else base + native
 
 
 def main() -> None:
@@ -205,16 +212,14 @@ def main() -> None:
     surface_col = man.get("surface_elev_col")
     obs_wte_col = man.get("obs_wte_col")
     obs_dtw_col = man["obs_dtw_col"]
-    if target_mode == TARGET_WTE:
-        base_col = surface_col
-        if base_col is None:
-            raise SystemExit("WTE bundle missing surface_elev_col in manifest")
-    else:
-        base_col = regional_prior_col
-        if base_col is None:
-            raise SystemExit(
-                "dtw_residual bundle missing regional_prior_col in manifest"
-            )
+    # The DTW base column is named by the manifest (dtw_base_col): regional prior
+    # (dtw_residual), z_surf (wte), or z_surf - R (wte_residual). Bundles predating
+    # dtw_base_col fall back to the per-mode default.
+    base_col = man.get("dtw_base_col")
+    if base_col is None:
+        base_col = surface_col if target_mode == TARGET_WTE else regional_prior_col
+    if base_col is None:
+        raise SystemExit(f"bundle missing a DTW base column for mode {target_mode}")
     log.info(
         "model=%s  mode=%s  features=%s  base=%s  target=%s",
         args.model,
@@ -257,10 +262,18 @@ def main() -> None:
     obs = qn[obs_dtw_col].to_numpy("float64")
     target = qn[target_col].to_numpy("float64")
     fold = qn[fold_col].to_numpy()
-    obs_wte = qn[obs_wte_col].to_numpy("float64") if target_mode == TARGET_WTE else None
+    # Head-space modes (wte, wte_residual) carry the observed WTE and land-surface
+    # elevation so the OOF table can reconstruct the absolute head and verify the
+    # head<->DTW identity. base is the DTW reconstruction term (z_surf - R for
+    # wte_residual), distinct from z_surf itself.
+    if target_mode in HEAD_SPACE_MODES:
+        obs_wte = qn[obs_wte_col].to_numpy("float64")
+        z_surf = qn[surface_col].to_numpy("float64")
+    else:
+        obs_wte = z_surf = None
     checks = [("base", base), ("obs", obs), ("target", target)]
     if obs_wte is not None:
-        checks.append(("obs_wte", obs_wte))
+        checks += [("obs_wte", obs_wte), ("z_surf", z_surf)]
     for nm, arr in checks:
         if not np.isfinite(arr).all():
             raise SystemExit(
@@ -316,10 +329,26 @@ def main() -> None:
         "obs_dtw_m": obs,
         "tab_dtw_m": tab_dtw,
     }
-    if target_mode == TARGET_WTE:
-        out_cols["z_surf_well_m"] = base
-        out_cols["obs_wte_m"] = obs_wte
-        out_cols["tab_wte_hat_m"] = native_oof
+    if target_mode in HEAD_SPACE_MODES:
+        # tab_wte_hat is the absolute head: native_oof IS the WTE under `wte`, or
+        # R + residual_hat under `wte_residual`. The head<->DTW identity must hold
+        # exactly (tab_dtw = z_surf - wte_hat, obs_dtw = z_surf - obs_wte).
+        r_wte = qn[REGIONAL_WTE_COL].to_numpy("float64")
+        wte_hat = native_oof if target_mode == TARGET_WTE else r_wte + native_oof
+        identity_max = float(
+            np.nanmax(np.abs(np.abs(wte_hat - obs_wte) - np.abs(tab_dtw - obs)))
+        )
+        log.info(
+            "%s identity check: max |abs(WTE err) - abs(DTW err)| = %.3e m",
+            target_mode,
+            identity_max,
+        )
+        out_cols |= {
+            "z_surf_well_m": z_surf,
+            "obs_wte_m": obs_wte,
+            "regional_wte_idw_oof_m": r_wte,
+            "tab_wte_hat_m": wte_hat,
+        }
     else:
         out_cols["regional_base_m"] = base
         out_cols["tab_residual_hat_m"] = native_oof
@@ -339,11 +368,11 @@ def main() -> None:
         "target_col": target_col,
         "importance_target": target_col,
         "native_prediction_col": (
-            "tab_wte_hat_m" if target_mode == TARGET_WTE else "tab_residual_hat_m"
+            "tab_wte_hat_m" if target_mode in HEAD_SPACE_MODES else "tab_residual_hat_m"
         ),
         "dtw_reconstruction": (
             "z_surf_well_m - tab_wte_hat_m"
-            if target_mode == TARGET_WTE
+            if target_mode in HEAD_SPACE_MODES
             else "regional_base_m + tab_residual_hat_m"
         ),
         "final_dtw_definition": man["final_dtw_definition"],

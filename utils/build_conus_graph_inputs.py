@@ -50,10 +50,13 @@ from build_stacker_features import (  # noqa: E402
     ETRM_ETA,
     ETRM_RECHARGE,
     ETRM_RUNOFF,
+    GRIDMET_AI,
+    GRIDMET_P,
     SLOPE,
     TRI,
     sample_coarse,
 )
+from fac_rem_registry import sample_fac_rem  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("build_conus_graph_inputs")
@@ -66,13 +69,29 @@ DEM = "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif"
 # the bundle/edges; only the query target + head-space priors differ.
 TARGET_DTW_RESIDUAL = "dtw_residual"
 TARGET_WTE = "wte"
-TARGET_CHOICES = (TARGET_DTW_RESIDUAL, TARGET_WTE)
+# wte_residual (the wall-to-wall keystone): predict the head residual above a smooth
+# regional WTE prior R, target = obs_wte - R (a small, well-conditioned residual).
+# Reconstruct dtw = z_surf - (R + resid_hat) = (z_surf - R) - resid_hat, so the DTW
+# base is (z_surf - R) and reconstruction shares the WTE mode's `base - native` form.
+# All head-space features are anomalies-from-R (translation-invariant); z_surf is the
+# reconstruction datum only, never a feature; HAND features are dropped.
+TARGET_WTE_RESIDUAL = "wte_residual"
+TARGET_CHOICES = (TARGET_DTW_RESIDUAL, TARGET_WTE, TARGET_WTE_RESIDUAL)
 SURFACE_ELEV_COL = "z_surf_well_m"  # DEM land-surface elev at the well (datum)
 OBS_WTE_COL = "wte_obs_m"  # observed head = z_surf_well - mean_dtw
-REGIONAL_WTE_COL = "regional_wte_idw_oof_m"  # cross-fit IDW of observed WTE
+REGIONAL_WTE_COL = "regional_wte_idw_oof_m"  # cross-fit IDW of observed WTE (= R)
 DEEP_REGIONAL_WTE_COL = "deep_regional_wte_idw_oof_m"  # cross-fit IDW of deep WTE
 FAC_REM_WTE_COL = "fac_rem_wte_m"  # z_surf - fac_rem_dtw (legit local DTW product)
 HAND_WTE_COL = "hand_wte_m"  # z_surf - hand_m (head-like FIM-HAND feature)
+# wte_residual columns: the DTW base (z_surf - R), the residual target (obs_wte - R),
+# and the two head-space prior anomalies-from-R (the core translation-invariant signal).
+WTE_RESID_BASE_COL = "wte_resid_base_m"  # z_surf - R; dtw = base - resid_hat
+WTE_RESIDUAL_TARGET_COL = "wte_residual_m"  # obs_wte - R
+FAC_REM_WTE_ANOM_COL = "fac_rem_wte_anom_m"  # (z_surf - fac_rem_dtw) - R
+DEEP_REGIONAL_WTE_ANOM_COL = "deep_regional_wte_anom_m"  # deep_wte_idw - R
+# gridMET climate (EPSG:4326 -> sampled at lon/lat). Kept in wte_residual mode: a
+# NEGATIVE result in the pilot stacker does not mean it cannot help the GNN.
+CLIMATE_FEATURE_COLS = ["aridity_index", "mean_annual_precip_mm"]
 # Well model features (leak-free). Everything else on the query node is carried
 # for scoring/diagnostics only.
 QUERY_FEATURE_COLS = ["hand_m", "regional_idw_dtw_oof_m"]
@@ -128,9 +147,12 @@ QUERY_DIAGNOSTIC_COLS = [
     "huc2",
     "mean_dtw",
     "janssen_dtw",
+    "hand_m",  # carried for the scorer's hand_cal benchmark in EVERY mode, not as a
+    # model feature -- head-space modes drop HAND from features but still score vs it.
     "regional_idw_dtw_oof_m",
     "regional_deep_idw_dtw_oof_m",
     "cv_fold",
+    "cv_unit",
     "block_40km",
 ]
 LATERAL_EDGE_FEATURE_COLS = [
@@ -164,15 +186,60 @@ def load_wells_hand(path: str) -> pd.DataFrame:
     return df
 
 
-def assign_folds(huc4: np.ndarray, folds: int, seed: int) -> np.ndarray:
-    """HUC4-blocked CV: each whole HUC4 basin assigned to one fold (round-robin on
-    a seeded shuffle), so train/test never share a basin -- the cross-basin
-    transfer test the CONUS scale is meant to attack.
+def assign_folds(unit: np.ndarray, folds: int, seed: int) -> np.ndarray:
+    """Blocked CV: each whole spatial unit assigned to one fold (round-robin on a
+    seeded shuffle), so train/test never share a unit. ``unit`` is a HUC12 code
+    (HUC12-blocked CV, the default) or a geometric block id (the national fallback);
+    a held-out unit's NEIGHBOURS stay in train, which is the between-wells
+    interpolation regime the wall-to-wall product is deployed in.
     """
-    uh = np.array(sorted(pd.unique(huc4)))
+    uh = np.array(sorted(pd.unique(unit)))
     rng = np.random.RandomState(seed)
     fold_of = {h: i % folds for i, h in enumerate(rng.permutation(uh))}
-    return np.array([fold_of[h] for h in huc4], dtype="int64")
+    return np.array([fold_of[h] for h in unit], dtype="int64")
+
+
+def spatial_block_ids(x: np.ndarray, y: np.ndarray, block_km: float) -> np.ndarray:
+    """Geometric square-block ids at ``block_km`` scale on the EPSG:5070 grid.
+
+    The national CV fallback (and the source of the synthetic unit for the rare
+    well that matches no HUC12 polygon): a ~12 km block is the HUC12 areal scale
+    (mean HUC12 ~ 100-250 km2, ~10-15 km across).
+    """
+    s = block_km * 1000.0
+    bx = np.floor(x / s).astype("int64")
+    by = np.floor(y / s).astype("int64")
+    return np.char.add(np.char.add(bx.astype(str), "_"), by.astype(str))
+
+
+def huc12_units(
+    x: np.ndarray, y: np.ndarray, huc12_path: str, fallback_block_km: float
+) -> np.ndarray:
+    """HUC12 code per well by point-in-polygon (EPSG:5070), for HUC12-blocked CV.
+
+    Wells matching no HUC12 polygon (rare border/coastal points) fall back to a
+    geometric block id (``blk_<bx>_<by>``) so no well is dropped; the fallback
+    count is logged, never silent.
+    """
+    polys = gpd.read_parquet(huc12_path)[["huc12", "geometry"]]
+    if polys.crs is None or polys.crs.to_epsg() != 5070:
+        raise SystemExit(f"HUC12 polys not EPSG:5070: {huc12_path} (crs={polys.crs})")
+    pts = gpd.GeoDataFrame(geometry=gpd.points_from_xy(x, y), crs=5070)
+    joined = gpd.sjoin(pts, polys, predicate="within", how="left")
+    # a point on a shared polygon edge can match >1 unit; keep the first.
+    joined = joined[~joined.index.duplicated(keep="first")].sort_index()
+    units = joined["huc12"].to_numpy(dtype=object).copy()
+    miss = pd.isna(units)
+    if miss.any():
+        idx = np.where(miss)[0]
+        block = spatial_block_ids(x[idx], y[idx], fallback_block_km)
+        units[idx] = np.char.add("blk_", block)
+        log.warning(
+            "HUC12 join: %d/%d wells unmatched -> geometric-block fallback",
+            int(miss.sum()),
+            len(units),
+        )
+    return units.astype(str)
 
 
 def crossfit_idw(
@@ -208,11 +275,14 @@ def deep_well_mask(
     region; a single global cut would select almost only arid-West wells and leave
     humid CONUS with no deep wells.
 
-    Leak-safe to compute once over all wells: every well in a HUC6 shares one HUC4
-    (= one CV fold), so the per-unit threshold is computed within a single fold,
-    and the leave-one-HUC4-out cross-fit of the surface (``crossfit_deep_idw``)
-    excludes that whole fold from the deep training pool. Sparse units
-    (< ``min_per_unit`` wells) fall back to the HUC4 threshold.
+    Leak discipline: the per-HUC6 deepest-quartile THRESHOLD is a global quantile
+    (under HUC12/geometric-block folds a HUC6 spans several folds, so the threshold
+    is no longer computed within a single fold -- a mild, second-order relaxation:
+    one held-out well's DTW can nudge the membership cut of OTHER wells, but never
+    enters its OWN prediction). The actual leak-safety is enforced downstream by
+    ``crossfit_deep_idw`` (``tr = fold_deep != f``), which excludes the held-out
+    fold from the deep training pool regardless of how the threshold was computed.
+    Sparse units (< ``min_per_unit`` wells) fall back to the HUC4 threshold.
     """
     dtw = wells["mean_dtw"].astype("float64")
     nchar = {"huc6": 6, "huc4": 4}[unit]
@@ -317,6 +387,25 @@ def sample_relief_etrm(
     }
 
 
+def sample_gridmet(x: np.ndarray, y: np.ndarray) -> dict[str, np.ndarray]:
+    """gridMET aridity + mean-annual-precip at EPSG:5070 coords.
+
+    The gridMET rasters are EPSG:4326, so the 5070 coords are transformed to lon/lat
+    first (NOT sampled at 5070 metres). Off-footprint / nodata stay NaN (the trainer
+    median-imputes + flags). Kept in wte_residual mode despite the stacker's NEGATIVE
+    result -- a tabular non-result is not a GNN non-result.
+    """
+    from pyproj import Transformer
+
+    tr = Transformer.from_crs(5070, 4326, always_xy=True)
+    lon, lat = tr.transform(x, y)
+    lon, lat = np.asarray(lon), np.asarray(lat)
+    return {
+        "aridity_index": sample_coarse(GRIDMET_AI, lon, lat),
+        "mean_annual_precip_mm": sample_coarse(GRIDMET_P, lon, lat),
+    }
+
+
 def build_anchor_query_edges(
     axy: np.ndarray, qxy: np.ndarray, knn: int, max_dist_m: float
 ) -> pd.DataFrame:
@@ -410,7 +499,35 @@ def main() -> None:
         help="optional parquet keyed by canonical_id with fac_rem_dtw_m; used to "
         "build fac_rem_wte_m in --target wte mode (only those two cols are read)",
     )
+    ap.add_argument(
+        "--require-fac",
+        action="store_true",
+        help="train where you serve: keep ONLY wells inside FAC-REM raster coverage "
+        "(the built basins). Aligns the training footprint with the wall-to-wall "
+        "render domain so every well carries FAC and the model actually learns it; "
+        "folds + the regional prior R + deep datum all become basin-local.",
+    )
     ap.add_argument("--folds", type=int, default=8)
+    ap.add_argument(
+        "--cv-scheme",
+        choices=["huc12", "block", "huc4"],
+        default="huc12",
+        help="CV blocking unit: huc12 (real WBD HUC12 polygons, the default -- holds "
+        "out small sub-HUC8 basins), block (geometric square blocks, the national "
+        "fallback needing no polygons), huc4 (legacy, far-too-large holdout)",
+    )
+    ap.add_argument(
+        "--huc12-polys",
+        default="/nas/hydrography/HUC_Boundaries/wbd_national/wbdhu12_5070.parquet",
+        help="EPSG:5070 HUC12 geoparquet for --cv-scheme huc12 (national WBD)",
+    )
+    ap.add_argument(
+        "--cv-block-km",
+        type=float,
+        default=12.0,
+        help="square-block size (km) for --cv-scheme block + the unmatched-HUC12 "
+        "fallback; ~12 km is the HUC12 areal scale",
+    )
     ap.add_argument("--knn-lateral", type=int, default=3)
     ap.add_argument("--idw-k", type=int, default=32)
     ap.add_argument("--idw-power", type=float, default=2.0)
@@ -475,17 +592,51 @@ def main() -> None:
     wells["huc2"] = wells["huc8"].str[:2]
     wells["is_nwis"] = wells["source"].isin(NWIS)
     wells = wells.reset_index(drop=True)
+
+    # Train-where-you-serve: restrict to wells inside FAC-REM raster coverage BEFORE
+    # folds/priors, so the regional prior R, deep datum, and HUC12 folds are all
+    # basin-local and every training well carries the FAC signal (no NaN'd critical
+    # feature, no train/serve footprint mismatch).
+    if args.require_fac:
+        fac_probe = sample_fac_rem(
+            wells["x5070"].to_numpy("float64"), wells["y5070"].to_numpy("float64")
+        )
+        keep = np.isfinite(fac_probe)
+        n0 = len(wells)
+        wells = wells[keep].reset_index(drop=True)
+        if len(wells) < args.folds * 10:
+            raise SystemExit(
+                f"--require-fac kept only {len(wells)} FAC-covered wells -- too few "
+                f"for {args.folds}-fold CV; build more FAC-REM basins first"
+            )
+        log.info(
+            "--require-fac: %d/%d wells inside FAC-REM coverage (%.2f%%) -- training "
+            "on the serve footprint",
+            len(wells),
+            n0,
+            100 * len(wells) / n0,
+        )
     wells["query_node_idx"] = np.arange(len(wells), dtype="int64")
 
-    # CV folds (HUC4-blocked) + within-train val blocks (40 km).
-    wells["cv_fold"] = assign_folds(wells["huc4"].to_numpy(), args.folds, args.seed)
-    bx = (wells["x5070"].to_numpy() // args.block_size_m).astype("int64")
-    by = (wells["y5070"].to_numpy() // args.block_size_m).astype("int64")
+    # CV folds (HUC12-blocked by default) + within-train val blocks (40 km).
+    wx = wells["x5070"].to_numpy("float64")
+    wy = wells["y5070"].to_numpy("float64")
+    if args.cv_scheme == "huc12":
+        cv_unit = huc12_units(wx, wy, args.huc12_polys, args.cv_block_km)
+    elif args.cv_scheme == "block":
+        cv_unit = spatial_block_ids(wx, wy, args.cv_block_km)
+    else:  # huc4 (legacy)
+        cv_unit = wells["huc4"].to_numpy().astype(str)
+    wells["cv_unit"] = cv_unit
+    wells["cv_fold"] = assign_folds(cv_unit, args.folds, args.seed)
+    bx = (wx // args.block_size_m).astype("int64")
+    by = (wy // args.block_size_m).astype("int64")
     wells["block_40km"] = np.char.add(np.char.add(bx.astype(str), "_"), by.astype(str))
     log.info(
-        "wells=%d  HUC4 basins=%d  folds=%d  non-NWIS=%d",
+        "wells=%d  cv_scheme=%s  cv_units=%d  folds=%d  non-NWIS=%d",
         len(wells),
-        wells["huc4"].nunique(),
+        args.cv_scheme,
+        int(pd.unique(cv_unit).size),
         args.folds,
         int((~wells["is_nwis"]).sum()),
     )
@@ -532,12 +683,15 @@ def main() -> None:
     # target datum (wte_obs = z_surf - dtw) and the DTW reconstruction term, so it
     # MUST be finite for every well -- a non-finite surface cannot reconstruct DTW.
     wells[SURFACE_ELEV_COL] = well_surf_m
-    if args.target == TARGET_WTE and not np.isfinite(well_surf_m).all():
+    if (
+        args.target in (TARGET_WTE, TARGET_WTE_RESIDUAL)
+        and not np.isfinite(well_surf_m).all()
+    ):
         n_bad = int((~np.isfinite(well_surf_m)).sum())
         raise SystemExit(
-            f"{n_bad} wells lack finite {SURFACE_ELEV_COL}; the WTE target cannot "
-            "reconstruct DTW for them (add a deliberate drop flag + audit if a few "
-            "off-DEM wells must be retained -- do not silently drop)"
+            f"{n_bad} wells lack finite {SURFACE_ELEV_COL}; the head-space target "
+            "cannot reconstruct DTW for them (add a deliberate drop flag + audit if "
+            "a few off-DEM wells must be retained -- do not silently drop)"
         )
     wells[OBS_WTE_COL] = well_surf_m - dtw  # observed head (NaN-tolerant in resid mode)
     if args.relief_etrm_features:
@@ -606,6 +760,61 @@ def main() -> None:
             fac_joined,
             f"{fac_finite_frac:.3f}" if fac_finite_frac is not None else "n/a",
         )
+    elif args.target == TARGET_WTE_RESIDUAL:
+        # Keystone: predict the head residual above a smooth regional WTE prior R.
+        # target = obs_wte - R (small, well-conditioned); features are anomalies-from-R
+        # (translation-invariant -- no absolute elevation memorised); reconstruct
+        # dtw = z_surf - (R + resid_hat) = (z_surf - R) - resid_hat. HAND is dropped.
+        if args.anchors_dir:
+            raise SystemExit(
+                "wte_residual + --anchors-dir not yet supported: the anchor Dirichlet "
+                "BC must be expressed as a head-anomaly (anchor_head - R(anchor)), an "
+                "unimplemented path. Run wte_residual without anchors, or use "
+                "--target wte for the absolute-head anchor BC."
+            )
+        wte = wells[OBS_WTE_COL].to_numpy("float64")
+        if not np.isfinite(wte).all():
+            raise SystemExit(
+                f"{int((~np.isfinite(wte)).sum())} non-finite {OBS_WTE_COL}"
+            )
+        # Regional WTE prior R: leave-one-fold-out IDW of OBSERVED WTE (head-space
+        # direct, never z_surf - dtw_prior). Deep WTE prior from the same deep pool.
+        r_wte = crossfit_idw(xy, wte, fold, args.idw_k, args.idw_power)
+        wells[REGIONAL_WTE_COL] = r_wte
+        deep_wte = crossfit_deep_idw(
+            xy, xy[deep], wte[deep], fold, fold[deep], args.idw_k_deep, args.idw_power
+        )
+        wells[DEEP_REGIONAL_WTE_COL] = deep_wte
+        # target (small residual) + DTW base (z_surf - R; dtw = base - resid_hat).
+        wells[WTE_RESIDUAL_TARGET_COL] = wte - r_wte
+        wells[WTE_RESID_BASE_COL] = well_surf_m - r_wte
+        # FAC-REM from the raster registry -- the SAME source as the inference grid
+        # (no shard concat, no lexical-sort precedence). NaN outside the built basins.
+        fac_dtw = sample_fac_rem(xy[:, 0], xy[:, 1])
+        wells["fac_rem_dtw_m"] = fac_dtw
+        fac_joined, fac_finite_frac = True, float(np.isfinite(fac_dtw).mean())
+        # Head-space prior anomalies-from-R (the core translation-invariant signal).
+        wells[FAC_REM_WTE_ANOM_COL] = (well_surf_m - fac_dtw) - r_wte
+        wells[DEEP_REGIONAL_WTE_ANOM_COL] = deep_wte - r_wte
+        # Exogenous target-blind covariates (terrain relief + ETRM fluxes + gridMET
+        # climate), always sampled in this mode (not gated behind --relief-etrm).
+        for col, vals in sample_relief_etrm(xy[:, 0], xy[:, 1], well_surf_m).items():
+            wells[col] = vals
+        for col, vals in sample_gridmet(xy[:, 0], xy[:, 1]).items():
+            wells[col] = vals
+        target_col = WTE_RESIDUAL_TARGET_COL
+        regional_prior_col = REGIONAL_WTE_COL  # carried; the DTW base is wte_resid_base
+        query_feature_cols = (
+            [FAC_REM_WTE_ANOM_COL, DEEP_REGIONAL_WTE_ANOM_COL]
+            + RELIEF_ETRM_FEATURE_COLS
+            + CLIMATE_FEATURE_COLS
+        )
+        log.info(
+            "target=wte_residual  R-MAD(DTW)=%.2f m  fac finite frac=%.3f  features=%s",
+            float(np.nanmedian(np.abs((well_surf_m - r_wte) - dtw))),
+            fac_finite_frac,
+            query_feature_cols,
+        )
     else:
         # Residual target over the chosen base. Mode B (--rebase-on-deep) measures
         # the residual against the deep datum, so the GNN only explains the riparian
@@ -661,6 +870,14 @@ def main() -> None:
         extra_keep += [REGIONAL_WTE_COL, DEEP_REGIONAL_WTE_COL, HAND_WTE_COL]
         if FAC_REM_WTE_COL in wells.columns:
             extra_keep += [FAC_REM_WTE_COL, "fac_rem_dtw_m"]
+    elif args.target == TARGET_WTE_RESIDUAL:
+        extra_keep += [
+            REGIONAL_WTE_COL,
+            DEEP_REGIONAL_WTE_COL,
+            WTE_RESID_BASE_COL,
+            WTE_RESIDUAL_TARGET_COL,
+            "fac_rem_dtw_m",
+        ]
     else:
         extra_keep.append("target_residual_dtw_m")
     q_keep = list(
@@ -762,11 +979,12 @@ def main() -> None:
     leakage_notes = [
         "Query features exclude Janssen/Ma/coords/obs DTW (carried for scoring).",
         "Reaches carry no labels; no query->query edges.",
-        "Deep datum: per-HUC6 deepest-quartile mask (each HUC6 in one HUC4=one "
-        "fold) + leave-one-HUC4-out cross-fit, so held-out basins never inform "
-        "their own deep prior.",
-        "RELIEF_ETRM query features are exogenous target-blind rasters (terrain "
-        "relief + ETRM fluxes); gridMET aridity excluded (NEGATIVE in stacker).",
+        "Cross-fit priors (regional/deep IDW) are leave-one-CV-fold-out on the SAME "
+        f"{args.cv_scheme}-blocked folds the model trains with, so a held-out unit's "
+        "own DTW never informs its own prior.",
+        "Deep datum: per-HUC6 deepest-quartile THRESHOLD is a global quantile (a "
+        "mild relaxation under sub-HUC6 folds); leak-safety is enforced by the "
+        "leave-one-fold-out deep cross-fit (held-out fold excluded from the pool).",
         "Anchors carry DEM head + fixed BC DTW=0, never an observed well DTW; "
         "anchor_x = class/source one-hot + head_uncertainty ONLY (no head_m). "
         "Anchors are a fixed BC in all CV folds (no label to hold out).",
@@ -780,8 +998,9 @@ def main() -> None:
         target_definition = "z_surf_well_m - mean_dtw (observed water-table elevation)"
         final_dtw_definition = "z_surf_well_m - wte_hat"
         dtw_reconstruction = "surface_elev_col - native_prediction"
+        dtw_base_col = SURFACE_ELEV_COL
         wte_features = {
-            REGIONAL_WTE_COL: "cross-fit leave-one-HUC4-out IDW of observed WTE",
+            REGIONAL_WTE_COL: "cross-fit leave-one-fold-out IDW of observed WTE",
             DEEP_REGIONAL_WTE_COL: "cross-fit IDW of deep-well observed WTE (direct)",
             FAC_REM_WTE_COL: "joined_from_stacker_features"
             if FAC_REM_WTE_COL in query_feature_cols
@@ -791,13 +1010,33 @@ def main() -> None:
         leakage_notes += [
             "WTE mode: target = observed water-table elevation; loss/scoring on "
             "reconstructed DTW (z_surf_well - wte_hat). |WTE err| == |DTW err|.",
-            "Regional + deep WTE priors are cross-fit leave-one-HUC4-out IDW of "
-            "OBSERVED WTE (head-space direct), never z_surf - dtw_prior.",
-            "fac_rem_wte = z_surf - fac_rem_dtw is target-blind; NaN where FAC-REM "
-            "is unavailable (NaN+indicator); only canonical_id + fac_rem_dtw_m read "
-            "from the stacker table (no frozen-ConusWTE / retired-well columns).",
             "Absolute land-surface elevation (z_surf_well_m) IS a feature in WTE "
-            "mode; HUC4-blocked CV is the overfit monitor (watch train/test gap).",
+            "mode; the blocked CV is the overfit monitor (watch train/test gap).",
+        ]
+    elif args.target == TARGET_WTE_RESIDUAL:
+        target_mode = TARGET_WTE_RESIDUAL
+        target_units = "m (head residual above the regional WTE prior R)"
+        # the model's native output is the residual; we emit the reconstructed head
+        # wte_hat = R + residual_hat (what the scorer's head-space block reads).
+        native_prediction_col = "gnn_wte_hat_m"
+        target_definition = f"{OBS_WTE_COL} - {REGIONAL_WTE_COL} (head residual over R)"
+        final_dtw_definition = f"z_surf_well_m - ({REGIONAL_WTE_COL} + residual_hat)"
+        dtw_reconstruction = "wte_resid_base_col - native_prediction"
+        dtw_base_col = WTE_RESID_BASE_COL  # z_surf - R; dtw = base - resid_hat
+        wte_features = {
+            FAC_REM_WTE_ANOM_COL: "(z_surf - fac_rem_dtw) - R, from the FAC raster "
+            "registry; NaN outside the built basins (NaN+indicator)",
+            DEEP_REGIONAL_WTE_ANOM_COL: "deep-well WTE IDW - R (deep-regime anomaly)",
+        }
+        leakage_notes += [
+            "wte_residual: target = obs_wte - R (small head residual); features are "
+            "anomalies-from-R (translation-invariant -- no absolute elevation fed). "
+            "Reconstruct dtw = (z_surf - R) - resid_hat; |WTE err| == |DTW err|.",
+            "HAND features removed; gridMET aridity KEPT (a tabular non-result is "
+            "not a GNN non-result). FAC-REM sourced from fac_rem_registry (same as "
+            "the inference grid), not the stacker shard table.",
+            "Anchors not supported in this mode yet (anchor BC would need a "
+            "head-anomaly anchor_head - R(anchor)); the build errors if requested.",
         ]
     else:
         target_mode = TARGET_DTW_RESIDUAL
@@ -806,6 +1045,7 @@ def main() -> None:
         target_definition = f"mean_dtw - {regional_prior_col} (cross-fit IDW prior)"
         final_dtw_definition = f"{regional_prior_col} + residual_hat"
         dtw_reconstruction = "regional_prior_col + native_prediction"
+        dtw_base_col = regional_prior_col
         wte_features = None
         leakage_notes.insert(
             0, "Query features = hand_m + cross-fit regional IDW prior (+ deep/RELIEF)."
@@ -839,10 +1079,15 @@ def main() -> None:
         "obs_wte_col": OBS_WTE_COL,
         "surface_elev_col": SURFACE_ELEV_COL,
         "regional_prior_col": regional_prior_col,
+        "dtw_base_col": dtw_base_col,
         "wte_features": wte_features,
         "cv_fold_col": "cv_fold",
         "cv_group_col": "block_40km",
-        "cv_scheme": f"HUC4-blocked, {args.folds} folds",
+        "cv_unit_col": "cv_unit",
+        "cv_scheme": f"{args.cv_scheme}-blocked, {args.folds} folds",
+        "cv_block_km": args.cv_block_km if args.cv_scheme != "huc4" else None,
+        "huc12_polys": args.huc12_polys if args.cv_scheme == "huc12" else None,
+        "require_fac": bool(args.require_fac),
         "reach_feature_cols": reach_manifest["reach_feature_cols"],
         "reach_structural_nan_cols": reach_manifest["reach_structural_nan_cols"],
         "channel_edge_feature_cols": reach_manifest["channel_edge_feature_cols"],
