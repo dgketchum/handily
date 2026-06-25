@@ -2,8 +2,14 @@ import geopandas as gpd
 import numpy as np
 import rioxarray  # noqa: F401
 import xarray as xr
+from shapely.geometry import LineString
 
 from handily.rem_fac import (
+    _JUNCTION_TOL,
+    _rasterize_sparse_sections_from_arrays,
+    _sample_section_pixels,
+    _strip_endpoint_arrays,
+    _terminal_endpoints,
     build_fac_wedges,
     build_orientation_field,
     fill_sparse_sections_gaussian,
@@ -135,6 +141,151 @@ def test_fill_sparse_sections_gaussian_fills_grid():
     )
     assert int(np.isfinite(filled_da.values).sum()) == filled_da.values.size
     assert int(np.isfinite(rem_da.values).sum()) == rem_da.values.size
+
+
+def test_terminal_endpoints_subcell_tolerance():
+    # Two reaches whose meeting endpoints are ~0.57 m apart (< _JUNCTION_TOL = 1 m)
+    # but round to adjacent grid cells: the cKDTree euclidean test must still
+    # join them, so neither shared endpoint is flagged terminal.
+    assert _JUNCTION_TOL >= 0.5
+    g = [LineString([(0, 0), (0, 100)]), LineString([(0.4, 100.4), (50, 200)])]
+    ids = [10, 20]
+    term_start, term_end = _terminal_endpoints(g, ids)
+    assert 10 not in term_end  # reach 10's end meets reach 20's start
+    assert 20 not in term_start
+    # the genuinely free endpoints remain terminal
+    assert 10 in term_start
+    assert 20 in term_end
+
+
+def test_generate_fac_strips_worker_equivalence():
+    dem_da = _synthetic_dem()
+    streams = _synthetic_streams()
+    field = build_orientation_field(dem_da, coarse_res_m=5.0, smooth_sigma_m=20.0)
+    params = dict(
+        station_spacing_m=10.0,
+        tangent_step_m=5.0,
+        min_hit_dist_m=1.0,
+        halo_n=4,
+        max_crossing_strip_m=50.0,
+    )
+    s1 = generate_fac_strips(streams, dem_da, field=field, workers=1, **params)
+    s3 = generate_fac_strips(streams, dem_da, field=field, workers=3, **params)
+    cols = [
+        "reach_id",
+        "station_id",
+        "side",
+        "hit_type",
+        "target_reach_id",
+        "dist_m",
+        "base_x",
+        "base_y",
+        "endpoint_x",
+        "endpoint_y",
+    ]
+    a = s1[cols].round(6).sort_values(cols).reset_index(drop=True)
+    b = s3[cols].round(6).sort_values(cols).reset_index(drop=True)
+    assert a.equals(b)
+
+
+def test_generate_fac_strips_naked_mode_bounded():
+    dem_da = _synthetic_dem()
+    streams = _synthetic_streams()
+    field = build_orientation_field(dem_da, coarse_res_m=5.0, smooth_sigma_m=20.0)
+    strips = generate_fac_strips(
+        streams,
+        dem_da,
+        field=field,
+        station_spacing_m=10.0,
+        tangent_step_m=5.0,
+        min_hit_dist_m=1.0,
+        naked_fill_m=20.0,
+    )
+    # naked mode disables edge strips and emits bounded flat anchors instead
+    assert (strips["hit_type"] == "edge").sum() == 0
+    naked = strips.loc[strips["hit_type"] == "naked"]
+    assert not naked.empty
+    # every naked strip is clamped to <= naked_fill_m (shorter only near the edge)
+    assert float(naked["dist_m"].max()) <= 20.0 + 1e-6
+
+
+def test_rasterize_sparse_sections_array_matches_per_strip():
+    # The fused array burn must be bit-identical to sampling each equivalent
+    # 2-vertex LineString through the per-strip reference path.
+    dem_da = _synthetic_dem()
+    x_vals = dem_da.x.values.astype(np.float64)
+    y_vals = dem_da.y.values.astype(np.float64)
+    rng = np.random.default_rng(11)
+    n = 200
+    bx = rng.uniform(5, 95, n)
+    by = rng.uniform(5, 95, n)
+    ang = rng.uniform(0, 2 * np.pi, n)
+    length = rng.uniform(1, 40, n)
+    ex = bx + np.cos(ang) * length
+    ey = by + np.sin(ang) * length
+    be = rng.uniform(100, 120, n)
+    ee = be + rng.uniform(-5, 5, n)
+    # exercise the keep mask: one NaN elevation, one degenerate zero-length
+    ee[3] = np.nan
+    ex[7], ey[7] = bx[7], by[7]
+
+    ny, nx = len(y_vals), len(x_vals)
+    ref_min = np.full((ny, nx), np.inf)
+    ref_cnt = np.zeros((ny, nx))
+    for i in range(n):
+        if not (np.isfinite(be[i]) and np.isfinite(ee[i])):
+            continue
+        geom = LineString([(bx[i], by[i]), (ex[i], ey[i])])
+        res = _sample_section_pixels(geom, be[i], ee[i], x_vals, y_vals)
+        if res is None:
+            continue
+        r, c, e = res
+        np.minimum.at(ref_min, (r, c), e)
+        np.add.at(ref_cnt, (r, c), 1.0)
+    ref_ws = np.where(ref_cnt > 0, ref_min, np.nan)
+
+    min_arr, cnt = _rasterize_sparse_sections_from_arrays(
+        bx, by, ex, ey, be, ee, x_vals, y_vals
+    )
+    ws = np.where(cnt > 0, min_arr, np.nan)
+    assert np.array_equal(ref_cnt, cnt)
+    assert np.array_equal(np.isfinite(ref_ws), np.isfinite(ws))
+    finite = np.isfinite(ref_ws)
+    assert float(np.max(np.abs(ref_ws[finite] - ws[finite]))) == 0.0
+
+
+def test_rasterize_sparse_sections_array_batch_invariant():
+    # The sample-budget batching must not change the result.
+    x_vals = np.arange(0.5, 100.0, 1.0)
+    y_vals = np.arange(99.5, -0.5, -1.0)
+    rng = np.random.default_rng(3)
+    n = 150
+    bx = rng.uniform(5, 95, n)
+    by = rng.uniform(5, 95, n)
+    ex = bx + rng.uniform(-30, 30, n)
+    ey = by + rng.uniform(-30, 30, n)
+    be = rng.uniform(100, 120, n)
+    ee = be + rng.uniform(-5, 5, n)
+    m1, c1 = _rasterize_sparse_sections_from_arrays(
+        bx, by, ex, ey, be, ee, x_vals, y_vals
+    )
+    m2, c2 = _rasterize_sparse_sections_from_arrays(
+        bx, by, ex, ey, be, ee, x_vals, y_vals, sample_budget=64
+    )
+    assert np.array_equal(c1, c2)
+    assert np.array_equal(np.isnan(m1), np.isnan(m2))
+    assert np.array_equal(m1[np.isfinite(m1)], m2[np.isfinite(m2)])
+
+
+def test_strip_endpoint_arrays_fallback_to_geometry():
+    # Without explicit endpoint columns, the helper extracts first/last vertices.
+    geoms = [LineString([(1, 2), (3, 4)]), LineString([(5, 6), (7, 8), (9, 10)])]
+    strips = gpd.GeoDataFrame({"geometry": geoms}, geometry="geometry", crs="EPSG:5070")
+    bx, by, ex, ey = _strip_endpoint_arrays(strips)
+    assert np.array_equal(bx, [1.0, 5.0])
+    assert np.array_equal(by, [2.0, 6.0])
+    assert np.array_equal(ex, [3.0, 9.0])
+    assert np.array_equal(ey, [4.0, 10.0])
 
 
 def test_fill_sparse_sections_idw_fills_within_radius():
