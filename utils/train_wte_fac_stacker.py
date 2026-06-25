@@ -1,5 +1,12 @@
 """Pilot level-1 stacker: learn DTW from ConusWTE + ConusFAC under blocked CV.
 
+The two level-0 priors are physically distinct surfaces (see "DTW Prior Taxonomy"
+in CLAUDE.md) and must never be conflated:
+  * FAC-REM (`fac_rem_dtw_m`) -- a terrain-following HAND DEPTH below ground from
+    the FAC pipeline; the shallow / near-stream prior.
+  * WTE IDW (`wte_dtw` = land_surface_elev - WTE) -- a regional water-table
+    ELEVATION surface (k-NN IDW of well altitudes); the deep / regional prior.
+
 Trains a HistGradientBoosting stacker on the ConusFAC-covered wells of the feature
 table (`build_stacker_features.py`) and scores it against its two level-0 inputs and
 the national benchmarks, on a common footprint, with the metric panel the project

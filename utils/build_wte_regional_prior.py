@@ -403,7 +403,14 @@ def idw_predict(
     power: float = 2.0,
     eps: float = 1e-6,
 ) -> np.ndarray:
-    """k-nearest inverse-distance interpolation with optional sample weights."""
+    """WTE IDW: k-nearest inverse-distance interpolation of well water-table
+    ELEVATIONS across a basin (regional aquifer-surface prior), with optional
+    sample weights.
+
+    This is the *WTE IDW* and is unrelated to the FAC pipeline's *strip-fill IDW*
+    (``rem_fac.fill_sparse_sections_idw``, a local fill of channel cross-section
+    strips inside the shallow REM solve). They share only the acronym.
+    """
     train_xy = np.asarray(train_xy, dtype="float64")
     train_y = np.asarray(train_y, dtype="float64")
     query_xy = np.asarray(query_xy, dtype="float64")
