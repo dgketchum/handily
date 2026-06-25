@@ -237,6 +237,7 @@ def write_config(
         "[strips]\n"
         f"max_crossing_strip_m = {args.max_crossing_strip_m}\n"
         f"naked_fill_m = {args.naked_fill_m}\n"
+        f"workers = {args.workers}\n"
         f"{raster_block}\n"
         "[propagation]\n"
         f"down_distance_scale_m = {args.down_distance_scale_m}\n"
@@ -298,7 +299,13 @@ def main(argv: list[str] | None = None) -> None:
         default=90,
         help="GSW permanent-water occurrence %%",
     )
-    p.add_argument("--workers", type=int, default=32, help="WBT max_procs")
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=32,
+        help="parallelism for WBT FAC + rem_fac strip-gen (worker count never "
+        "affects output, only runtime)",
+    )
 
     # Arid-regime overrides (defaults = the accepted Mesilla values)
     p.add_argument("--ndvi-mid", type=float, default=0.23)
