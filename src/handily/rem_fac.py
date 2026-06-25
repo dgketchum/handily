@@ -1381,34 +1381,65 @@ def build_fac_wedges(strips: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(rows, geometry="geometry", crs=strips.crs)
 
 
+_ENDPOINT_COLS = ("base_x", "base_y", "endpoint_x", "endpoint_y")
+
+
+def _has_endpoint_columns(strips: gpd.GeoDataFrame) -> bool:
+    """True when the explicit straight base->endpoint coordinate columns are
+    present (always the case for strips from :func:`generate_fac_strips`)."""
+    return all(c in strips.columns for c in _ENDPOINT_COLS)
+
+
 def _strip_endpoint_arrays(
     strips: gpd.GeoDataFrame,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """(base_x, base_y, endpoint_x, endpoint_y) for every strip.
+    """(base_x, base_y, endpoint_x, endpoint_y) from the explicit endpoint
+    columns that :func:`generate_fac_strips` always emits.
 
-    Prefers the explicit endpoint columns (always present on strips from
-    :func:`generate_fac_strips`); falls back to the first/last vertex of each
-    geometry for callers that pass a bare geometry GeoDataFrame.
+    Only valid for straight base->endpoint strips. Geometry-only inputs may be
+    bent and must have their full path walked, so they go through
+    :func:`_rasterize_sparse_sections_from_geoms` instead of this fast path.
     """
-    cols = ("base_x", "base_y", "endpoint_x", "endpoint_y")
-    if all(c in strips.columns for c in cols):
-        return (
-            strips["base_x"].to_numpy(dtype=np.float64),
-            strips["base_y"].to_numpy(dtype=np.float64),
-            strips["endpoint_x"].to_numpy(dtype=np.float64),
-            strips["endpoint_y"].to_numpy(dtype=np.float64),
-        )
-    geoms = strips.geometry.values
-    coords, index = shapely.get_coordinates(geoms, return_index=True)
-    n = len(geoms)
-    first_pos = np.searchsorted(index, np.arange(n), side="left")
-    last_pos = np.searchsorted(index, np.arange(n), side="right") - 1
     return (
-        coords[first_pos, 0],
-        coords[first_pos, 1],
-        coords[last_pos, 0],
-        coords[last_pos, 1],
+        strips["base_x"].to_numpy(dtype=np.float64),
+        strips["base_y"].to_numpy(dtype=np.float64),
+        strips["endpoint_x"].to_numpy(dtype=np.float64),
+        strips["endpoint_y"].to_numpy(dtype=np.float64),
     )
+
+
+def _rasterize_sparse_sections_from_geoms(
+    strips: gpd.GeoDataFrame,
+    x_vals: np.ndarray,
+    y_vals: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-cell min/count burn for geometry-only strip inputs.
+
+    Walks each LineString's full path via :func:`_sample_section_pixels` so a
+    bent strip burns along every segment (not just the base->endpoint chord), and
+    skips empty/degenerate geometries instead of raising. Used for public callers
+    that pass a bare geometry GeoDataFrame; strips from
+    :func:`generate_fac_strips` carry endpoint columns and take the faster fused
+    :func:`_rasterize_sparse_sections_from_arrays` path.
+    """
+    ny, nx = len(y_vals), len(x_vals)
+    min_arr = np.full((ny, nx), np.inf, dtype=np.float64)
+    count_arr = np.zeros((ny, nx), dtype=np.float64)
+    geoms = strips.geometry.values
+    base_elev = strips["base_elev_m"].to_numpy(dtype=np.float64)
+    endpoint_elev = strips["endpoint_elev_m"].to_numpy(dtype=np.float64)
+    for geom, be, ee in zip(geoms, base_elev, endpoint_elev):
+        if geom is None or geom.is_empty:
+            continue
+        if not (np.isfinite(be) and np.isfinite(ee)):
+            continue
+        result = _sample_section_pixels(geom, be, ee, x_vals, y_vals)
+        if result is None:
+            continue
+        rows, cols, elevs = result
+        np.minimum.at(min_arr, (rows, cols), elevs)
+        np.add.at(count_arr, (rows, cols), 1.0)
+    return min_arr, count_arr
 
 
 def _rasterize_sparse_sections_from_arrays(
@@ -1530,7 +1561,7 @@ def rasterize_sparse_sections_20m(
     if strips.empty:
         min_arr = np.full((ny, nx), np.inf, dtype=np.float64)
         count_arr = np.zeros((ny, nx), dtype=np.float64)
-    else:
+    elif _has_endpoint_columns(strips):
         bx, by, ex, ey = _strip_endpoint_arrays(strips)
         min_arr, count_arr = _rasterize_sparse_sections_from_arrays(
             bx,
@@ -1541,6 +1572,12 @@ def rasterize_sparse_sections_20m(
             strips["endpoint_elev_m"].to_numpy(dtype=np.float64),
             x_vals,
             y_vals,
+        )
+    else:
+        # Geometry-only callers: walk each LineString's full (possibly bent) path
+        # and skip empty geometries rather than reduce to a straight chord.
+        min_arr, count_arr = _rasterize_sparse_sections_from_geoms(
+            strips, x_vals, y_vals
         )
 
     ws = np.full((ny, nx), np.nan, dtype=np.float64)
