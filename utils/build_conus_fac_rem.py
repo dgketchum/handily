@@ -31,7 +31,10 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
+from rasterio import Affine, windows
 from rasterio.features import rasterize
+from rasterio.warp import Resampling, reproject
+from rasterio.windows import Window
 
 from handily import regional_fac
 
@@ -49,6 +52,23 @@ NHD_GDB = (
 PROFILE = "/home/dgketchum/code/handily/configs/rem/profiles/conus_fac_rem.toml"
 OUT_ROOT = "/data/ssd2/handily/conus/fac_rem"
 
+# --- 100 m CONUS retention grid ------------------------------------------
+# Per-HUC8 10 m REM rasters are first-class products but too large to keep
+# CONUS-wide, so each is downsampled (average) onto this shared 100 m grid and
+# appended to a mosaic. The grid is defined pixel-for-pixel from the DTW stacker
+# grid (wte_dtw_100m_5070.tif) so every retained tile co-registers with it.
+COMMON_GRID = "/data/ssd2/handily/conus/hydrography90m/wte_dtw_100m_5070.tif"
+MOSAIC_CRS = "EPSG:5070"
+MOSAIC_TRANSFORM = Affine(100.0, 0.0, -2540000.0, 0.0, -100.0, 3258000.0)
+MOSAIC_WIDTH = 49810
+MOSAIC_HEIGHT = 31390
+MOSAIC_NODATA = -9999.0
+# FAC-REM = depth (shallow water-table prior); WS = strip-fill-IDW water-surface
+# ELEVATION. Distinct surfaces, named so they can never be confused (see
+# notes/FAC_REM_WTE_NAMING_AND_RETENTION_HANDOFF.md).
+REM_MOSAIC = "fac_rem_dtw_100m_5070.tif"
+WS_MOSAIC = "fac_rem_water_surface_100m_5070.tif"
+
 # Regime-spread pilot HUC8s (verified to exist with unconfined wells).
 PILOT = {
     "13030102": "arid_rift_mesilla",
@@ -61,8 +81,23 @@ PILOT = {
 
 UNCONFINED = ("unconfined", "unconfined_marginal")
 
-# WBT intermediates safe to delete after a successful build (large, derivable).
+# Per-HUC8 intermediates safe to delete after the shard is written (large,
+# fully derivable from inputs). These dominate per-HUC8 disk (3-4 GB each on a
+# large HUC8); leaving them in place would blow the CONUS-wide build past disk.
+#
+# The 10 m REM depth (fac_head_depth_rem_10m.tif) and water surface
+# (fac_rem_water_surface_10m.tif) are deliberately NOT here: they are first-class
+# model products, not scratch. They are downsampled into the 100 m mosaics
+# (_retain_mosaics) and only then deleted, so a mosaic failure never loses them.
 _CLEANUP = (
+    # rem_fac intermediate rasters (3-4 GB each on large HUC8s)
+    "fac_head_depth_sparse_10m.tif",
+    "fac_normals_smoothed_dem.tif",
+    "fac_normals_cross_sections.fgb",
+    # terrain inputs (re-derivable from the shared dem_tiles cache + NHD)
+    "dem_10m.tif",
+    "flow_accumulation.tif",
+    # legacy WBT intermediate names (harmless if absent on this rem_fac variant)
     "dem_10m_filled.tif",
     "d8_pointer.tif",
     "streams_10m.tif",
@@ -197,6 +232,145 @@ def _sample_wells(rem_path: Path, wells_huc8: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _mosaic_profile() -> dict:
+    """rasterio profile for a 100 m CONUS mosaic on the common grid."""
+    return {
+        "driver": "GTiff",
+        "height": MOSAIC_HEIGHT,
+        "width": MOSAIC_WIDTH,
+        "count": 1,
+        "dtype": "float32",
+        "crs": MOSAIC_CRS,
+        "transform": MOSAIC_TRANSFORM,
+        "nodata": MOSAIC_NODATA,
+        "tiled": True,
+        "blockxsize": 256,
+        "blockysize": 256,
+        "compress": "lzw",
+        "BIGTIFF": "YES",
+    }
+
+
+def _ensure_mosaic(path: Path) -> None:
+    """Create an all-nodata 100 m mosaic on the common grid if it is absent.
+
+    Initialised explicitly to nodata (not sparse) so that any HUC8 never built
+    reads back as nodata rather than a spurious 0 depth.
+    """
+    if path.exists():
+        return
+    prof = _mosaic_profile()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(path, "w", **prof) as dst:
+        block = int(prof["blockysize"])
+        fill = np.full((block, dst.width), MOSAIC_NODATA, dtype="float32")
+        for r0 in range(0, dst.height, block):
+            h = min(block, dst.height - r0)
+            dst.write(fill[:h], 1, window=Window(0, r0, dst.width, h))
+
+
+def _grid_window(bounds, transform, width: int, height: int) -> Window | None:
+    """Integer, in-bounds mosaic window covering *bounds* (5070)."""
+    minx, miny, maxx, maxy = bounds
+    win = windows.from_bounds(minx, miny, maxx, maxy, transform)
+    col0 = max(0, int(np.floor(win.col_off)))
+    row0 = max(0, int(np.floor(win.row_off)))
+    col1 = min(width, int(np.ceil(win.col_off + win.width)))
+    row1 = min(height, int(np.ceil(win.row_off + win.height)))
+    if col1 <= col0 or row1 <= row0:
+        return None
+    return Window(col0, row0, col1 - col0, row1 - row0)
+
+
+def _append_to_mosaic(src_path: Path, poly, mosaic_path: Path) -> int:
+    """Downsample a 10 m raster to the 100 m grid and write the unbuffered HUC8
+    footprint into the CONUS mosaic in place. Returns cells written.
+
+    The 10 m REM is built over a halo; only cells inside the unbuffered HUC8
+    polygon are written so adjacent HUC8s never overwrite each other's footprint.
+    """
+    _ensure_mosaic(mosaic_path)
+    with rasterio.open(mosaic_path, "r+") as dst:
+        win = _grid_window(poly.bounds, dst.transform, dst.width, dst.height)
+        if win is None:
+            return 0
+        win_transform = windows.transform(win, dst.transform)
+        h, w = int(win.height), int(win.width)
+
+        downsampled = np.full((h, w), MOSAIC_NODATA, dtype="float32")
+        with rasterio.open(src_path) as src:
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=downsampled,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                src_nodata=src.nodata,
+                dst_transform=win_transform,
+                dst_crs=dst.crs,
+                dst_nodata=MOSAIC_NODATA,
+                resampling=Resampling.average,
+            )
+        keep = rasterize(
+            [(poly, 1)],
+            out_shape=(h, w),
+            transform=win_transform,
+            fill=0,
+            dtype="uint8",
+        ).astype(bool)
+        new = keep & (downsampled != MOSAIC_NODATA) & np.isfinite(downsampled)
+        block = dst.read(1, window=win)
+        block[new] = downsampled[new]
+        dst.write(block, 1, window=win)
+        return int(new.sum())
+
+
+def _retain_mosaics(huc8, rem_path: Path, ws_path: Path, poly, out_root: Path) -> bool:
+    """Downsample the 10 m REM (depth) and water surface (elevation) into the
+    100 m CONUS mosaics. Returns True only if the REM mosaic write succeeded —
+    the gate for deleting the 10 m rasters.
+    """
+    try:
+        n = _append_to_mosaic(rem_path, poly, out_root / REM_MOSAIC)
+        log.info("[%s] +%d cells -> %s", huc8, n, REM_MOSAIC)
+        if ws_path.exists():
+            nw = _append_to_mosaic(ws_path, poly, out_root / WS_MOSAIC)
+            log.info("[%s] +%d cells -> %s", huc8, nw, WS_MOSAIC)
+        return True
+    except Exception as e:  # noqa: BLE001 - keep the 10 m REM if mosaicking fails
+        log.exception("[%s] 100 m mosaic append failed: %s", huc8, e)
+        return False
+
+
+def finalize_cog(out_root: Path) -> None:
+    """Convert the incremental 100 m mosaics to true COGs (overviews + COG IFD
+    layout) as ``*_cog.tif``. Run once after a CONUS batch finishes -- the
+    per-HUC8 mosaics are plain tiled BigTIFFs because a COG cannot be appended to
+    incrementally.
+    """
+    for name in (REM_MOSAIC, WS_MOSAIC):
+        src = out_root / name
+        if not src.exists():
+            log.info("no %s to finalize -> skip", name)
+            continue
+        dst = src.with_name(f"{src.stem}_cog.tif")
+        cmd = [
+            "gdal_translate",
+            str(src),
+            str(dst),
+            "-of",
+            "COG",
+            "-co",
+            "COMPRESS=LZW",
+            "-co",
+            "RESAMPLING=AVERAGE",
+            "-co",
+            "BIGTIFF=YES",
+        ]
+        log.info("finalizing COG: %s -> %s", src.name, dst.name)
+        subprocess.run(cmd, check=True)
+        log.info("wrote %s", dst)
+
+
 def build_one_huc8(huc8, label, poly, flow_join, wells_unique, args) -> bool:
     out_root = Path(args.out_root)
     shard_dir = out_root / "fac_rem_shards"
@@ -241,7 +415,17 @@ def build_one_huc8(huc8, label, poly, flow_join, wells_unique, args) -> bool:
     run_log = workdir / "rem_fac.log"
     with open(run_log, "w") as fh:
         proc = subprocess.run(
-            [sys.executable, "-m", "handily.rem_fac", "--config", str(cfg)],
+            [
+                sys.executable,
+                "-m",
+                "handily.rem_fac",
+                "--config",
+                str(cfg),
+                # The strip layer is a burn intermediate, not a product, and is
+                # cleaned up anyway -- skip materializing tens of millions of
+                # LineStrings to disk at CONUS scale.
+                "--no-strip-debug",
+            ],
             stdout=fh,
             stderr=subprocess.STDOUT,
         )
@@ -268,9 +452,26 @@ def build_one_huc8(huc8, label, poly, flow_join, wells_unique, args) -> bool:
         shard.name,
     )
 
+    # Retained durable products: the 10 m REM (depth) and water surface
+    # (elevation) are first-class outputs but too large to keep CONUS-wide.
+    # Downsample them into the 100 m mosaics on the common grid, then drop the
+    # 10 m rasters -- but only after the mosaic write succeeds, so a mosaic
+    # failure never silently loses them.
+    ws_path = workdir / "fac_rem_water_surface_10m.tif"
+    mosaic_ok = _retain_mosaics(huc8, rem_path, ws_path, poly, out_root)
+
     if not args.keep_intermediates:
         for name in _CLEANUP:
             (workdir / name).unlink(missing_ok=True)
+        if mosaic_ok:
+            rem_path.unlink(missing_ok=True)
+            ws_path.unlink(missing_ok=True)
+        else:
+            log.warning(
+                "[%s] keeping 10 m REM/water surface in %s (mosaic write failed)",
+                huc8,
+                workdir,
+            )
     return True
 
 
@@ -335,21 +536,72 @@ def validate(args) -> None:
                 for g in [cf[(cf.mean_dtw >= lo) & (cf.mean_dtw < hi)]]
             )
             log.info("  %-8s %s | %s", name, line, db)
+        # shallow skill for every predictor so the GO/NO-GO gate (fac_rem vs HAND
+        # <5m recall) reads directly off the panel.
         for thr in (2, 5, 10):
-            tp = int(((cf.fac_rem_dtw_m < thr) & (cf.mean_dtw < thr)).sum())
-            obs = int((cf.mean_dtw < thr).sum())
-            pred = int((cf.fac_rem_dtw_m < thr).sum())
-            log.info(
-                "  fac_rem shallow<%dm: recall=%.3f precision=%.3f (obs=%d)",
-                thr,
-                tp / max(obs, 1),
-                tp / max(pred, 1),
-                obs,
-            )
+            obs_mask = cf.mean_dtw < thr
+            obs = int(obs_mask.sum())
+            for name, col in (
+                ("fac_rem", "fac_rem_dtw_m"),
+                ("hand", "hand_m"),
+                ("janssen", "janssen_dtw"),
+            ):
+                pred_mask = cf[col] < thr
+                tp = int((pred_mask & obs_mask).sum())
+                pred = int(pred_mask.sum())
+                log.info(
+                    "  %-8s shallow<%dm: recall=%.3f precision=%.3f (obs=%d)",
+                    name,
+                    thr,
+                    tp / max(obs, 1),
+                    tp / max(pred, 1),
+                    obs,
+                )
 
     for huc8 in sorted(df["huc8"].unique()):
         show(df[df["huc8"] == huc8], f"HUC8 {huc8} {PILOT.get(huc8, '')}")
     show(df, "POOLED (all pilot HUC8s)")
+
+
+def _validate_halo(halo_km: float) -> None:
+    """Warn loudly if the halo is too thin for the active profile's reach.
+
+    A strip can travel up to ``max_crossing_strip_m`` to find a neighbor stream,
+    and the sparse burn is then IDW-filled out to ``idw_radius_m``. If the halo
+    is narrower than their sum, an interior cell near the unbuffered HUC8 edge can
+    draw on streams/strips that were clipped away at the halo boundary, producing
+    a seam in the 100 m mosaic. This is advisory (some border HUC8s legitimately
+    run thin), not a hard stop.
+    """
+    # The profile defines no [paths], so it cannot be instantiated as a full
+    # FacRemConfig; read the two values we need straight from the (profile-aware)
+    # raw TOML, falling back to the dataclass defaults if a key is absent.
+    from handily.rem_fac_config import _load_toml_with_profile
+
+    raw, _ = _load_toml_with_profile(Path(PROFILE))
+    max_crossing = float(raw.get("strips", {}).get("max_crossing_strip_m", 0.0))
+    idw_radius = float(raw.get("raster", {}).get("idw_radius_m", 200.0))
+    needed_m = max_crossing + idw_radius
+    halo_m = halo_km * 1000.0
+    if halo_m < needed_m:
+        log.warning(
+            "HALO TOO THIN: halo_km=%.1f (%.0f m) < max_crossing_strip_m"
+            " (%.0f) + idw_radius_m (%.0f) = %.0f m. Cells near the HUC8 edge"
+            " may seam in the mosaic; raise --halo-km to >= %.1f.",
+            halo_km,
+            halo_m,
+            max_crossing,
+            idw_radius,
+            needed_m,
+            needed_m / 1000.0,
+        )
+    else:
+        log.info(
+            "halo OK: %.0f m >= max_crossing_strip_m (%.0f) + idw_radius_m (%.0f)",
+            halo_m,
+            max_crossing,
+            idw_radius,
+        )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -358,20 +610,48 @@ def main(argv: list[str] | None = None) -> None:
     )
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--huc8", nargs="*", help="HUC8 codes (default: pilot set)")
+    p.add_argument(
+        "--huc8-list",
+        help="file with one HUC8 code per line (for CONUS-wide batches)",
+    )
     p.add_argument("--out-root", default=OUT_ROOT)
     p.add_argument("--halo-km", type=float, default=5.0)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--keep-intermediates", action="store_true")
     p.add_argument("--force", action="store_true", help="rebuild even if shard exists")
     p.add_argument("--validate-only", action="store_true")
+    p.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="skip the post-build validation panel (for long batches)",
+    )
+    p.add_argument(
+        "--finalize-cog",
+        action="store_true",
+        help="convert the incremental 100m mosaics to true COGs and exit",
+    )
     args = p.parse_args(argv)
+
+    if args.finalize_cog:
+        finalize_cog(Path(args.out_root))
+        return
 
     if args.validate_only:
         validate(args)
         return
 
-    huc8s = args.huc8 or list(PILOT)
-    log.info("pilot HUC8s: %s", huc8s)
+    _validate_halo(args.halo_km)
+
+    if args.huc8_list:
+        listed = [
+            ln.strip()
+            for ln in Path(args.huc8_list).read_text().splitlines()
+            if ln.strip() and not ln.startswith("#")
+        ]
+        huc8s = listed + list(args.huc8 or [])
+    else:
+        huc8s = args.huc8 or list(PILOT)
+    log.info("target HUC8s: %d", len(huc8s))
 
     polys = gpd.read_parquet(HUC8_POLYS).set_index("huc8")
     log.info("loading flowline geometry + reach attributes ...")
@@ -406,7 +686,7 @@ def main(argv: list[str] | None = None) -> None:
         except Exception as e:  # noqa: BLE001 - keep the pilot going past one failure
             log.exception("[%s] build failed: %s", huc8, e)
     log.info("built %d/%d HUC8s", ok, len(huc8s))
-    if ok:
+    if ok and not args.no_validate:
         validate(args)
 
 
