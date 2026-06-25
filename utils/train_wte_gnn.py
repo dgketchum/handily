@@ -193,10 +193,12 @@ class WTEGraphNet(nn.Module):
         f_anchor_reach: int | None = None,
         f_anchor_query: int | None = None,
         pinball: bool = False,
+        fac_skip: bool = False,
     ) -> None:
         super().__init__()
         self.has_anchor = f_anchor is not None
         self.pinball = pinball
+        self.fac_skip = fac_skip
         self.reach_enc = nn.Sequential(
             nn.Linear(f_reach, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
         )
@@ -229,6 +231,12 @@ class WTEGraphNet(nn.Module):
                 hidden, hidden, f_anchor_query, hidden, dropout=dropout
             )
             head_in = hidden * 3  # [q, ctx_reach, ctx_anchor]
+        if self.fac_skip:
+            # raw-FAC bypass: the standardized FAC target-estimate + its presence flag
+            # ride straight to the head (un-smoothed), and the output is anchored on
+            # that estimate so message passing can only CORRECT FAC, never erase its
+            # sharp shallow signal (the diagnosed over-smoothing failure).
+            head_in += 2
         self.head = nn.Sequential(
             nn.Linear(head_in, hidden),
             nn.ReLU(),
@@ -266,9 +274,18 @@ class WTEGraphNet(nn.Module):
             q = self.query_enc(g["query_x"])
             ctx = self.lateral(r, q, g["lat_ei"], g["lat_ea"])
             h = torch.cat([q, ctx], dim=-1)
-        primary = self.head(h).squeeze(-1)
+        if self.fac_skip:
+            # g["fac_base"] is FAC's target-estimate standardized in THIS fold's target
+            # space (0 where FAC is absent); g["fac_present"] is the 0/1 coverage flag.
+            fb = g["fac_base"].view(-1, 1)
+            pres = g["fac_present"].view(-1, 1)
+            h = torch.cat([h, fb, pres], dim=-1)
+            skip = (pres * fb).squeeze(-1)  # FAC estimate where present, else 0
+        else:
+            skip = 0.0
+        primary = self.head(h).squeeze(-1) + skip
         if self.pinball:
-            return primary, self.pin_head(h).squeeze(-1)
+            return primary, self.pin_head(h).squeeze(-1) + skip
         return primary
 
 
