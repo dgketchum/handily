@@ -11,6 +11,7 @@ Covers the two properties the CONUS-scale retention patch depends on:
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -125,3 +126,116 @@ def test_append_is_idempotent_on_rebuild(tmp_path, monkeypatch):
         second = r.read(1)
     np.testing.assert_array_equal(first, second)
     assert second[3, 3] == pytest.approx(7.0)
+
+
+def test_append_clears_stale_value_when_rebuild_tile_is_nodata(tmp_path, monkeypatch):
+    """A rebuild whose new tile is nodata over a previously-finite cell must clear
+    the stale depth, not leave the old value behind."""
+    monkeypatch.setattr(bc, "MOSAIC_WIDTH", 8)
+    monkeypatch.setattr(bc, "MOSAIC_HEIGHT", 8)
+    monkeypatch.setattr(bc, "MOSAIC_TRANSFORM", Affine(100.0, 0, 0, 0, -100.0, 1000.0))
+    mosaic = tmp_path / "mosaic.tif"
+    poly = box(300, 600, 400, 700)
+    transform = Affine(10.0, 0, 300.0, 0, -10.0, 700.0)
+
+    # First build: finite depth lands in the footprint cell.
+    rem1 = tmp_path / "rem1_10m.tif"
+    _write_raster(rem1, np.full((10, 10), 5.0), transform, nodata=bc.MOSAIC_NODATA)
+    bc._append_to_mosaic(rem1, poly, mosaic)
+    with rasterio.open(mosaic) as r:
+        assert r.read(1)[3, 3] == pytest.approx(5.0)
+
+    # Rebuild: the new tile is all-nodata over the same footprint.
+    rem2 = tmp_path / "rem2_10m.tif"
+    _write_raster(
+        rem2,
+        np.full((10, 10), bc.MOSAIC_NODATA),
+        transform,
+        nodata=bc.MOSAIC_NODATA,
+    )
+    n = bc._append_to_mosaic(rem2, poly, mosaic)
+    assert n == 0
+    with rasterio.open(mosaic) as r:
+        assert r.read(1)[3, 3] == bc.MOSAIC_NODATA
+
+
+def _backfill_args(out_root, keep_intermediates):
+    return SimpleNamespace(
+        out_root=str(out_root), force=False, keep_intermediates=keep_intermediates
+    )
+
+
+def test_resume_backfills_mosaic_when_shard_predates_marker(tmp_path, monkeypatch):
+    """A shard with no mosaic marker but a surviving 10 m REM is backfilled into
+    the mosaics (and marked done), not silently skipped."""
+    monkeypatch.setattr(bc, "MOSAIC_WIDTH", 8)
+    monkeypatch.setattr(bc, "MOSAIC_HEIGHT", 8)
+    monkeypatch.setattr(bc, "MOSAIC_TRANSFORM", Affine(100.0, 0, 0, 0, -100.0, 1000.0))
+    out_root = tmp_path
+    huc8 = "13030102"
+    (out_root / "fac_rem_shards").mkdir(parents=True)
+    (out_root / "fac_rem_shards" / f"{huc8}.parquet").write_bytes(
+        b""
+    )  # pre-mosaic shard
+    workdir = out_root / huc8
+    workdir.mkdir()
+    _write_raster(
+        workdir / "fac_head_depth_rem_10m.tif",
+        np.full((10, 10), 5.0),
+        Affine(10.0, 0, 300.0, 0, -10.0, 700.0),
+        nodata=bc.MOSAIC_NODATA,
+    )
+    poly = box(300, 600, 400, 700)
+
+    ok = bc.build_one_huc8(
+        huc8, "label", poly, None, None, _backfill_args(out_root, False)
+    )
+    assert ok
+    assert bc._mosaic_marker(out_root, huc8).exists()
+    with rasterio.open(out_root / bc.REM_MOSAIC) as r:
+        assert r.read(1)[3, 3] == pytest.approx(5.0)
+    # default cleanup removed the 10 m REM once the mosaic captured it
+    assert not (workdir / "fac_head_depth_rem_10m.tif").exists()
+
+
+def test_resume_skips_when_shard_and_marker_present(tmp_path, monkeypatch):
+    """Shard + marker -> a clean skip, no mosaic write attempted."""
+    out_root = tmp_path
+    huc8 = "13030102"
+    (out_root / "fac_rem_shards").mkdir(parents=True)
+    (out_root / "fac_rem_shards" / f"{huc8}.parquet").write_bytes(b"")
+    marker = bc._mosaic_marker(out_root, huc8)
+    marker.parent.mkdir(parents=True)
+    marker.touch()
+
+    ok = bc.build_one_huc8(
+        huc8,
+        "label",
+        box(300, 600, 400, 700),
+        None,
+        None,
+        _backfill_args(out_root, False),
+    )
+    assert ok
+    assert not (out_root / bc.REM_MOSAIC).exists()
+
+
+def test_resume_warns_when_rem_gone_and_no_marker(tmp_path, monkeypatch):
+    """Shard without a marker and no surviving 10 m REM -> no silent success: the
+    mosaic is not fabricated and no marker is written (needs a --force rebuild)."""
+    out_root = tmp_path
+    huc8 = "13030102"
+    (out_root / "fac_rem_shards").mkdir(parents=True)
+    (out_root / "fac_rem_shards" / f"{huc8}.parquet").write_bytes(b"")
+
+    ok = bc.build_one_huc8(
+        huc8,
+        "label",
+        box(300, 600, 400, 700),
+        None,
+        None,
+        _backfill_args(out_root, False),
+    )
+    assert ok  # returns True so the batch continues, but...
+    assert not bc._mosaic_marker(out_root, huc8).exists()
+    assert not (out_root / bc.REM_MOSAIC).exists()
