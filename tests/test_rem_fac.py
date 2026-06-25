@@ -6,6 +6,7 @@ from shapely.geometry import LineString
 
 from handily.rem_fac import (
     _JUNCTION_TOL,
+    _axes_from_bounds,
     _rasterize_sparse_sections_from_arrays,
     _sample_section_pixels,
     _strip_endpoint_arrays,
@@ -277,15 +278,63 @@ def test_rasterize_sparse_sections_array_batch_invariant():
     assert np.array_equal(m1[np.isfinite(m1)], m2[np.isfinite(m2)])
 
 
-def test_strip_endpoint_arrays_fallback_to_geometry():
-    # Without explicit endpoint columns, the helper extracts first/last vertices.
-    geoms = [LineString([(1, 2), (3, 4)]), LineString([(5, 6), (7, 8), (9, 10)])]
-    strips = gpd.GeoDataFrame({"geometry": geoms}, geometry="geometry", crs="EPSG:5070")
+def test_strip_endpoint_arrays_reads_columns():
+    # The fast path reads the explicit straight base->endpoint columns directly.
+    strips = gpd.GeoDataFrame(
+        {
+            "base_x": [1.0, 5.0],
+            "base_y": [2.0, 6.0],
+            "endpoint_x": [3.0, 9.0],
+            "endpoint_y": [4.0, 10.0],
+            "geometry": [LineString([(1, 2), (3, 4)]), LineString([(5, 6), (9, 10)])],
+        },
+        geometry="geometry",
+        crs="EPSG:5070",
+    )
     bx, by, ex, ey = _strip_endpoint_arrays(strips)
     assert np.array_equal(bx, [1.0, 5.0])
     assert np.array_equal(by, [2.0, 6.0])
     assert np.array_equal(ex, [3.0, 9.0])
     assert np.array_equal(ey, [4.0, 10.0])
+
+
+def test_rasterize_sparse_sections_geometry_only_walks_bent_path():
+    # Geometry-only callers (no endpoint columns) must walk each LineString's
+    # full path -- a bent strip burns along every segment, not just the
+    # base->endpoint chord -- and skip empty geometries without raising.
+    dem_da = _synthetic_dem()
+    bent = LineString([(10, 10), (10, 80), (80, 80)])  # right-angle dogleg
+    strips = gpd.GeoDataFrame(
+        {
+            "base_elev_m": [100.0, 100.0],
+            "endpoint_elev_m": [120.0, 120.0],
+            "geometry": [bent, LineString()],  # second geometry empty -> skipped
+        },
+        geometry="geometry",
+        crs="EPSG:5070",
+    )
+    ws_da, count_da = rasterize_sparse_sections_20m(strips, dem_da, res_m=20.0)
+
+    # Reference: only the bent strip, sampled through the per-geometry path on the
+    # same 20 m burn axes. The empty geometry contributes nothing.
+    x20, y20 = _axes_from_bounds(tuple(dem_da.rio.bounds()), 20.0)
+    rows, cols, elevs = _sample_section_pixels(bent, 100.0, 120.0, x20, y20)
+    ref_min = np.full((len(y20), len(x20)), np.inf)
+    ref_cnt = np.zeros((len(y20), len(x20)))
+    np.minimum.at(ref_min, (rows, cols), elevs)
+    np.add.at(ref_cnt, (rows, cols), 1.0)
+    ref_ws = np.where(ref_cnt > 0, ref_min, np.nan)
+
+    assert np.array_equal(ref_cnt, count_da.values)
+    assert np.array_equal(np.isfinite(ref_ws), np.isfinite(ws_da.values))
+    finite = np.isfinite(ref_ws)
+    assert float(np.max(np.abs(ref_ws[finite] - ws_da.values[finite]))) == 0.0
+    # The dogleg's vertical leg burns cells the straight chord would miss.
+    chord = LineString([(10, 10), (80, 80)])
+    cr, cc, _ = _sample_section_pixels(chord, 100.0, 120.0, x20, y20)
+    chord_cells = set(zip(cr.tolist(), cc.tolist()))
+    bent_cells = set(zip(rows.tolist(), cols.tolist()))
+    assert bent_cells - chord_cells
 
 
 def test_fill_sparse_sections_idw_fills_within_radius():
