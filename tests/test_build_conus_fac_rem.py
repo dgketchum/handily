@@ -165,77 +165,133 @@ def _backfill_args(out_root, keep_intermediates):
     )
 
 
-def test_resume_backfills_mosaic_when_shard_predates_marker(tmp_path, monkeypatch):
-    """A shard with no mosaic marker but a surviving 10 m REM is backfilled into
-    the mosaics (and marked done), not silently skipped."""
+def _small_grid(monkeypatch):
     monkeypatch.setattr(bc, "MOSAIC_WIDTH", 8)
     monkeypatch.setattr(bc, "MOSAIC_HEIGHT", 8)
     monkeypatch.setattr(bc, "MOSAIC_TRANSFORM", Affine(100.0, 0, 0, 0, -100.0, 1000.0))
-    out_root = tmp_path
-    huc8 = "13030102"
-    (out_root / "fac_rem_shards").mkdir(parents=True)
-    (out_root / "fac_rem_shards" / f"{huc8}.parquet").write_bytes(
-        b""
-    )  # pre-mosaic shard
+
+
+def _seed_shard_and_rasters(out_root, huc8, *, rem=5.0, ws_name=None, ws=9.0):
+    """Pre-mosaic shard + 10 m REM (and optional WS under *ws_name*) in workdir."""
+    (out_root / "fac_rem_shards").mkdir(parents=True, exist_ok=True)
+    (out_root / "fac_rem_shards" / f"{huc8}.parquet").write_bytes(b"")
     workdir = out_root / huc8
-    workdir.mkdir()
-    _write_raster(
-        workdir / "fac_head_depth_rem_10m.tif",
-        np.full((10, 10), 5.0),
-        Affine(10.0, 0, 300.0, 0, -10.0, 700.0),
-        nodata=bc.MOSAIC_NODATA,
-    )
+    workdir.mkdir(exist_ok=True)
+    tr = Affine(10.0, 0, 300.0, 0, -10.0, 700.0)
+    if rem is not None:
+        _write_raster(
+            workdir / bc.REM_RASTER, np.full((10, 10), rem), tr, nodata=bc.MOSAIC_NODATA
+        )
+    if ws_name is not None:
+        _write_raster(
+            workdir / ws_name, np.full((10, 10), ws), tr, nodata=bc.MOSAIC_NODATA
+        )
+    return workdir
+
+
+def test_resume_backfills_both_mosaics_when_shard_predates_marker(
+    tmp_path, monkeypatch
+):
+    """A shard with no marker but surviving 10 m REM + WS backfills BOTH mosaics,
+    marks done, and cleans up the 10 m rasters -- never a silent skip."""
+    _small_grid(monkeypatch)
+    huc8 = "13030102"
+    workdir = _seed_shard_and_rasters(tmp_path, huc8, ws_name=bc.WS_RASTER)
     poly = box(300, 600, 400, 700)
 
-    ok = bc.build_one_huc8(
-        huc8, "label", poly, None, None, _backfill_args(out_root, False)
+    status = bc.build_one_huc8(
+        huc8, "label", poly, None, None, _backfill_args(tmp_path, False)
     )
-    assert ok
-    assert bc._mosaic_marker(out_root, huc8).exists()
-    with rasterio.open(out_root / bc.REM_MOSAIC) as r:
+    assert status == bc.STATUS_BUILT
+    assert bc._mosaic_marker(tmp_path, huc8).exists()
+    with rasterio.open(tmp_path / bc.REM_MOSAIC) as r:
         assert r.read(1)[3, 3] == pytest.approx(5.0)
-    # default cleanup removed the 10 m REM once the mosaic captured it
-    assert not (workdir / "fac_head_depth_rem_10m.tif").exists()
+    with rasterio.open(tmp_path / bc.WS_MOSAIC) as r:
+        assert r.read(1)[3, 3] == pytest.approx(9.0)
+    # default cleanup removed both 10 m rasters once the mosaics captured them
+    assert not (workdir / bc.REM_RASTER).exists()
+    assert not (workdir / bc.WS_RASTER).exists()
+
+
+def test_resume_backfill_honours_legacy_ws_filename(tmp_path, monkeypatch):
+    """A pre-rename run whose WS file is fac_head_depth_idw_fill_10m.tif must still
+    populate the WS mosaic and mark complete."""
+    _small_grid(monkeypatch)
+    huc8 = "13030102"
+    _seed_shard_and_rasters(tmp_path, huc8, ws_name=bc.WS_RASTER_LEGACY)
+
+    status = bc.build_one_huc8(
+        huc8,
+        "label",
+        box(300, 600, 400, 700),
+        None,
+        None,
+        _backfill_args(tmp_path, True),
+    )
+    assert status == bc.STATUS_BUILT
+    assert bc._mosaic_marker(tmp_path, huc8).exists()
+    with rasterio.open(tmp_path / bc.WS_MOSAIC) as r:
+        assert r.read(1)[3, 3] == pytest.approx(9.0)
+
+
+def test_resume_needs_force_when_ws_missing(tmp_path, monkeypatch):
+    """REM present but NO water-surface raster -> retention is incomplete: the WS
+    mosaic and marker are not written, and the status is NEEDS_FORCE."""
+    _small_grid(monkeypatch)
+    huc8 = "13030102"
+    workdir = _seed_shard_and_rasters(tmp_path, huc8, ws_name=None)
+
+    status = bc.build_one_huc8(
+        huc8,
+        "label",
+        box(300, 600, 400, 700),
+        None,
+        None,
+        _backfill_args(tmp_path, False),
+    )
+    assert status == bc.STATUS_NEEDS_FORCE
+    assert not bc._mosaic_marker(tmp_path, huc8).exists()
+    assert not (tmp_path / bc.WS_MOSAIC).exists()
+    # the surviving 10 m REM is kept so a --force rebuild can regenerate the WS
+    assert (workdir / bc.REM_RASTER).exists()
 
 
 def test_resume_skips_when_shard_and_marker_present(tmp_path, monkeypatch):
     """Shard + marker -> a clean skip, no mosaic write attempted."""
-    out_root = tmp_path
     huc8 = "13030102"
-    (out_root / "fac_rem_shards").mkdir(parents=True)
-    (out_root / "fac_rem_shards" / f"{huc8}.parquet").write_bytes(b"")
-    marker = bc._mosaic_marker(out_root, huc8)
+    (tmp_path / "fac_rem_shards").mkdir(parents=True)
+    (tmp_path / "fac_rem_shards" / f"{huc8}.parquet").write_bytes(b"")
+    marker = bc._mosaic_marker(tmp_path, huc8)
     marker.parent.mkdir(parents=True)
     marker.touch()
 
-    ok = bc.build_one_huc8(
+    status = bc.build_one_huc8(
         huc8,
         "label",
         box(300, 600, 400, 700),
         None,
         None,
-        _backfill_args(out_root, False),
+        _backfill_args(tmp_path, False),
     )
-    assert ok
-    assert not (out_root / bc.REM_MOSAIC).exists()
+    assert status == bc.STATUS_SKIPPED
+    assert not (tmp_path / bc.REM_MOSAIC).exists()
 
 
-def test_resume_warns_when_rem_gone_and_no_marker(tmp_path, monkeypatch):
+def test_resume_needs_force_when_rem_gone_and_no_marker(tmp_path, monkeypatch):
     """Shard without a marker and no surviving 10 m REM -> no silent success: the
-    mosaic is not fabricated and no marker is written (needs a --force rebuild)."""
-    out_root = tmp_path
+    mosaic is not fabricated, no marker is written, status is NEEDS_FORCE."""
     huc8 = "13030102"
-    (out_root / "fac_rem_shards").mkdir(parents=True)
-    (out_root / "fac_rem_shards" / f"{huc8}.parquet").write_bytes(b"")
+    (tmp_path / "fac_rem_shards").mkdir(parents=True)
+    (tmp_path / "fac_rem_shards" / f"{huc8}.parquet").write_bytes(b"")
 
-    ok = bc.build_one_huc8(
+    status = bc.build_one_huc8(
         huc8,
         "label",
         box(300, 600, 400, 700),
         None,
         None,
-        _backfill_args(out_root, False),
+        _backfill_args(tmp_path, False),
     )
-    assert ok  # returns True so the batch continues, but...
-    assert not bc._mosaic_marker(out_root, huc8).exists()
-    assert not (out_root / bc.REM_MOSAIC).exists()
+    assert status == bc.STATUS_NEEDS_FORCE
+    assert not bc._mosaic_marker(tmp_path, huc8).exists()
+    assert not (tmp_path / bc.REM_MOSAIC).exists()
