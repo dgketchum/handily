@@ -16,8 +16,19 @@ tangent_step_m = 10.0
 min_hit_dist_m = 5.0
 min_strahler = 0
 max_crossing_strip_m = 800.0
+# naked_fill_m is intentionally left unset (= 0): CONUS keeps live "edge" strips
+# rather than the Mesilla/Ruby bounded-flat-anchor fallback, because the montane
+# pilot regimes have real cross-valley structure to reach. Edge mode means the
+# boundary probe runs to the full AOI diagonal, but that is a single, cheap ring
+# intersection; the cost reduction comes from the capped stream ray, the STRtree
+# predicate query, balanced worker chunks, and the array-based sparse burn -- not
+# from shortening the boundary probe. (Revisit if a deep-arid CONUS expansion
+# wants the bounded fallback, as in nm_*/mt_mh_* configs.)
 halo_n = 12
 workers = 8
+# Strip layer is a burn intermediate, not a product; the builder also passes
+# --no-strip-debug, but pin it here so a direct profile run is consistent.
+write_strip_debug = false
 
 [raster]
 burn_res_m = 10.0
