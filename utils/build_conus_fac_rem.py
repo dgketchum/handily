@@ -16,11 +16,16 @@ the basin-wide build never has to fit in memory. For each HUC8:
      -> fac_rem_shards/<huc8>.parquet (canonical_id, fac_rem_dtw_m).
 
 Resumable per HUC8: a HUC8 is skipped only when BOTH its well shard and its 100 m
-mosaic-completion marker (mosaic_markers/<huc8>.done) exist. A shard without a
-marker (e.g. from a pre-mosaic run, or a run whose mosaic write failed) triggers a
-mosaic backfill from the surviving 10 m REM rather than a silent skip; if the 10 m
-REM has already been cleaned up, that HUC8 must be rebuilt with --force. rem_fac
-runs as a fresh subprocess per HUC8 so a single failure cannot abort the pilot.
+mosaic-completion marker (mosaic_markers/<huc8>.done) exist. The marker is written
+only after BOTH the REM (depth) and water-surface (elevation) mosaics are
+retained, so a half-retained HUC8 never reports complete. A shard without a marker
+(pre-mosaic run, or a failed/partial mosaic write) triggers a backfill from the
+surviving 10 m rasters -- honouring the legacy WS filename
+(fac_head_depth_idw_fill_10m.tif) -- rather than a silent skip; if the 10 m REM is
+gone or the WS raster cannot be retained, that HUC8 is reported NEEDS_FORCE and the
+batch tally counts it incomplete (rerun with --force to rebuild and retain).
+rem_fac runs as a fresh subprocess per HUC8 so a single failure cannot abort the
+pilot.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ import argparse
 import logging
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import geopandas as gpd
@@ -72,6 +78,21 @@ MOSAIC_NODATA = -9999.0
 # notes/FAC_REM_WTE_NAMING_AND_RETENTION_HANDOFF.md).
 REM_MOSAIC = "fac_rem_dtw_100m_5070.tif"
 WS_MOSAIC = "fac_rem_water_surface_100m_5070.tif"
+
+# 10 m per-HUC8 rasters rem_fac writes. The legacy pre-rename water-surface name
+# is still honoured when backfilling old workdirs (it held the idw-fill water
+# SURFACE, not a depth, despite the "head_depth" prefix).
+REM_RASTER = "fac_head_depth_rem_10m.tif"
+WS_RASTER = "fac_rem_water_surface_10m.tif"
+WS_RASTER_LEGACY = "fac_head_depth_idw_fill_10m.tif"
+
+# build_one_huc8 outcomes -- a CONUS batch is "complete" only on BUILT/SKIPPED.
+# NEEDS_FORCE means the shard exists but durable mosaic retention can't be
+# finished without a --force rebuild (so a batch never silently looks complete).
+STATUS_BUILT = "built"
+STATUS_SKIPPED = "skipped"
+STATUS_NEEDS_FORCE = "needs_force"
+STATUS_FAILED = "failed"
 
 # Regime-spread pilot HUC8s (verified to exist with unconfined wells).
 PILOT = {
@@ -335,25 +356,48 @@ def _append_to_mosaic(src_path: Path, poly, mosaic_path: Path) -> int:
 
 
 def _mosaic_marker(out_root: Path, huc8) -> Path:
-    """Sentinel written once a HUC8's 10 m REM/WS are downsampled into the 100 m
-    mosaics. Its presence (alongside the shard) is the resume signal that the
-    durable mosaic retention is complete, not just the well shard."""
+    """Sentinel written once a HUC8's 10 m REM AND water surface are both
+    downsampled into the 100 m mosaics. Its presence (alongside the shard) is the
+    resume signal that durable mosaic retention is complete, not just the well
+    shard."""
     return out_root / "mosaic_markers" / f"{huc8}.done"
 
 
-def _retain_mosaics(huc8, rem_path: Path, ws_path: Path, poly, out_root: Path) -> bool:
+def _resolve_ws_raster(workdir: Path) -> Path | None:
+    """The 10 m water-surface raster in *workdir*, honouring the legacy
+    pre-rename name. None if neither is present."""
+    for name in (WS_RASTER, WS_RASTER_LEGACY):
+        p = workdir / name
+        if p.exists():
+            return p
+    return None
+
+
+def _retain_mosaics(huc8, rem_path: Path, ws_path, poly, out_root: Path) -> bool:
     """Downsample the 10 m REM (depth) and water surface (elevation) into the
-    100 m CONUS mosaics. Returns True only if the REM mosaic write succeeded —
-    the gate for deleting the 10 m rasters.
+    100 m CONUS mosaics.
+
+    Returns True only when BOTH mosaics are written. A missing/never-produced WS
+    raster (e.g. a pre-rename run whose WS file the caller could not resolve) is
+    an INCOMPLETE retention and returns False, so the completion marker and the
+    10 m cleanup never fire on a half-retained HUC8.
     """
     try:
         n = _append_to_mosaic(rem_path, poly, out_root / REM_MOSAIC)
         log.info("[%s] +%d cells -> %s", huc8, n, REM_MOSAIC)
-        if ws_path.exists():
-            nw = _append_to_mosaic(ws_path, poly, out_root / WS_MOSAIC)
-            log.info("[%s] +%d cells -> %s", huc8, nw, WS_MOSAIC)
+        if ws_path is None or not ws_path.exists():
+            log.error(
+                "[%s] REM mosaic written but no water-surface raster found "
+                "(looked for %s / %s) -> retention incomplete",
+                huc8,
+                WS_RASTER,
+                WS_RASTER_LEGACY,
+            )
+            return False
+        nw = _append_to_mosaic(ws_path, poly, out_root / WS_MOSAIC)
+        log.info("[%s] +%d cells -> %s", huc8, nw, WS_MOSAIC)
         return True
-    except Exception as e:  # noqa: BLE001 - keep the 10 m REM if mosaicking fails
+    except Exception as e:  # noqa: BLE001 - keep the 10 m rasters if mosaicking fails
         log.exception("[%s] 100 m mosaic append failed: %s", huc8, e)
         return False
 
@@ -388,7 +432,7 @@ def finalize_cog(out_root: Path) -> None:
         log.info("wrote %s", dst)
 
 
-def build_one_huc8(huc8, label, poly, flow_join, wells_unique, args) -> bool:
+def build_one_huc8(huc8, label, poly, flow_join, wells_unique, args) -> str:
     out_root = Path(args.out_root)
     shard_dir = out_root / "fac_rem_shards"
     shard_dir.mkdir(parents=True, exist_ok=True)
@@ -399,33 +443,40 @@ def build_one_huc8(huc8, label, poly, flow_join, wells_unique, args) -> bool:
     if shard.exists() and not args.force:
         if marker.exists():
             log.info("[%s %s] shard + mosaic retained -> skip", huc8, label)
-            return True
+            return STATUS_SKIPPED
         # Shard predates the 100 m mosaics (pre-mosaic run) or a prior mosaic
         # write failed. Backfill from the surviving 10 m rasters if present rather
         # than report "built" with no mosaic cells; if the 10 m REM is already
-        # cleaned up, the only recovery is a --force rebuild.
-        rem_path = workdir / "fac_head_depth_rem_10m.tif"
-        ws_path = workdir / "fac_rem_water_surface_10m.tif"
+        # cleaned up (or the WS raster can't be retained), the only recovery is a
+        # --force rebuild -- reported as NEEDS_FORCE so the batch isn't "complete".
+        rem_path = workdir / REM_RASTER
+        ws_path = _resolve_ws_raster(workdir)
         if rem_path.exists():
             if _retain_mosaics(huc8, rem_path, ws_path, poly, out_root):
                 marker.parent.mkdir(parents=True, exist_ok=True)
                 marker.touch()
                 if not args.keep_intermediates:
                     rem_path.unlink(missing_ok=True)
-                    ws_path.unlink(missing_ok=True)
-                log.info("[%s %s] backfilled 100 m mosaics from 10 m REM", huc8, label)
-            else:
-                log.error(
-                    "[%s %s] mosaic backfill failed; keeping 10 m REM", huc8, label
+                    if ws_path is not None:
+                        ws_path.unlink(missing_ok=True)
+                log.info(
+                    "[%s %s] backfilled 100 m mosaics from 10 m rasters", huc8, label
                 )
-            return True
+                return STATUS_BUILT
+            log.error(
+                "[%s %s] mosaic backfill incomplete (REM ok, WS missing/failed); "
+                "keeping 10 m rasters -> needs --force rebuild to regenerate WS",
+                huc8,
+                label,
+            )
+            return STATUS_NEEDS_FORCE
         log.warning(
             "[%s %s] shard exists but mosaics never retained and 10 m REM is gone "
             "-> rerun with --force to rebuild and retain",
             huc8,
             label,
         )
-        return True
+        return STATUS_NEEDS_FORCE
 
     workdir.mkdir(parents=True, exist_ok=True)
     dem_tiles = out_root / "dem_tiles"  # shared 3DEP cache across HUC8s
@@ -437,7 +488,7 @@ def build_one_huc8(huc8, label, poly, flow_join, wells_unique, args) -> bool:
     tiles = regional_fac.download_3dep_10m_tiles(bbox_wgs84, dem_tiles)
     if not tiles:
         log.warning("[%s] no 3DEP tiles (border/ocean) -> skip", huc8)
-        return False
+        return STATUS_FAILED
     dem_path = workdir / "dem_10m.tif"
     regional_fac.build_regional_dem(
         tiles,
@@ -477,12 +528,12 @@ def build_one_huc8(huc8, label, poly, flow_join, wells_unique, args) -> bool:
         )
     if proc.returncode != 0:
         log.error("[%s] rem_fac failed (rc=%d); see %s", huc8, proc.returncode, run_log)
-        return False
+        return STATUS_FAILED
 
-    rem_path = workdir / "fac_head_depth_rem_10m.tif"
+    rem_path = workdir / REM_RASTER
     if not rem_path.exists():
         log.error("[%s] rem_fac produced no REM raster", huc8)
-        return False
+        return STATUS_FAILED
 
     # 6. sample wells in the unbuffered footprint (huc8 assignment) -> shard
     wells_huc8 = wells_unique[wells_unique["huc8"] == huc8]
@@ -503,7 +554,7 @@ def build_one_huc8(huc8, label, poly, flow_join, wells_unique, args) -> bool:
     # Downsample them into the 100 m mosaics on the common grid, then drop the
     # 10 m rasters -- but only after the mosaic write succeeds, so a mosaic
     # failure never silently loses them.
-    ws_path = workdir / "fac_rem_water_surface_10m.tif"
+    ws_path = _resolve_ws_raster(workdir)
     mosaic_ok = _retain_mosaics(huc8, rem_path, ws_path, poly, out_root)
     if mosaic_ok:
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -514,14 +565,19 @@ def build_one_huc8(huc8, label, poly, flow_join, wells_unique, args) -> bool:
             (workdir / name).unlink(missing_ok=True)
         if mosaic_ok:
             rem_path.unlink(missing_ok=True)
-            ws_path.unlink(missing_ok=True)
+            if ws_path is not None:
+                ws_path.unlink(missing_ok=True)
         else:
             log.warning(
-                "[%s] keeping 10 m REM/water surface in %s (mosaic write failed)",
+                "[%s] keeping 10 m REM/water surface in %s (mosaic retention "
+                "incomplete) -- a plain re-run will backfill them",
                 huc8,
                 workdir,
             )
-    return True
+    # A fresh build that couldn't complete retention keeps its 10 m rasters, so a
+    # plain re-run backfills (no --force needed); flag it as FAILED for now so the
+    # batch tally doesn't count it complete.
+    return STATUS_BUILT if mosaic_ok else STATUS_FAILED
 
 
 def _panel(resid: np.ndarray) -> dict:
@@ -715,27 +771,47 @@ def main(argv: list[str] | None = None) -> None:
     ).drop_duplicates("canonical_id")
     log.info("flowlines=%d wells=%d", len(flow_join), len(wells_unique))
 
-    ok = 0
+    counts = Counter()
+    needs_force = []
     for huc8 in huc8s:
         if huc8 not in polys.index:
             log.warning("HUC8 %s not in polygons -> skip", huc8)
+            counts[STATUS_FAILED] += 1
             continue
         label = PILOT.get(huc8, "custom")
         try:
-            ok += bool(
-                build_one_huc8(
-                    huc8,
-                    label,
-                    polys.loc[huc8, "geometry"],
-                    flow_join,
-                    wells_unique,
-                    args,
-                )
+            status = build_one_huc8(
+                huc8,
+                label,
+                polys.loc[huc8, "geometry"],
+                flow_join,
+                wells_unique,
+                args,
             )
         except Exception as e:  # noqa: BLE001 - keep the pilot going past one failure
             log.exception("[%s] build failed: %s", huc8, e)
-    log.info("built %d/%d HUC8s", ok, len(huc8s))
-    if ok and not args.no_validate:
+            status = STATUS_FAILED
+        counts[status] += 1
+        if status == STATUS_NEEDS_FORCE:
+            needs_force.append(huc8)
+
+    complete = counts[STATUS_BUILT] + counts[STATUS_SKIPPED]
+    log.info(
+        "complete %d/%d HUC8s (built=%d skipped=%d needs_force=%d failed=%d)",
+        complete,
+        len(huc8s),
+        counts[STATUS_BUILT],
+        counts[STATUS_SKIPPED],
+        counts[STATUS_NEEDS_FORCE],
+        counts[STATUS_FAILED],
+    )
+    if needs_force:
+        log.warning(
+            "%d HUC8s need a --force rebuild to finish mosaic retention: %s",
+            len(needs_force),
+            needs_force,
+        )
+    if complete and not args.no_validate:
         validate(args)
 
 
