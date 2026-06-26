@@ -235,6 +235,13 @@ class WTEGraphNet(nn.Module):
         fac_skip: bool = False,
         fac_gate: bool = False,
         directional_edges: bool = False,
+        f_aquifer: int | None = None,
+        f_aquifer_edge: int | None = None,
+        f_aquifer_query: int | None = None,
+        n_aquifer_layers: int = 0,
+        aquifer_route: str = "off",
+        aquifer_gate_init: float = -6.0,
+        aquifer_delta_init_zero: bool = True,
     ) -> None:
         super().__init__()
         if fac_gate and not fac_skip:
@@ -245,6 +252,22 @@ class WTEGraphNet(nn.Module):
         self.fac_gate = fac_gate
         self.directional_edges = directional_edges
         self.last_fac_gate: torch.Tensor | None = None
+        # Regional-aquifer substrate (Phase 1): an OPTIONAL gated residual correction
+        # branch over the proven stream/FAC-residual head, never a wider head. "off"
+        # / "fixed_stream" make it an EXACT no-op (the branch is short-circuited so no
+        # aquifer dropout is drawn -> stream RNG/output is byte-identical to baseline);
+        # only "learned" runs message passing + a gated delta. See regional_aquifer_graph.md.
+        if aquifer_route not in ("off", "fixed_stream", "learned"):
+            raise ValueError(f"bad aquifer_route: {aquifer_route!r}")
+        self.has_aquifer = (
+            f_aquifer is not None and n_aquifer_layers > 0 and aquifer_route != "off"
+        )
+        self.aquifer_route = aquifer_route
+        self.last_aquifer_gate: torch.Tensor | None = None
+        if self.has_aquifer and pinball:
+            raise ValueError("--pinball with the aquifer branch is not supported yet")
+        if self.has_aquifer and self.has_anchor:
+            raise ValueError("the aquifer branch is not supported with anchors yet")
         self.reach_enc = nn.Sequential(
             nn.Linear(f_reach, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
         )
@@ -332,6 +355,84 @@ class WTEGraphNet(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(hidden, 1),
             )
+        # --- aquifer branch: CONSTRUCTED LAST so every baseline module above consumes
+        # identical RNG whether or not the branch exists. Same seed => byte-identical
+        # stream weights, which (with the fixed_stream short-circuit) is what makes the
+        # no-op run match baseline to <1e-5 m DTW.
+        if self.has_aquifer:
+            self.aquifer_enc = nn.Sequential(
+                nn.Linear(f_aquifer, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
+            )
+            self.aquifer_layers = nn.ModuleList(
+                [
+                    EdgeGatedConv(
+                        hidden, hidden, f_aquifer_edge, hidden, dropout=dropout
+                    )
+                    for _ in range(n_aquifer_layers)
+                ]
+            )
+            self.aquifer_to_query = EdgeGatedConv(
+                hidden, hidden, f_aquifer_query, hidden, dropout=dropout
+            )
+            # delta + gate read [q, ctx_reach, ctx_aquifer] (3*hidden); independent of
+            # the stream head width, so it never perturbs the stream head.
+            self.aquifer_delta_head = nn.Sequential(
+                nn.Linear(hidden * 3, hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, 1),
+            )
+            self.aquifer_gate_mlp = nn.Sequential(
+                nn.Linear(hidden * 3, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, 1),
+            )
+            # Gate pinned to sigmoid(gate_init) for ALL queries at init (final weight
+            # zeroed, bias = gate_init): epoch-0 gate ~= sigmoid(-6) ~= 0.0025, so the
+            # stream side dominates and the aquifer correction is strictly opt-in.
+            nn.init.zeros_(self.aquifer_gate_mlp[-1].weight)
+            nn.init.constant_(self.aquifer_gate_mlp[-1].bias, aquifer_gate_init)
+            if aquifer_delta_init_zero:
+                # delta == 0 at init regardless of gate: the learned branch starts as
+                # an exact no-op over the stream head, then earns its correction.
+                nn.init.zeros_(self.aquifer_delta_head[-1].weight)
+                nn.init.zeros_(self.aquifer_delta_head[-1].bias)
+
+    def _augment_for_skip(self, h: torch.Tensor, g: dict):
+        """Append the FAC raw-skip / confidence-gate pieces to the head input.
+
+        Returns (head_input, additive_skip). Behaviour is identical to the prior inline
+        block; factored out so the aquifer delta can be added on top of the stream
+        primary without duplicating the fac_skip/fac_gate logic.
+        """
+        if not self.fac_skip:
+            return h, 0.0
+        fb = g["fac_base"].view(-1, 1)
+        pres = g["fac_present"].view(-1, 1)
+        if self.fac_gate:
+            fpd = g["fac_pred_dtw"].view(-1, 1)
+            c = torch.sigmoid(self.fac_gate_mlp(torch.cat([h, fb, pres, fpd], dim=-1)))
+            self.last_fac_gate = c.detach()
+            return torch.cat([h, fb, pres, fpd, c], dim=-1), (pres * c * fb).squeeze(-1)
+        return torch.cat([h, fb, pres], dim=-1), (pres * fb).squeeze(-1)
+
+    def _aquifer_delta(self, q: torch.Tensor, ctx_reach: torch.Tensor, g: dict):
+        """ctx_aquifer read + gated correction delta (learned route only).
+
+        The aquifer smoothing path deliberately does NOT use the channel branch's outer
+        residual ``a = a + layer(a, ...)``: that residual keeps the stream layers sharp,
+        but the aquifer substrate's job is a SMOOTH long-range field, so each layer fully
+        replaces the node state (the update MLP still sees the prior state via its
+        internal [x_dst, agg] concat). Returns (gate, delta), both shape (N,).
+        """
+        a = self.aquifer_enc(g["aquifer_x"])
+        for layer in self.aquifer_layers:
+            a = layer(a, a, g["aq_node_ei"], g["aq_node_ea"])
+        ctx_aq = self.aquifer_to_query(a, q, g["aq_query_ei"], g["aq_query_ea"])
+        h_aq = torch.cat([q, ctx_reach, ctx_aq], dim=-1)
+        delta = self.aquifer_delta_head(h_aq).squeeze(-1)
+        gate = torch.sigmoid(self.aquifer_gate_mlp(h_aq)).squeeze(-1)
+        return gate, delta
 
     def forward(self, g: dict):
         # flow-direction sign per channel/lateral edge (None unless directional_edges);
@@ -358,29 +459,20 @@ class WTEGraphNet(nn.Module):
                 # residual channel update (direction-conditioned when enabled)
                 r = r + layer(r, r, g["ch_ei"], g["ch_ea"], dir_sign=ch_dir)
             q = self.query_enc(g["query_x"])
-            ctx = self.lateral(r, q, g["lat_ei"], g["lat_ea"], dir_sign=lat_dir)
-            h = torch.cat([q, ctx], dim=-1)
-        if self.fac_skip:
-            # g["fac_base"] is FAC's target-estimate standardized in THIS fold's target
-            # space (0 where FAC is absent); g["fac_present"] is the 0/1 coverage flag.
-            fb = g["fac_base"].view(-1, 1)
-            pres = g["fac_present"].view(-1, 1)
-            if self.fac_gate:
-                # gate on FAC's own predicted DTW: full anchor where FAC is shallow/
-                # reliable, released where FAC saturates (deep-regional regime).
-                fpd = g["fac_pred_dtw"].view(-1, 1)
-                c = torch.sigmoid(
-                    self.fac_gate_mlp(torch.cat([h, fb, pres, fpd], dim=-1))
-                )
-                self.last_fac_gate = c.detach()
-                h = torch.cat([h, fb, pres, fpd, c], dim=-1)
-                skip = (pres * c * fb).squeeze(-1)
-            else:
-                h = torch.cat([h, fb, pres], dim=-1)
-                skip = (pres * fb).squeeze(-1)  # FAC estimate where present, else 0
-        else:
-            skip = 0.0
+            ctx_reach = self.lateral(r, q, g["lat_ei"], g["lat_ea"], dir_sign=lat_dir)
+            h = torch.cat([q, ctx_reach], dim=-1)
+        # FAC raw-skip / confidence-gate pieces (no-op when fac_skip is off).
+        h, skip = self._augment_for_skip(h, g)
         primary = self.head(h).squeeze(-1) + skip
+        # Regional-aquifer correction: gated additive delta over the stream primary.
+        # "fixed_stream"/"off" short-circuit (no branch executed, no aquifer dropout
+        # drawn) so the run is an EXACT no-op vs baseline; only "learned" contributes.
+        if self.has_aquifer and self.aquifer_route == "learned":
+            gate, aq_delta = self._aquifer_delta(q, ctx_reach, g)
+            self.last_aquifer_gate = gate.detach()
+            primary = primary + gate * aq_delta
+        elif self.has_aquifer:
+            self.last_aquifer_gate = torch.zeros_like(primary)
         if self.pinball:
             return primary, self.pin_head(h).squeeze(-1) + skip
         return primary
