@@ -381,6 +381,34 @@ def main() -> None:
         "Uses columns already in the bundle (no rebuild); the production arm is the "
         "no-flag default.",
     )
+    # --- regional-aquifer substrate (Phase 1): optional gated correction branch -----
+    p.add_argument(
+        "--aquifer",
+        action="store_true",
+        help="enable the aquifer graph tensors if present in graph_manifest.json; "
+        "adds a GATED residual-correction branch over the stream/FAC-residual head "
+        "(exact no-op under --aquifer-route fixed_stream)",
+    )
+    p.add_argument("--aquifer-layers", type=int, default=4)
+    p.add_argument(
+        "--aquifer-route",
+        choices=["fixed_stream", "learned"],
+        default="fixed_stream",
+        help="fixed_stream: branch short-circuited (no-op identity vs baseline); "
+        "learned: gated aquifer delta is added to the stream primary",
+    )
+    p.add_argument("--aquifer-gate-init", type=float, default=-6.0)
+    p.add_argument(
+        "--aquifer-delta-init-zero",
+        action="store_true",
+        default=True,
+        help="zero the aquifer delta head at init (branch starts as an exact no-op)",
+    )
+    p.add_argument(
+        "--no-aquifer-delta-init-zero",
+        dest="aquifer_delta_init_zero",
+        action="store_false",
+    )
     args = p.parse_args()
 
     gdir = Path(args.graph_dir)
@@ -606,6 +634,94 @@ def main() -> None:
         }
         f_anchor, f_ar, f_aq = anchor_x.shape[1], ar_ea.shape[1], aq_ea.shape[1]
 
+    # --- regional-aquifer substrate: optional gated correction branch -------------
+    # Loaded before the memory probe so the probe's full-batch forward includes the
+    # aquifer tensors. Features are target-blind + constant across folds (no label to
+    # hold out), so fit_stats on all rows is leak-safe.
+    aquifer_block = man.get("aquifer")
+    use_aquifer = bool(args.aquifer and aquifer_block and aquifer_block.get("enabled"))
+    f_aquifer = f_aq_edge = f_aq_query = None
+    if args.aquifer and not aquifer_block:
+        raise SystemExit(
+            "--aquifer set but graph_manifest.json has no aquifer block "
+            "(run build_regional_aquifer_graph.py on this bundle first)"
+        )
+    if use_aquifer:
+        if args.aquifer_route == "learned" and args.aquifer_layers <= 0:
+            raise SystemExit("--aquifer-route learned requires --aquifer-layers > 0")
+        if use_anchors:
+            raise SystemExit("Phase 1: --aquifer is not supported with anchors")
+        if args.fac_skip:
+            raise SystemExit(
+                "Phase 1: --aquifer is not supported with --fac-skip (the leading "
+                "recipe uses --residual-base fac_rem and passes no --fac-skip)"
+            )
+        aqf_cols = aquifer_block["aquifer_feature_cols"]
+        aqe_cols = aquifer_block["aquifer_edge_feature_cols"]
+        aqq_cols = aquifer_block["aquifer_query_edge_feature_cols"]
+        aqn = (
+            pd.read_parquet(gdir / aquifer_block["node_file"])
+            .sort_values("aquifer_node_idx")
+            .reset_index(drop=True)
+        )
+        aqe = pd.read_parquet(gdir / aquifer_block["edge_file"])
+        aqq = pd.read_parquet(gdir / aquifer_block["query_edge_file"])
+        assert (aqn["aquifer_node_idx"].to_numpy() == np.arange(len(aqn))).all()
+        assert aqq["query_node_idx"].max() < len(qn), "aquifer->query idx out of range"
+        ei = aqe[["src_aquifer_idx", "dst_aquifer_idx"]].to_numpy("int64")
+        assert ei.min() >= 0 and ei.max() < len(aqn), "aquifer edge idx out of range"
+        aq_x = torch.as_tensor(
+            apply_stats(aqn, fit_stats(aqn, aqf_cols, None)),
+            dtype=torch.float32,
+            device=device,
+        )
+        aq_node_ea_t = torch.as_tensor(
+            apply_stats(aqe, fit_stats(aqe, aqe_cols, None)),
+            dtype=torch.float32,
+            device=device,
+        )
+        aq_query_ea_t = torch.as_tensor(
+            apply_stats(aqq, fit_stats(aqq, aqq_cols, None)),
+            dtype=torch.float32,
+            device=device,
+        )
+        # Collision-free keys: anchor->query already owns aq_ei/aq_ea, so the aquifer
+        # graph uses aq_node_* (aquifer<->aquifer) + aq_query_* (aquifer->query). The
+        # aquifer node/query index spaces are independent of the reach prune (queries
+        # are never pruned), so no remap is needed.
+        graph_tensors |= {
+            "aquifer_x": aq_x,
+            "aq_node_ei": torch.as_tensor(ei.T, dtype=torch.long, device=device),
+            "aq_node_ea": aq_node_ea_t,
+            "aq_query_ei": torch.as_tensor(
+                aqq[["aquifer_node_idx", "query_node_idx"]].to_numpy().T,
+                dtype=torch.long,
+                device=device,
+            ),
+            "aq_query_ea": aq_query_ea_t,
+        }
+        f_aquifer = aq_x.shape[1]
+        f_aq_edge = aq_node_ea_t.shape[1]
+        f_aq_query = aq_query_ea_t.shape[1]
+        log.info(
+            "aquifer ON: %d nodes(%df) %d edges(%df) %d query-edges(%df) | route=%s "
+            "layers=%d gate_init=%.1f delta_init_zero=%s",
+            len(aqn),
+            f_aquifer,
+            len(aqe),
+            f_aq_edge,
+            len(aqq),
+            f_aq_query,
+            args.aquifer_route,
+            args.aquifer_layers,
+            args.aquifer_gate_init,
+            args.aquifer_delta_init_zero,
+        )
+    elif aquifer_block and not args.aquifer:
+        log.info(
+            "bundle has an aquifer block but --aquifer not set: stream-only baseline"
+        )
+
     obs_dtw = qn[man["obs_dtw_col"]].to_numpy("float64")
     target = qn[target_col].to_numpy("float64")
     folds = np.array(sorted(qn[fold_col].unique()))
@@ -681,8 +797,21 @@ def main() -> None:
     f_ch, f_lat = ch_ea.shape[1], lat_ea.shape[1]
     native_oof = np.full(len(qn), np.nan)
     gate_oof = np.full(len(qn), np.nan) if fac_gate else None
+    learned_aquifer = use_aquifer and args.aquifer_route == "learned"
+    aquifer_gate_oof = np.full(len(qn), np.nan) if learned_aquifer else None
     fold_log: list[dict] = []
     huber_delta_std_by_fold: list[float] = []
+
+    # Shared aquifer-branch kwargs (off unless --aquifer + manifest block present).
+    aquifer_kwargs = dict(
+        f_aquifer=f_aquifer if use_aquifer else None,
+        f_aquifer_edge=f_aq_edge if use_aquifer else None,
+        f_aquifer_query=f_aq_query if use_aquifer else None,
+        n_aquifer_layers=args.aquifer_layers if use_aquifer else 0,
+        aquifer_route=args.aquifer_route if use_aquifer else "off",
+        aquifer_gate_init=args.aquifer_gate_init,
+        aquifer_delta_init_zero=args.aquifer_delta_init_zero,
+    )
 
     # All-wells query features for the memory probe (shapes match any fold).
     probe_x = torch.as_tensor(
@@ -709,6 +838,7 @@ def main() -> None:
             fac_skip=fac_skip,
             fac_gate=fac_gate,
             directional_edges=args.directional_edges,
+            **aquifer_kwargs,
         ).to(device)
 
     if device.startswith("cuda"):
@@ -725,7 +855,11 @@ def main() -> None:
             else:
                 probe_feat |= _fac_feat(fac_raw, fac_present, yc0, ys0, device)
         if has_anchor_bc:
-            bc0 = anchor_head_m if anchor_head_m is not None else anchor_anom[int(folds[0])]
+            bc0 = (
+                anchor_head_m
+                if anchor_head_m is not None
+                else anchor_anom[int(folds[0])]
+            )
             probe_feat["anchor_value"] = torch.as_tensor(
                 (bc0 - yc0) / ys0, dtype=torch.float32, device=device
             )
@@ -797,6 +931,7 @@ def main() -> None:
             fac_skip=fac_skip,
             fac_gate=fac_gate,
             directional_edges=args.directional_edges,
+            **aquifer_kwargs,
         ).to(device)
         native, best_mad, best_epoch = train_fold(
             model,
@@ -817,6 +952,11 @@ def main() -> None:
         if fac_gate and model.last_fac_gate is not None:
             # last_fac_gate is from train_fold's final full-batch forward (all queries).
             gate_oof[test] = model.last_fac_gate.cpu().numpy().reshape(-1)[test]
+        if learned_aquifer and model.last_aquifer_gate is not None:
+            # per-query sigmoid gate from the final full-batch forward (all queries).
+            aquifer_gate_oof[test] = (
+                model.last_aquifer_gate.cpu().numpy().reshape(-1)[test]
+            )
         del model, query_x, y_std, feat
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
@@ -859,6 +999,19 @@ def main() -> None:
         )
         log.info("fac-gate mean OOF gate by obs-depth: %s", msg)
 
+    if learned_aquifer:
+        # The aquifer correction should OPEN (gate->1) where the regional substrate
+        # carries signal; log the OOF gate by observed-depth band as the first read on
+        # whether it earns its place (deep bands are where the stream head is weakest).
+        bands = [(0, 2), (2, 5), (5, 10), (10, 30), (30, np.inf)]
+        msg = "; ".join(
+            f"{lo}-{hi if hi != np.inf else '+'}m "
+            f"g={np.nanmean(aquifer_gate_oof[m]):.3f}(n={int(m.sum())})"
+            for lo, hi in bands
+            if (m := (obs_dtw >= lo) & (obs_dtw < hi)).any()
+        )
+        log.info("aquifer-gate mean OOF gate by obs-depth: %s", msg)
+
     gnn_dtw = _native_to_dtw(native_oof, base, target_mode)
     # Common scoring columns (DTW + the named regional/deep DTW priors + benchmarks),
     # so the scorer's predictor set is identical across modes.
@@ -879,6 +1032,8 @@ def main() -> None:
     }
     if fac_gate:
         out_cols["fac_gate_c"] = gate_oof  # learned anchor confidence (diagnostic)
+    if learned_aquifer:
+        out_cols["aquifer_gate"] = aquifer_gate_oof  # per-query aquifer-branch gate
     identity_max = None
     if target_mode in HEAD_SPACE_MODES:
         # wte_hat is the absolute head (wte) or R + residual_hat (wte_residual).
@@ -963,6 +1118,29 @@ def main() -> None:
             "anchor_col": fac_base_col if fac_skip else None,
             "wells_with_fac": int(fac_present.sum()) if fac_skip else None,
             "confidence_gate": bool(fac_gate),
+        },
+        "aquifer": {
+            "enabled": bool(use_aquifer),
+            "available_in_bundle": bool(aquifer_block and aquifer_block.get("enabled")),
+            "route": args.aquifer_route if use_aquifer else None,
+            "n_layers": args.aquifer_layers if use_aquifer else None,
+            "gate_init": args.aquifer_gate_init if learned_aquifer else None,
+            "delta_init_zero": bool(args.aquifer_delta_init_zero)
+            if learned_aquifer
+            else None,
+            "n_nodes": int(len(aqn)) if use_aquifer else None,
+            "n_edges": int(len(aqe)) if use_aquifer else None,
+            "n_query_edges": int(len(aqq)) if use_aquifer else None,
+            "feature_dims": {
+                "node": int(f_aquifer),
+                "edge": int(f_aq_edge),
+                "query_edge": int(f_aq_query),
+            }
+            if use_aquifer
+            else None,
+            "mean_oof_gate": float(np.nanmean(aquifer_gate_oof))
+            if learned_aquifer
+            else None,
         },
         "depth_aware_loss": {
             "shallow_weight": args.shallow_weight,
