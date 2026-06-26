@@ -89,6 +89,10 @@ WTE_RESID_BASE_COL = "wte_resid_base_m"  # z_surf - R; dtw = base - resid_hat
 WTE_RESIDUAL_TARGET_COL = "wte_residual_m"  # obs_wte - R
 FAC_REM_WTE_ANOM_COL = "fac_rem_wte_anom_m"  # (z_surf - fac_rem_dtw) - R
 DEEP_REGIONAL_WTE_ANOM_COL = "deep_regional_wte_anom_m"  # deep_wte_idw - R
+# --residual-base fac_rem only: R = FAC water surface, so str_top2 becomes the
+# regional-context anomaly feature (str_top2 WTE - R) + a diagnostic surface column.
+STR_TOP2_WTE_COL = "str_top2_wte_m"  # the str_top2 regional WTE surface (diagnostic)
+STR_TOP2_WTE_ANOM_COL = "str_top2_wte_anom_m"  # str_top2 WTE - R (regional anomaly)
 # gridMET climate (EPSG:4326 -> sampled at lon/lat). Kept in wte_residual mode: a
 # NEGATIVE result in the pilot stacker does not mean it cannot help the GNN.
 CLIMATE_FEATURE_COLS = ["aridity_index", "mean_annual_precip_mm"]
@@ -674,6 +678,18 @@ def main() -> None:
         "wte predicts real-magnitude water-table elevation",
     )
     ap.add_argument(
+        "--residual-base",
+        choices=["str_top2", "fac_rem"],
+        default="str_top2",
+        help="(wte_residual only) the regional surface R the residual target/base/"
+        "anomalies are taken over. str_top2 = the well-free streams-Strahler regional "
+        "WTE prior (default; FAC enters as a feature/fac-skip anchor). fac_rem = the "
+        "FAC-REM water surface (z_surf - fac_rem_dtw): FAC becomes the residual BASE and "
+        "the model predicts the correction to FAC's DTW (dtw = fac_rem_dtw - resid_hat); "
+        "str_top2 then enters as the regional-context anomaly feature. Use fac_rem (no "
+        "--fac-skip) when FAC-REM is the better base than R -- the FAC-residual approach.",
+    )
+    ap.add_argument(
         "--stacker-features",
         default=None,
         help="optional parquet keyed by canonical_id with fac_rem_dtw_m; used to "
@@ -1010,17 +1026,39 @@ def main() -> None:
             raise SystemExit(
                 f"{int((~np.isfinite(wte)).sum())} non-finite {OBS_WTE_COL}"
             )
-        # Regional WTE prior R = the well-free streams-Strahler IDW (top-2 orders,
-        # str_top2_idw_wte_100m.tif from huc8/{basin}). It consumes zero well labels,
-        # so it is leakage-free and needs NO cross-fit (unlike the well-IDW R it
-        # replaces). All finite here -- off-trunk wells were dropped up front. The
-        # deep WTE prior stays a deep-well IDW (a distinct deep-regime datum).
-        r_wte = sample_str_top2_wte(xy[:, 0], xy[:, 1])
-        if not np.isfinite(r_wte).all():
+        # FAC-REM DTW from the raster registry -- the SAME source as the inference grid
+        # (no shard concat, no lexical-sort precedence); finite for every retained well
+        # under --require-fac. Sampled up front because it is either an anomaly feature
+        # (str_top2 base) or the residual BASE itself (fac_rem base).
+        fac_dtw = sample_fac_rem(xy[:, 0], xy[:, 1])
+        wells["fac_rem_dtw_m"] = fac_dtw
+        fac_joined, fac_finite_frac = True, float(np.isfinite(fac_dtw).mean())
+        fac_wte = well_surf_m - fac_dtw  # FAC-REM water-surface ELEVATION
+        # The well-free streams-Strahler regional WTE surface (top-2 orders,
+        # str_top2_idw_wte_100m.tif from huc8/{basin}); zero well labels -> leakage-free,
+        # no cross-fit. Finite for every retained well (off-trunk dropped up front).
+        str_top2 = sample_str_top2_wte(xy[:, 0], xy[:, 1])
+        if not np.isfinite(str_top2).all():
             raise SystemExit(
-                f"{int((~np.isfinite(r_wte)).sum())} wells lack finite str_top2 R "
+                f"{int((~np.isfinite(str_top2)).sum())} wells lack finite str_top2 "
                 "after the up-front off-trunk drop -- investigate (do not patch)"
             )
+        # Choose the regional surface R the residual is taken over. Reconstruction is
+        # dtw = (z_surf - R) - resid_hat, so R=fac_rem makes FAC the BASE (dtw =
+        # fac_rem_dtw - resid_hat -> the model predicts the correction to FAC) and
+        # str_top2 swaps in as the regional-context anomaly feature; R=str_top2 is the
+        # default (FAC enters as the anomaly feature / fac-skip anchor).
+        if args.residual_base == "fac_rem":
+            if not np.isfinite(fac_wte).all():
+                raise SystemExit(
+                    f"{int((~np.isfinite(fac_wte)).sum())} wells lack finite FAC-REM for "
+                    "the --residual-base fac_rem base -- investigate (do not patch)"
+                )
+            r_wte = fac_wte
+            head_anom_cols = [STR_TOP2_WTE_ANOM_COL, DEEP_REGIONAL_WTE_ANOM_COL]
+        else:
+            r_wte = str_top2
+            head_anom_cols = [FAC_REM_WTE_ANOM_COL, DEEP_REGIONAL_WTE_ANOM_COL]
         wells[REGIONAL_WTE_COL] = r_wte
         deep_wte = crossfit_deep_idw(
             xy,
@@ -1038,13 +1076,13 @@ def main() -> None:
         # target (small residual) + DTW base (z_surf - R; dtw = base - resid_hat).
         wells[WTE_RESIDUAL_TARGET_COL] = wte - r_wte
         wells[WTE_RESID_BASE_COL] = well_surf_m - r_wte
-        # FAC-REM from the raster registry -- the SAME source as the inference grid
-        # (no shard concat, no lexical-sort precedence). NaN outside the built basins.
-        fac_dtw = sample_fac_rem(xy[:, 0], xy[:, 1])
-        wells["fac_rem_dtw_m"] = fac_dtw
-        fac_joined, fac_finite_frac = True, float(np.isfinite(fac_dtw).mean())
-        # Head-space prior anomalies-from-R (the core translation-invariant signal).
-        wells[FAC_REM_WTE_ANOM_COL] = (well_surf_m - fac_dtw) - r_wte
+        # Head-space prior anomalies-from-R (the core translation-invariant signal). Both
+        # anomaly columns are always written for schema/diagnostic consistency; only
+        # head_anom_cols enter the feature set. The FAC anomaly is identically 0 when R IS
+        # the FAC surface, so str_top2's anomaly takes its place in fac_rem mode.
+        wells[FAC_REM_WTE_ANOM_COL] = fac_wte - r_wte
+        wells[STR_TOP2_WTE_COL] = str_top2
+        wells[STR_TOP2_WTE_ANOM_COL] = str_top2 - r_wte
         wells[DEEP_REGIONAL_WTE_ANOM_COL] = deep_wte - r_wte
         # Exogenous target-blind covariates (terrain relief + ETRM fluxes + gridMET
         # climate), always sampled in this mode (not gated behind --relief-etrm).
@@ -1053,9 +1091,7 @@ def main() -> None:
         for col, vals in sample_gridmet(xy[:, 0], xy[:, 1]).items():
             wells[col] = vals
         # Observable evidence bank (NDVI greenness here; the GSW wet-reach distance is
-        # added after the flowline geom loads below). NO FAC-REM head estimate is fed --
-        # FAC enters ONLY as the fac-skip anchor on its target-estimate, so the graph
-        # builds the shallow correction from evidence, not from FAC's rough solve.
+        # added after the flowline geom loads below).
         if args.evidence_features:
             for col, vals in sample_evidence_ndvi(xy[:, 0], xy[:, 1]).items():
                 wells[col] = vals
@@ -1063,14 +1099,18 @@ def main() -> None:
         target_col = WTE_RESIDUAL_TARGET_COL
         regional_prior_col = REGIONAL_WTE_COL  # carried; the DTW base is wte_resid_base
         query_feature_cols = (
-            [FAC_REM_WTE_ANOM_COL, DEEP_REGIONAL_WTE_ANOM_COL]
+            head_anom_cols
             + RELIEF_ETRM_FEATURE_COLS
             + CLIMATE_FEATURE_COLS
             + (EVIDENCE_FEATURE_COLS if args.evidence_features else [])
         )
         log.info(
-            "target=wte_residual  R=str_top2(streams-Strahler, well-free)  "
-            "R-MAD(DTW)=%.2f m  R-RMSE(DTW)=%.2f m  fac finite frac=%.3f  features=%s",
+            "target=wte_residual  residual_base=%s  R=%s  R-MAD(DTW)=%.2f m  "
+            "R-RMSE(DTW)=%.2f m  fac finite frac=%.3f  features=%s",
+            args.residual_base,
+            "fac_rem(z_surf-fac_rem_dtw)"
+            if args.residual_base == "fac_rem"
+            else "str_top2(streams-Strahler, well-free)",
             float(np.nanmedian(np.abs((well_surf_m - r_wte) - dtw))),
             float(np.sqrt(np.nanmean(((well_surf_m - r_wte) - dtw) ** 2))),
             fac_finite_frac,
@@ -1333,26 +1373,50 @@ def main() -> None:
         final_dtw_definition = f"z_surf_well_m - ({REGIONAL_WTE_COL} + residual_hat)"
         dtw_reconstruction = "wte_resid_base_col - native_prediction"
         dtw_base_col = WTE_RESID_BASE_COL  # z_surf - R; dtw = base - resid_hat
-        wte_features = {
-            FAC_REM_WTE_ANOM_COL: "(z_surf - fac_rem_dtw) - R, from the FAC raster "
-            "registry; NaN outside the built basins (NaN+indicator)",
-            DEEP_REGIONAL_WTE_ANOM_COL: "deep-well WTE IDW - R (deep-regime anomaly)",
-        }
-        leakage_notes += [
-            "wte_residual: target = obs_wte - R (small head residual); features are "
-            "anomalies-from-R (translation-invariant -- no absolute elevation fed). "
-            "Reconstruct dtw = (z_surf - R) - resid_hat; |WTE err| == |DTW err|.",
-            "R = str_top2 streams-Strahler IDW WTE (build_str7_idw_raster, top-2 "
-            "orders), sampled from huc8/{basin}/str_top2_idw_wte_100m.tif via "
-            "fac_rem_registry.sample_str_top2_wte. Well-free (zero well labels) -> "
-            "leakage-free, so R needs NO cross-fit. Off-trunk wells (no top-2 anchor) "
-            "are dropped up front; R is finite for every retained well.",
-            "HAND features removed; gridMET aridity KEPT (a tabular non-result is "
-            "not a GNN non-result). FAC-REM sourced from fac_rem_registry (same as "
-            "the inference grid), not the stacker shard table.",
-            "Anchors not supported in this mode yet (anchor BC would need a "
-            "head-anomaly anchor_head - R(anchor)); the build errors if requested.",
-        ]
+        if args.residual_base == "fac_rem":
+            wte_features = {
+                STR_TOP2_WTE_ANOM_COL: "str_top2 regional WTE - R (regional-context "
+                "anomaly; FAC is the base here so str_top2 is the feature)",
+                DEEP_REGIONAL_WTE_ANOM_COL: "deep-well WTE IDW - R (deep-regime anomaly)",
+            }
+            leakage_notes += [
+                "wte_residual / residual_base=fac_rem (the FAC-residual approach): R = "
+                "the FAC-REM water surface (z_surf - fac_rem_dtw) from fac_rem_registry. "
+                "FAC is the residual BASE, so dtw = (z_surf - R) - resid_hat = "
+                "fac_rem_dtw - resid_hat -- the model predicts the CORRECTION to FAC's "
+                "DTW. str_top2 (well-free streams-Strahler WTE) enters as the regional-"
+                "context anomaly feature (str_top2 - R). --fac-skip is moot here (the FAC "
+                "anomaly is identically 0) and must NOT be passed.",
+                "NOTE: only the head-space WTE diagnostic regional_wte_idw_oof_m (= R) "
+                "carries the FAC surface in this mode. The scorer's PANEL 'regional' "
+                "predictor is regional_idw_dtw_oof_m (the cross-fit well-IDW DTW prior, "
+                "computed in every mode) and is UNAFFECTED. The panel 'fac_rem' predictor "
+                "equals the base R here. str_top2-standalone is not in the panel (feature, "
+                "not base).",
+                "Both R sources are well-free / leakage-free and need NO cross-fit. The "
+                "deep WTE prior stays a leave-one-fold-out deep-well IDW.",
+            ]
+        else:
+            wte_features = {
+                FAC_REM_WTE_ANOM_COL: "(z_surf - fac_rem_dtw) - R, from the FAC raster "
+                "registry; NaN outside the built basins (NaN+indicator)",
+                DEEP_REGIONAL_WTE_ANOM_COL: "deep-well WTE IDW - R (deep-regime anomaly)",
+            }
+            leakage_notes += [
+                "wte_residual: target = obs_wte - R (small head residual); features are "
+                "anomalies-from-R (translation-invariant -- no absolute elevation fed). "
+                "Reconstruct dtw = (z_surf - R) - resid_hat; |WTE err| == |DTW err|.",
+                "R = str_top2 streams-Strahler IDW WTE (build_str7_idw_raster, top-2 "
+                "orders), sampled from huc8/{basin}/str_top2_idw_wte_100m.tif via "
+                "fac_rem_registry.sample_str_top2_wte. Well-free (zero well labels) -> "
+                "leakage-free, so R needs NO cross-fit. Off-trunk wells (no top-2 anchor) "
+                "are dropped up front; R is finite for every retained well.",
+                "HAND features removed; gridMET aridity KEPT (a tabular non-result is "
+                "not a GNN non-result). FAC-REM sourced from fac_rem_registry (same as "
+                "the inference grid), not the stacker shard table.",
+                "Anchors not supported in this mode yet (anchor BC would need a "
+                "head-anomaly anchor_head - R(anchor)); the build errors if requested.",
+            ]
         if args.evidence_features:
             leakage_notes.append(
                 "Evidence bank (--evidence-features): observable target-blind signals "
@@ -1402,6 +1466,9 @@ def main() -> None:
         "obs_wte_col": OBS_WTE_COL,
         "surface_elev_col": SURFACE_ELEV_COL,
         "regional_prior_col": regional_prior_col,
+        "residual_base": args.residual_base
+        if target_mode == TARGET_WTE_RESIDUAL
+        else None,
         "dtw_base_col": dtw_base_col,
         "wte_features": wte_features,
         "cv_fold_col": "cv_fold",
