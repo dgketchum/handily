@@ -646,6 +646,13 @@ def main() -> None:
             "--aquifer set but graph_manifest.json has no aquifer block "
             "(run build_regional_aquifer_graph.py on this bundle first)"
         )
+    if args.aquifer and aquifer_block and not aquifer_block.get("enabled"):
+        # disabled-but-present must not silently fall through to a stream-only run when
+        # the user explicitly asked for the aquifer branch.
+        raise SystemExit(
+            "--aquifer set but the manifest aquifer block is disabled "
+            "(enabled=false); rebuild the bundle or drop --aquifer"
+        )
     if use_aquifer:
         if args.aquifer_route == "learned" and args.aquifer_layers <= 0:
             raise SystemExit("--aquifer-route learned requires --aquifer-layers > 0")
