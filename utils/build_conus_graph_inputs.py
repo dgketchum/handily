@@ -92,6 +92,25 @@ DEEP_REGIONAL_WTE_ANOM_COL = "deep_regional_wte_anom_m"  # deep_wte_idw - R
 # gridMET climate (EPSG:4326 -> sampled at lon/lat). Kept in wte_residual mode: a
 # NEGATIVE result in the pilot stacker does not mean it cannot help the GNN.
 CLIMATE_FEATURE_COLS = ["aridity_index", "mean_annual_precip_mm"]
+# Evidence-feature bank (the "feed the evidence, not FAC's water-surface answer" path,
+# behind --evidence-features). Observable, target-blind signals -- MODIS summer NDVI +
+# summer-minus-winter amplitude (phreatophyte greenness, a shallow-GW proxy) and
+# proximity to GSW-evidenced surface water -- added to the wte_residual query bank
+# WITHOUT the un-calibrated FAC-REM head estimate. Tests whether the GNN can build the
+# shallow correction from raw evidence rather than riding FAC's own rough water-surface
+# solve (the "shortcut to a mediocre prediction"). The required fac-skip anchor on the
+# FAC target-estimate is unchanged -- this is a feature change, not a skip change.
+NDVI_JJA = "/data/ssd2/handily/conus/covariates/modis_ndvi_jja_mean.tif"
+NDVI_DJF = "/data/ssd2/handily/conus/covariates/modis_ndvi_djf_mean.tif"
+GSW_OCC_DIR = Path(
+    "/nas/hydrography/gsw/occurrence"
+)  # JRC GSW occurrence (0-100, 4326)
+EVIDENCE_FEATURE_COLS = [
+    "well_ndvi_jja",  # summer greenness at the well
+    "well_ndvi_amp",  # jja - djf (phreatophyte amplitude: green in summer, dry in winter)
+    "dist_to_wet_reach_m",  # distance to nearest stream reach with GSW water evidence
+    "log1p_dist_to_wet_reach_m",
+]
 # Well model features (leak-free). Everything else on the query node is carried
 # for scoring/diagnostics only.
 QUERY_FEATURE_COLS = ["hand_m", "regional_idw_dtw_oof_m"]
@@ -242,26 +261,91 @@ def huc12_units(
     return units.astype(str)
 
 
+def _relief_coords(xy: np.ndarray, z: np.ndarray | None, vw: float) -> np.ndarray:
+    """Coordinates for the IDW KD-tree, optionally relief-lifted into (x, y, vw*z).
+
+    With ``vw>0`` and a land-surface elevation ``z``, neighbour selection AND the
+    inverse-distance weights run in lifted space, so only wells at SIMILAR ground
+    elevation inform a cell -- the fix for the high-relief WTE smear (a valley head
+    bleeding onto an upland well; ``build_wte_idw_grid.py``, vw=100 cuts the
+    leave-fold-out WTE MAD 8.45->6.18 and RMSE 80->54). ``vw=0`` is the original
+    horizontal IDW (identity), so callers that pass no z/vw are byte-identical.
+    """
+    if vw and z is not None:
+        return np.column_stack([xy[:, 0], xy[:, 1], vw * np.asarray(z, "float64")])
+    return xy
+
+
 def crossfit_idw(
-    xy: np.ndarray, value: np.ndarray, fold: np.ndarray, k: int, power: float
+    xy: np.ndarray,
+    value: np.ndarray,
+    fold: np.ndarray,
+    k: int,
+    power: float,
+    z: np.ndarray | None = None,
+    vw: float = 0.0,
 ) -> np.ndarray:
     """Leave-one-fold-out IDW(kNN) of a scalar well value -- the leak-free prior.
 
     Scalar-generic: ``value`` is DTW for the regional DTW prior and observed WTE
     for the head-space prior. A held-out fold's wells are never in their own
-    neighbor set.
+    neighbor set. ``z``/``vw`` enable the relief-aware lift (see ``_relief_coords``).
     """
+    coords = _relief_coords(xy, z, vw)
     pred = np.full(len(value), np.nan)
     for f in np.unique(fold):
         te = fold == f
         tr = ~te
-        tree = cKDTree(xy[tr])
-        dist, idx = tree.query(xy[te], k=k)
+        tree = cKDTree(coords[tr])
+        dist, idx = tree.query(coords[te], k=k)
         if k == 1:
             dist, idx = dist[:, None], idx[:, None]
         w = 1.0 / np.maximum(dist, 1.0) ** power
         pred[te] = (w * value[tr][idx]).sum(1) / w.sum(1)
     return pred
+
+
+def idw_at_points(
+    train_xy: np.ndarray,
+    train_val: np.ndarray,
+    query_xy: np.ndarray,
+    k: int,
+    power: float,
+) -> np.ndarray:
+    """Plain IDW(kNN) of a scalar from training points to arbitrary query points."""
+    tree = cKDTree(train_xy)
+    kk = min(k, len(train_xy))
+    dist, idx = tree.query(query_xy, k=kk)
+    if kk == 1:
+        dist, idx = dist[:, None], idx[:, None]
+    w = 1.0 / np.maximum(dist, 1.0) ** power
+    return (w * train_val[idx]).sum(1) / w.sum(1)
+
+
+def crossfit_anchor_anomaly(
+    well_xy: np.ndarray,
+    well_wte: np.ndarray,
+    fold: np.ndarray,
+    anchor_xy: np.ndarray,
+    anchor_head: np.ndarray,
+    k: int,
+    power: float,
+) -> dict[int, np.ndarray]:
+    """Per-fold leak-safe anchor head-anomaly: anchor_head - R_f(anchor).
+
+    R_f(anchor) is the IDW of OBSERVED WTE from wells in folds != f -- the SAME
+    leave-one-fold-out scheme as the well-side regional prior R. A held-out fold's
+    wells therefore never enter the anchor BC injected when predicting that fold,
+    so the Dirichlet BC carries no leakage into fold f's own wells. The anomaly is
+    in the wte_residual target space (obs_wte - R), so the trainer standardizes it
+    by the same per-fold target median/MAD. Returns {fold: anomaly over anchor_xy}.
+    """
+    out: dict[int, np.ndarray] = {}
+    for f in np.unique(fold):
+        tr = fold != f
+        r_f = idw_at_points(well_xy[tr], well_wte[tr], anchor_xy, k, power)
+        out[int(f)] = anchor_head - r_f
+    return out
 
 
 def deep_well_mask(
@@ -303,6 +387,9 @@ def crossfit_deep_idw(
     fold_deep: np.ndarray,
     k: int,
     power: float,
+    z_all: np.ndarray | None = None,
+    z_deep: np.ndarray | None = None,
+    vw: float = 0.0,
 ) -> np.ndarray:
     """Leave-one-HUC4-fold-out IDW for ALL wells from the DEEP-well pool.
 
@@ -314,15 +401,17 @@ def crossfit_deep_idw(
     ``value_deep`` (deep DTW for the DTW datum; deep observed WTE for the head
     datum -- the deep pool is a DTW depth class either way).
     """
+    coords_all = _relief_coords(xy_all, z_all, vw)
+    coords_deep = _relief_coords(xy_deep, z_deep, vw)
     pred = np.full(len(xy_all), np.nan)
     for f in np.unique(fold_all):
         te = fold_all == f
         tr = fold_deep != f
         if tr.sum() == 0:
             raise SystemExit(f"deep training pool empty for held-out fold {f}")
-        tree = cKDTree(xy_deep[tr])
+        tree = cKDTree(coords_deep[tr])
         kk = min(k, int(tr.sum()))
-        dist, idx = tree.query(xy_all[te], k=kk)
+        dist, idx = tree.query(coords_all[te], k=kk)
         if kk == 1:
             dist, idx = dist[:, None], idx[:, None]
         w = 1.0 / np.maximum(dist, 1.0) ** power
@@ -404,6 +493,97 @@ def sample_gridmet(x: np.ndarray, y: np.ndarray) -> dict[str, np.ndarray]:
         "aridity_index": sample_coarse(GRIDMET_AI, lon, lat),
         "mean_annual_precip_mm": sample_coarse(GRIDMET_P, lon, lat),
     }
+
+
+def sample_evidence_ndvi(x: np.ndarray, y: np.ndarray) -> dict[str, np.ndarray]:
+    """Summer NDVI + summer-minus-winter amplitude at well 5070 coords.
+
+    Phreatophyte greenness: vegetation that stays green through summer (high JJA NDVI),
+    especially where winter NDVI is low (high amplitude), flags shallow-groundwater
+    access in water-limited settings -- the shallow signal the FAC pipeline solves for,
+    fed here as raw OBSERVED evidence instead of FAC's water-surface estimate. Both
+    MODIS NDVI rasters are EPSG:5070. Winter (DJF) nodata over snow/cloud stays NaN; the
+    trainer median-imputes + flags it (fit_stats/apply_stats), so amp inherits that gap.
+    """
+    jja = sample_coarse(NDVI_JJA, x, y)
+    djf = sample_coarse(NDVI_DJF, x, y)
+    return {"well_ndvi_jja": jja, "well_ndvi_amp": jja - djf}
+
+
+def _sample_gsw_occurrence(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    """JRC GSW occurrence (0-100 = %% of valid months inundated) at lon/lat (EPSG:4326).
+
+    Routes each point to its covering 10-deg tile by tile bounds; points outside every
+    cached tile stay NaN. Half-open bounds [left,right)/(bottom,top] keep a point on a
+    shared 10-deg tile seam from being sampled twice.
+    """
+    import rasterio  # local: heavy import only when the evidence bank is built
+
+    lon = np.asarray(lon, "float64")
+    lat = np.asarray(lat, "float64")
+    out = np.full(lon.shape, np.nan)
+    tiles = sorted(GSW_OCC_DIR.glob("*.tif"))
+    if not tiles:
+        raise SystemExit(f"no GSW occurrence tiles in {GSW_OCC_DIR}")
+    for tp in tiles:
+        with rasterio.open(tp) as ds:
+            b = ds.bounds
+            ins = (lon >= b.left) & (lon < b.right) & (lat > b.bottom) & (lat <= b.top)
+            if not ins.any():
+                continue
+            vals = np.array(
+                [v[0] for v in ds.sample(list(zip(lon[ins], lat[ins])))], "float64"
+            )
+            if ds.nodata is not None:
+                vals[vals == ds.nodata] = np.nan
+            out[ins] = vals
+    return out
+
+
+def dist_to_wet_reach(
+    qxy: np.ndarray,
+    rx: np.ndarray,
+    ry: np.ndarray,
+    occ_threshold: float,
+    search_km: float,
+) -> np.ndarray:
+    """Distance (m, EPSG:5070) from each well to the nearest stream reach carrying GSW
+    surface-water evidence.
+
+    "Water evidence" = a reach whose flowline rep-point sits on GSW occurrence
+    >= ``occ_threshold`` (%% of valid months inundated). Candidate reaches are limited to
+    within ``search_km`` of any well (the only ones that can be a near neighbour), so the
+    per-point GSW sampling stays cheap. Distinct from the bundle's dist_to_stream_m
+    (nearest stream, wet or dry): the GAP between them is the signal -- close to a channel
+    but far from WET water flags an ephemeral/dry reach over a deeper table (the
+    deep-regime flag the 30+m tail lacks). Every well gets a finite nearest wet reach.
+    """
+    from pyproj import Transformer
+
+    near = cKDTree(qxy).query(np.column_stack([rx, ry]), k=1)[0] <= search_km * 1000.0
+    if not near.any():
+        raise SystemExit("no candidate reaches within --wet-search-km of any well")
+    rx, ry = rx[near], ry[near]
+    lon, lat = Transformer.from_crs(5070, 4326, always_xy=True).transform(rx, ry)
+    occ = _sample_gsw_occurrence(lon, lat)
+    wet = np.isfinite(occ) & (occ >= occ_threshold)
+    if not wet.any():
+        raise SystemExit(
+            f"no GSW-wet reaches (occ>={occ_threshold}) within {search_km} km of any "
+            "well -- lower --gsw-wet-threshold or widen --wet-search-km"
+        )
+    d = cKDTree(np.column_stack([rx[wet], ry[wet]])).query(qxy, k=1)[0]
+    log.info(
+        "dist_to_wet_reach: %d/%d candidate reaches wet (occ>=%g); well dist "
+        "p50/p90/max %.0f/%.0f/%.0f m",
+        int(wet.sum()),
+        int(near.sum()),
+        occ_threshold,
+        float(np.median(d)),
+        float(np.percentile(d, 90)),
+        float(d.max()),
+    )
+    return d
 
 
 def build_anchor_query_edges(
@@ -531,6 +711,16 @@ def main() -> None:
     ap.add_argument("--knn-lateral", type=int, default=3)
     ap.add_argument("--idw-k", type=int, default=32)
     ap.add_argument("--idw-power", type=float, default=2.0)
+    ap.add_argument(
+        "--r-relief-vw",
+        type=float,
+        default=0.0,
+        help="relief-aware lift for the wte_residual regional WTE prior R: vertical "
+        "weight (horizontal-m per vertical-m). 0=horizontal IDW (original); 100 lifts "
+        "neighbor selection + weights into (x,y,vw*z_surf) so only wells at similar "
+        "ground elevation inform a cell (build_wte_idw_grid.py: MAD 8.45->6.18, "
+        "RMSE 80->54 in high relief, no-op where dz~0).",
+    )
     ap.add_argument("--block-size-m", type=float, default=40000.0)
     ap.add_argument("--seed", type=int, default=0)
     # Deep regional aquifer datum (built from the deepest-quartile wells only).
@@ -565,8 +755,32 @@ def main() -> None:
     )
     ap.add_argument("--max-attach-dist-m", type=float, default=5000.0)
     ap.add_argument("--conductance-p", type=float, default=0.5)
+    ap.add_argument(
+        "--evidence-features",
+        action="store_true",
+        help="add the observable evidence bank (MODIS NDVI greenness + GSW wet-reach "
+        "distance) to the wte_residual query features -- WITHOUT the FAC-REM head "
+        "estimate (the fac-skip anchor is unchanged)",
+    )
+    ap.add_argument(
+        "--gsw-wet-threshold",
+        type=float,
+        default=25.0,
+        help="GSW occurrence %% for a reach to count as carrying water evidence",
+    )
+    ap.add_argument(
+        "--wet-search-km",
+        type=float,
+        default=50.0,
+        help="candidate-reach radius (km) around wells for the wet-reach KD-tree",
+    )
     args = ap.parse_args()
     gdir = Path(args.graph_dir)
+    if args.evidence_features and args.target != TARGET_WTE_RESIDUAL:
+        raise SystemExit(
+            "--evidence-features is wired into the wte_residual query bank only; "
+            f"got target={args.target}"
+        )
 
     reach_nodes = pd.read_parquet(gdir / "reach_nodes.parquet")
     comid_to_idx = dict(
@@ -765,13 +979,8 @@ def main() -> None:
         # target = obs_wte - R (small, well-conditioned); features are anomalies-from-R
         # (translation-invariant -- no absolute elevation memorised); reconstruct
         # dtw = z_surf - (R + resid_hat) = (z_surf - R) - resid_hat. HAND is dropped.
-        if args.anchors_dir:
-            raise SystemExit(
-                "wte_residual + --anchors-dir not yet supported: the anchor Dirichlet "
-                "BC must be expressed as a head-anomaly (anchor_head - R(anchor)), an "
-                "unimplemented path. Run wte_residual without anchors, or use "
-                "--target wte for the absolute-head anchor BC."
-            )
+        # Anchors (if requested) are injected as a per-fold head-anomaly BC
+        # (anchor_head - R_f(anchor)) computed in the anchor block below.
         wte = wells[OBS_WTE_COL].to_numpy("float64")
         if not np.isfinite(wte).all():
             raise SystemExit(
@@ -779,10 +988,27 @@ def main() -> None:
             )
         # Regional WTE prior R: leave-one-fold-out IDW of OBSERVED WTE (head-space
         # direct, never z_surf - dtw_prior). Deep WTE prior from the same deep pool.
-        r_wte = crossfit_idw(xy, wte, fold, args.idw_k, args.idw_power)
+        r_wte = crossfit_idw(
+            xy,
+            wte,
+            fold,
+            args.idw_k,
+            args.idw_power,
+            z=well_surf_m,
+            vw=args.r_relief_vw,
+        )
         wells[REGIONAL_WTE_COL] = r_wte
         deep_wte = crossfit_deep_idw(
-            xy, xy[deep], wte[deep], fold, fold[deep], args.idw_k_deep, args.idw_power
+            xy,
+            xy[deep],
+            wte[deep],
+            fold,
+            fold[deep],
+            args.idw_k_deep,
+            args.idw_power,
+            z_all=well_surf_m,
+            z_deep=well_surf_m[deep],
+            vw=args.r_relief_vw,
         )
         wells[DEEP_REGIONAL_WTE_COL] = deep_wte
         # target (small residual) + DTW base (z_surf - R; dtw = base - resid_hat).
@@ -802,16 +1028,28 @@ def main() -> None:
             wells[col] = vals
         for col, vals in sample_gridmet(xy[:, 0], xy[:, 1]).items():
             wells[col] = vals
+        # Observable evidence bank (NDVI greenness here; the GSW wet-reach distance is
+        # added after the flowline geom loads below). NO FAC-REM head estimate is fed --
+        # FAC enters ONLY as the fac-skip anchor on its target-estimate, so the graph
+        # builds the shallow correction from evidence, not from FAC's rough solve.
+        if args.evidence_features:
+            for col, vals in sample_evidence_ndvi(xy[:, 0], xy[:, 1]).items():
+                wells[col] = vals
+                log.info("  %s: %.3f finite frac", col, float(np.isfinite(vals).mean()))
         target_col = WTE_RESIDUAL_TARGET_COL
         regional_prior_col = REGIONAL_WTE_COL  # carried; the DTW base is wte_resid_base
         query_feature_cols = (
             [FAC_REM_WTE_ANOM_COL, DEEP_REGIONAL_WTE_ANOM_COL]
             + RELIEF_ETRM_FEATURE_COLS
             + CLIMATE_FEATURE_COLS
+            + (EVIDENCE_FEATURE_COLS if args.evidence_features else [])
         )
         log.info(
-            "target=wte_residual  R-MAD(DTW)=%.2f m  fac finite frac=%.3f  features=%s",
+            "target=wte_residual  R-relief-vw=%.0f  R-MAD(DTW)=%.2f m  "
+            "R-RMSE(DTW)=%.2f m  fac finite frac=%.3f  features=%s",
+            args.r_relief_vw,
             float(np.nanmedian(np.abs((well_surf_m - r_wte) - dtw))),
+            float(np.sqrt(np.nanmean(((well_surf_m - r_wte) - dtw) ** 2))),
             fac_finite_frac,
             query_feature_cols,
         )
@@ -844,6 +1082,19 @@ def main() -> None:
     geom = geom[geom["reach_node_idx"].notna()].copy()
     geom["reach_node_idx"] = geom["reach_node_idx"].astype("int64")
     log.info("flowline geom: %d reaches matched to graph nodes", len(geom))
+    # GSW wet-reach distance (the second evidence feature). Computed here so it reuses
+    # the already-loaded flowline rep-points instead of re-reading the 2.69M-row geom;
+    # the column names were appended to query_feature_cols above.
+    if args.evidence_features:
+        dwr = dist_to_wet_reach(
+            xy,
+            geom["cx"].to_numpy("float64"),
+            geom["cy"].to_numpy("float64"),
+            args.gsw_wet_threshold,
+            args.wet_search_km,
+        )
+        wells["dist_to_wet_reach_m"] = dwr
+        wells["log1p_dist_to_wet_reach_m"] = np.log1p(dwr)
     lat = build_lateral_edges(xy, geom, comid_to_idx, args.knn_lateral)
     lat["reach_log1p_drainage_km2"] = r_logdr.reindex(lat["reach_node_idx"]).to_numpy()
     lat["reach_strahler"] = r_strah.reindex(lat["reach_node_idx"]).to_numpy()
@@ -922,6 +1173,36 @@ def main() -> None:
         aq["head_uncertainty_m"] = a_unc.reindex(aq["anchor_node_idx"]).to_numpy()
 
         ax = build_anchor_x(anodes)
+        # Anchor Dirichlet BC value. In TARGET_WTE it is the absolute head_m (one
+        # column). In TARGET_WTE_RESIDUAL the BC must live in residual space, so it
+        # is a per-fold head-anomaly (anchor_head - R_f(anchor)) -- one leak-safe
+        # column per CV fold, which the trainer selects fold-by-fold.
+        anchor_bc_mode = "absolute_head"
+        anchor_bc_anom_cols = None
+        if args.target == TARGET_WTE_RESIDUAL:
+            anom = crossfit_anchor_anomaly(
+                xy,
+                wte,
+                fold,
+                axy,
+                anodes["head_m"].to_numpy("float64"),
+                args.idw_k,
+                args.idw_power,
+            )
+            anchor_bc_anom_cols = []
+            for fk in sorted(anom):
+                col = f"anchor_bc_anom_fold_{fk}"
+                ax[col] = anom[fk]
+                anchor_bc_anom_cols.append(col)
+            if not all(
+                np.isfinite(ax[c].to_numpy()).all() for c in anchor_bc_anom_cols
+            ):
+                raise SystemExit("non-finite anchor BC anomaly (anchor_head - R_f)")
+            anchor_bc_mode = "head_anomaly_over_R"
+            log.info(
+                "anchor BC: per-fold head-anomaly over R, %d folds",
+                len(anchor_bc_anom_cols),
+            )
         ax.to_parquet(gdir / "anchor_nodes.parquet")
         ar[
             ["anchor_node_idx", "reach_node_idx", *ANCHOR_REACH_EDGE_FEATURE_COLS]
@@ -951,7 +1232,13 @@ def main() -> None:
             # this column and injects it (fold-standardized in target space) on a
             # dedicated value channel -- it is NOT a member of anchor_feature_cols.
             "anchor_bc_col": "head_m",
-            "anchor_bc_units": "m_same_datum_as_target_wte",
+            "anchor_bc_mode": anchor_bc_mode,
+            "anchor_bc_anom_cols": anchor_bc_anom_cols,
+            "anchor_bc_units": (
+                "m_residual_over_regional_wte_R"
+                if anchor_bc_mode == "head_anomaly_over_R"
+                else "m_same_datum_as_target_wte"
+            ),
         }
         log.info(
             "anchors: %d nodes, %d->reach edges, %d->query edges (k=%d)",
@@ -1038,6 +1325,14 @@ def main() -> None:
             "Anchors not supported in this mode yet (anchor BC would need a "
             "head-anomaly anchor_head - R(anchor)); the build errors if requested.",
         ]
+        if args.evidence_features:
+            leakage_notes.append(
+                "Evidence bank (--evidence-features): observable target-blind signals "
+                "only -- MODIS JJA NDVI + JJA-DJF amplitude (phreatophyte greenness) and "
+                "GSW wet-reach distance (occ>=%g%% within %g km). NO FAC-REM head "
+                "estimate is a feature; FAC enters only as the fac-skip anchor."
+                % (args.gsw_wet_threshold, args.wet_search_km)
+            )
     else:
         target_mode = TARGET_DTW_RESIDUAL
         target_units = "m"
@@ -1098,11 +1393,22 @@ def main() -> None:
         "relief_etrm_feature_cols": RELIEF_ETRM_FEATURE_COLS
         if args.relief_etrm_features
         else [],
+        "evidence_features": EVIDENCE_FEATURE_COLS if args.evidence_features else [],
+        "evidence_params": {
+            "ndvi_jja": NDVI_JJA,
+            "ndvi_djf": NDVI_DJF,
+            "gsw_occurrence_dir": str(GSW_OCC_DIR),
+            "gsw_wet_threshold_pct": args.gsw_wet_threshold,
+            "wet_search_km": args.wet_search_km,
+        }
+        if args.evidence_features
+        else None,
         "anchors": anchor_block,
         "conductance_p": args.conductance_p,
         "knn_lateral": args.knn_lateral,
         "idw_k": args.idw_k,
         "idw_power": args.idw_power,
+        "r_relief_vw": args.r_relief_vw,
         "deep_datum": {
             "quantile": args.deep_quantile,
             "unit": args.deep_unit,
