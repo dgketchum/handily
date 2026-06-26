@@ -29,7 +29,7 @@ import rasterio
 
 log = logging.getLogger("fac_rem_registry")
 
-_SCALABLE_ROOT = "/data/ssd2/handily/scalable_fac_rem"
+_SCALABLE_ROOT = "/data/ssd2/handily/huc8"
 
 
 def _fac_path(basin: str) -> str:
@@ -115,6 +115,56 @@ def sample_fac_rem(
         log.info(
             "FAC-REM %s: filled %d/%d remaining",
             Path(path).parents[1].name,
+            int(np.isfinite(vals).sum()),
+            int(need.sum()),
+        )
+    return out
+
+
+def _str_top2_wte_path(basin: str) -> str:
+    return f"{_SCALABLE_ROOT}/{basin}/str_top2_idw_wte_100m.tif"
+
+
+# The well-free streams-Strahler regional WTE prior R (top-2 Strahler orders;
+# build_str7_idw_raster.py). Same basins/precedence contract as FAC_REM_REGISTRY,
+# but a 100 m EPSG:5070 water-table ELEVATION (not a depth). It consumes zero well
+# labels, so as the GNN's regional base it is leakage-free and needs no cross-fit.
+STR_TOP2_WTE_REGISTRY: list[str] = [
+    _str_top2_wte_path(b)
+    for b in (
+        "nm_rio_grande_abq",
+        "nv_upper_humboldt",
+        "mt_big_hole",
+        "mt_beaverhead",
+        "mt_ruby",
+    )
+]
+
+
+def sample_str_top2_wte(
+    x5070: np.ndarray, y5070: np.ndarray, registry: list[str] | None = None
+) -> np.ndarray:
+    """Streams-Strahler regional WTE elevation (m) at EPSG:5070 coords.
+
+    Registry precedence, first finite hit wins (the basins do not overlap today).
+    Points off the trunk-supported valley (no top-2 Strahler anchor within the
+    prior's dmax) stay NaN -- the caller decides explicitly (the GNN builder drops
+    those wells with an audited log, never silently).
+    """
+    reg = STR_TOP2_WTE_REGISTRY if registry is None else registry
+    x5070 = np.asarray(x5070, dtype="float64")
+    y5070 = np.asarray(y5070, dtype="float64")
+    out = np.full(x5070.shape, np.nan, dtype="float64")
+    for path in existing_registry(reg):
+        need = ~np.isfinite(out)
+        if not need.any():
+            break
+        vals = _sample_one(path, x5070[need], y5070[need])
+        idx = np.where(need)[0]
+        out[idx] = vals
+        log.info(
+            "str_top2 WTE %s: filled %d/%d remaining",
+            Path(path).parents[0].name,
             int(np.isfinite(vals).sum()),
             int(need.sum()),
         )

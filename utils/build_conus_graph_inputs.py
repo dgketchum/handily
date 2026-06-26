@@ -56,7 +56,7 @@ from build_stacker_features import (  # noqa: E402
     TRI,
     sample_coarse,
 )
-from fac_rem_registry import sample_fac_rem  # noqa: E402
+from fac_rem_registry import sample_fac_rem, sample_str_top2_wte  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("build_conus_graph_inputs")
@@ -830,6 +830,30 @@ def main() -> None:
             n0,
             100 * len(wells) / n0,
         )
+    # Streams-Strahler R footprint (wte_residual only): R is the well-free str_top2
+    # WTE (huc8/{basin}/str_top2_idw_wte_100m.tif), finite only on the trunk-supported
+    # valley. Drop off-trunk wells NOW (audited, not silent) so folds, the deep datum,
+    # and the residual base/target are all defined on the same R footprint.
+    if args.target == TARGET_WTE_RESIDUAL:
+        r_probe = sample_str_top2_wte(
+            wells["x5070"].to_numpy("float64"), wells["y5070"].to_numpy("float64")
+        )
+        keep_r = np.isfinite(r_probe)
+        n0r = len(wells)
+        if int(keep_r.sum()) < args.folds * 10:
+            raise SystemExit(
+                f"str_top2 R covers only {int(keep_r.sum())} wells -- too few for "
+                f"{args.folds}-fold CV; widen the str_top2 anchors/footprint first"
+            )
+        if (~keep_r).any():
+            log.info(
+                "str_top2 R: dropping %d/%d wells off the stream-anchored footprint "
+                "(no top-2 Strahler R there) -- residual base undefined off-trunk",
+                int((~keep_r).sum()),
+                n0r,
+            )
+        wells = wells[keep_r].reset_index(drop=True)
+
     wells["query_node_idx"] = np.arange(len(wells), dtype="int64")
 
     # CV folds (HUC12-blocked by default) + within-train val blocks (40 km).
@@ -986,17 +1010,17 @@ def main() -> None:
             raise SystemExit(
                 f"{int((~np.isfinite(wte)).sum())} non-finite {OBS_WTE_COL}"
             )
-        # Regional WTE prior R: leave-one-fold-out IDW of OBSERVED WTE (head-space
-        # direct, never z_surf - dtw_prior). Deep WTE prior from the same deep pool.
-        r_wte = crossfit_idw(
-            xy,
-            wte,
-            fold,
-            args.idw_k,
-            args.idw_power,
-            z=well_surf_m,
-            vw=args.r_relief_vw,
-        )
+        # Regional WTE prior R = the well-free streams-Strahler IDW (top-2 orders,
+        # str_top2_idw_wte_100m.tif from huc8/{basin}). It consumes zero well labels,
+        # so it is leakage-free and needs NO cross-fit (unlike the well-IDW R it
+        # replaces). All finite here -- off-trunk wells were dropped up front. The
+        # deep WTE prior stays a deep-well IDW (a distinct deep-regime datum).
+        r_wte = sample_str_top2_wte(xy[:, 0], xy[:, 1])
+        if not np.isfinite(r_wte).all():
+            raise SystemExit(
+                f"{int((~np.isfinite(r_wte)).sum())} wells lack finite str_top2 R "
+                "after the up-front off-trunk drop -- investigate (do not patch)"
+            )
         wells[REGIONAL_WTE_COL] = r_wte
         deep_wte = crossfit_deep_idw(
             xy,
@@ -1045,9 +1069,8 @@ def main() -> None:
             + (EVIDENCE_FEATURE_COLS if args.evidence_features else [])
         )
         log.info(
-            "target=wte_residual  R-relief-vw=%.0f  R-MAD(DTW)=%.2f m  "
-            "R-RMSE(DTW)=%.2f m  fac finite frac=%.3f  features=%s",
-            args.r_relief_vw,
+            "target=wte_residual  R=str_top2(streams-Strahler, well-free)  "
+            "R-MAD(DTW)=%.2f m  R-RMSE(DTW)=%.2f m  fac finite frac=%.3f  features=%s",
             float(np.nanmedian(np.abs((well_surf_m - r_wte) - dtw))),
             float(np.sqrt(np.nanmean(((well_surf_m - r_wte) - dtw) ** 2))),
             fac_finite_frac,
@@ -1319,6 +1342,11 @@ def main() -> None:
             "wte_residual: target = obs_wte - R (small head residual); features are "
             "anomalies-from-R (translation-invariant -- no absolute elevation fed). "
             "Reconstruct dtw = (z_surf - R) - resid_hat; |WTE err| == |DTW err|.",
+            "R = str_top2 streams-Strahler IDW WTE (build_str7_idw_raster, top-2 "
+            "orders), sampled from huc8/{basin}/str_top2_idw_wte_100m.tif via "
+            "fac_rem_registry.sample_str_top2_wte. Well-free (zero well labels) -> "
+            "leakage-free, so R needs NO cross-fit. Off-trunk wells (no top-2 anchor) "
+            "are dropped up front; R is finite for every retained well.",
             "HAND features removed; gridMET aridity KEPT (a tabular non-result is "
             "not a GNN non-result). FAC-REM sourced from fac_rem_registry (same as "
             "the inference grid), not the stacker shard table.",
