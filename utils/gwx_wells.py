@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 from pyproj import Transformer
+from scipy.spatial import cKDTree
 from shapely.geometry import Point
 
 # National GWX well index (confinement-labeled). nwis/ngwmn are the *direct*
@@ -26,6 +27,11 @@ from shapely.geometry import Point
 GWX_INDEX = "/data/ssd2/gwx/products/current/wells.geoparquet"
 WT_CLASSES = ("unconfined", "unconfined_marginal")
 DEPTH_BANDS = ((0, 2), (2, 5), (5, 10), (10, 30), (30, 1e9))
+# Horizontal distance from surface water — the regional-prior (R) test. Near
+# surface water the channel bed *is* the answer (FAC-REM's shallow domain), so
+# those bands are non-diagnostic; a regional water-table prior is judged on the
+# FAR bands, where the table is decoupled from the local channel.
+SW_DIST_BANDS = ((0, 500), (500, 2000), (2000, 5000), (5000, 10000), (10000, 1e9))
 
 
 def sample_raster(path: str, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
@@ -107,6 +113,38 @@ def tag_setting(
     near = near[~near.index.duplicated(keep="first")]
     d = near["_d"].reindex(wells.index).to_numpy()
     return np.where(d <= dist_m, "valley", "upland"), d
+
+
+def surface_water_distance(
+    wells: gpd.GeoDataFrame, sw_path: str, decim: int = 5
+) -> np.ndarray:
+    """Horizontal distance (m) from each well to the nearest permanent-surface-water cell.
+
+    ``sw_path`` is a binary/occurrence raster where (value != nodata, default 0)
+    marks water -- e.g. a JRC-GSW permanent-water mask. The full mask is read and
+    block-pooled with ``any()`` (factor ``decim``, ~decim*native_res) so thin river
+    lines survive decimation (nearest-neighbour reads would drop them), then a k-NN
+    distance is taken. Wells must carry x5070/y5070 (set by ``load_window_wells``).
+    """
+    with rasterio.open(sw_path) as s:
+        a = s.read(1)
+        t, nod, crs = s.transform, s.nodata, s.crs
+    water = a != (nod if nod is not None else 0)
+    del a
+    h0, w0 = water.shape
+    h, w = h0 // decim, w0 // decim
+    wp = water[: h * decim, : w * decim].reshape(h, decim, w, decim).any((1, 3))
+    rows, cols = np.where(wp)
+    if rows.size == 0:
+        return np.full(len(wells), np.nan)
+    xs = t.c + (cols * decim + decim / 2) * t.a
+    ys = t.f + (rows * decim + decim / 2) * t.e
+    if crs is not None and crs.to_epsg() != 5070:
+        xs, ys = Transformer.from_crs(crs, "EPSG:5070", always_xy=True).transform(
+            xs, ys
+        )
+    qxy = np.c_[wells["x5070"].to_numpy(), wells["y5070"].to_numpy()]
+    return cKDTree(np.c_[xs, ys]).query(qxy)[0]
 
 
 def resid_stats(pred: np.ndarray, obs: np.ndarray) -> dict | None:

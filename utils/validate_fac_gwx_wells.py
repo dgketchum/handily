@@ -48,10 +48,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gwx_wells import (  # noqa: E402
     DEPTH_BANDS,
     GWX_INDEX,
+    SW_DIST_BANDS,
     WT_CLASSES,
     load_window_wells,
     resid_stats,
     sample_raster,
+    surface_water_distance,
     tag_setting,
 )
 
@@ -90,6 +92,14 @@ def main() -> None:
     )
     p.add_argument("--confinement", default=",".join(WT_CLASSES))
     p.add_argument("--valley-dist-m", type=float, default=500.0)
+    p.add_argument(
+        "--surface-water",
+        default=None,
+        help="binary surface-water raster (e.g. JRC-GSW permanent water). Enables the "
+        "sw_dist stratification — the regional-prior (R) test: bands of horizontal "
+        "distance from surface water, where the FAR bands judge how well a predictor "
+        "expresses the regional (drainage-decoupled) water table.",
+    )
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -125,6 +135,13 @@ def main() -> None:
     setting, dist = tag_setting(wells, args.streams, args.valley_dist_m)
     wells["setting"] = setting
     wells["dist_stream_m"] = dist
+    if args.surface_water:
+        wells["sw_dist_m"] = surface_water_distance(wells, args.surface_water)
+        log.info(
+            "surface-water distance: median %.0f m, %.0f%% within 2 km",
+            np.nanmedian(wells["sw_dist_m"]),
+            100 * np.nanmean(wells["sw_dist_m"].to_numpy() < 2000),
+        )
 
     # Common footprint: every predictor finite (fair head-to-head).
     finite = np.ones(len(wells), dtype=bool)
@@ -172,6 +189,15 @@ def main() -> None:
         )
         emit("northing_quartile", f"q{i + 1}_S_to_N", mask)
 
+    # Regional-prior (R) test: distance from surface water. Far bands decide whether
+    # a predictor expresses the drainage-decoupled regional table (near bands are
+    # non-diagnostic — the channel bed is the answer there).
+    if args.surface_water:
+        swd = cw["sw_dist_m"].to_numpy()
+        for lo, hi in SW_DIST_BANDS:
+            lab = f"{lo / 1000:g}-{hi / 1000:g}km" if hi < 1e9 else f"{lo / 1000:g}+km"
+            emit("sw_dist", lab, (swd >= lo) & (swd < hi))
+
     summary = pd.DataFrame(rows)
     summary_path = out_dir / "score_summary.csv"
     summary.to_csv(summary_path, index=False)
@@ -186,6 +212,7 @@ def main() -> None:
         "confinement_source",
         "setting",
         "dist_stream_m",
+        *(["sw_dist_m"] if args.surface_water else []),
         *[f"pred_{label}" for label in preds],
         *[f"resid_{label}" for label in preds],
         "geometry",
@@ -215,7 +242,10 @@ def main() -> None:
         f"\n=== {args.pred_label} vs benchmarks on {len(cw)} GWX unconfined wells "
         f"({src_note}) ==="
     )
-    for gt in ("all", "setting", "well_class", "obs_depth", "fac_dist_stream"):
+    console_groups = ["all", "setting", "well_class", "obs_depth", "fac_dist_stream"]
+    if args.surface_water:
+        console_groups.append("sw_dist")
+    for gt in console_groups:
         sl = summary[summary["group_type"] == gt]
         for g in sl["group"].unique():
             line = f"{gt:16} {g:14}"
