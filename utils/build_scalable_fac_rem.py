@@ -497,9 +497,16 @@ def build_one_region(
         buffer_m=halo_m,
     )
 
-    # 2. WBT FAC + streams
+    # 2. WBT FAC + streams (clipped to the FAC-delineated watershed of the
+    # dominant outlet so the persisted network is the basin's own connected
+    # drainage -- including the trunk where it assembles below the HUC pour point
+    # out in the halo -- not the foreign catchments that exit other window edges).
     regional_fac.compute_regional_fac(
-        dem_path, out_dir, threshold=args.stream_threshold, max_procs=args.workers
+        dem_path,
+        out_dir,
+        threshold=args.stream_threshold,
+        max_procs=args.workers,
+        basin_poly=poly,
     )
     streams_path = out_dir / "streams_regional.fgb"
     fac_path = out_dir / "flow_accumulation.tif"
@@ -598,7 +605,10 @@ def resolve_batch_huc8s(args) -> list[tuple[str, object]]:
         ]
     if args.state:
         want = {s.upper() for s in args.state}
-        touched = gdf["states"].fillna("").str.upper().str.split("|")
+        # The national WBD `states` column lists every state a HUC8 touches,
+        # comma-separated ("CO,NM"); split on comma OR pipe so border HUC8s shared
+        # with neighbors are included (wall-to-wall coverage), not just interior ones.
+        touched = gdf["states"].fillna("").str.upper().str.split(r"[,|]")
         mask = touched.apply(lambda lst: bool(want.intersection(lst)))
         codes += gdf.index[mask].tolist()
 
