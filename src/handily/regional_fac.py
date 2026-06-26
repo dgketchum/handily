@@ -19,6 +19,9 @@ import numpy as np
 import rasterio
 import requests
 import whitebox
+from rasterio.features import rasterize
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from shapely.geometry import LineString, MultiLineString
 from shapely.ops import linemerge
 from tqdm import tqdm
@@ -78,7 +81,9 @@ def download_3dep_10m_tiles(
             paths.append(local)
             continue
         log.info("  downloading %s ...", name)
-        tmp = local.with_suffix(".tif.part")
+        # Per-process temp name so concurrent workers sharing this cache dir
+        # cannot clobber each other's partial download of the same tile.
+        tmp = local.with_suffix(f".tif.part.{os.getpid()}")
         with requests.get(url, stream=True, timeout=300) as r:
             if r.status_code == 404:
                 # No 3DEP coverage for this 1-degree cell (border/Mexico/ocean);
@@ -95,7 +100,12 @@ def download_3dep_10m_tiles(
                     if chunk:
                         f.write(chunk)
                         pbar.update(len(chunk))
-        tmp.rename(local)
+        # Another worker may have finished the same tile while we downloaded;
+        # the atomic rename makes last-writer-wins safe (identical content).
+        if local.exists():
+            tmp.unlink(missing_ok=True)
+        else:
+            tmp.rename(local)
         paths.append(local)
     return paths
 
@@ -179,13 +189,242 @@ def build_regional_dem(
 # ---------------------------------------------------------------------------
 
 
+def d8_stream_cell_components(
+    streams_arr: np.ndarray,
+    d8_arr: np.ndarray,
+    stream_value=1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Connected components of the D8 stream-cell graph.
+
+    Two stream cells are connected iff one is the other's D8 downstream neighbor
+    (treated undirected), so every connected component is the contributing area of
+    a single window outlet — its most-downstream cell either has ``d8 == 0`` or
+    drains off the valid-data window. Returns ``(rows, cols, labels, sizes)``:
+    ``labels[i]`` is the component index of stream cell ``(rows[i], cols[i])`` and
+    ``sizes[k]`` is the number of stream cells in component ``k``.
+
+    Stepping along :data:`_D8_OFFSETS` follows flow downstream (FAC increases), so
+    the component partition is the authoritative D8 routing — independent of the
+    coordinate node-matching that the vector reach graph relies on.
+    """
+    ny, nx = streams_arr.shape
+    mask = streams_arr == stream_value
+    rows, cols = np.where(mask)
+    n = len(rows)
+    if n == 0:
+        empty = np.array([], dtype=np.int64)
+        return rows, cols, empty, empty
+
+    cell_idx = -np.ones((ny, nx), dtype=np.int64)
+    cell_idx[rows, cols] = np.arange(n)
+
+    v = d8_arr[rows, cols].astype(np.int64)
+    dr = np.zeros(n, np.int64)
+    dc = np.zeros(n, np.int64)
+    has_dir = np.zeros(n, bool)
+    for val, (off_r, off_c) in _D8_OFFSETS.items():
+        m = v == val
+        dr[m], dc[m], has_dir[m] = off_r, off_c, True
+    tr, tc = rows + dr, cols + dc
+    in_bounds = has_dir & (tr >= 0) & (tr < ny) & (tc >= 0) & (tc < nx)
+    dst = -np.ones(n, np.int64)
+    dst[in_bounds] = cell_idx[tr[in_bounds], tc[in_bounds]]
+    edge = dst >= 0
+    src_e = np.arange(n)[edge]
+    dst_e = dst[edge]
+    graph = coo_matrix((np.ones(len(src_e)), (src_e, dst_e)), shape=(n, n))
+    _, labels = connected_components(graph, directed=False)
+    sizes = np.bincount(labels)
+    return rows, cols, labels, sizes
+
+
+def clip_streams_to_fac_watershed(
+    streams_gdf: gpd.GeoDataFrame,
+    d8_path: str | Path,
+    streams_raster_path: str | Path,
+    fac_path: str | Path,
+    basin_poly=None,
+    min_outlet_fraction: float = 0.5,
+    min_in_basin_fraction: float = 0.9,
+    min_secondary_fraction: float = 0.05,
+) -> gpd.GeoDataFrame:
+    """Clip reaches to the FAC-delineated watershed(s) of the dominant outlet(s).
+
+    The FAC network is extracted over ``basin + halo`` so accumulation is correct
+    at the basin edges. The right unit to keep is **not** the HUC polygon: a HUC8
+    pour point generally sits *upstream* of where the FAC mainstem finishes
+    assembling (the mainstem keeps gathering tributaries below the pour point, out
+    in the halo, before exiting the window). Clipping to the polygon therefore
+    severs every tributary whose confluence with the trunk lies below the pour
+    point, leaving the network fragmented. Instead, keep the contributing area of
+    the dominant outlet — the largest connected D8 stream-cell component, which
+    spans the halo trunk and all below-pour-point confluences and is one connected
+    network by construction.
+
+    Components are ranked by **outlet flow accumulation** (max accumulation over
+    the component's cells, i.e. its drainage area at the window edge). A component
+    is kept when **either**:
+
+    - its outlet FAC is ``>= min_outlet_fraction`` of the largest — so a genuinely
+      bifurcated window (two comparable rivers) retains both outlets; **or**
+    - it is a substantial, unambiguously in-HUC tributary: ``>=
+      min_in_basin_fraction`` of its cells fall inside ``basin_poly`` **and** its
+      outlet FAC is ``>= min_secondary_fraction`` of the largest. This retains an
+      in-HUC tributary whose confluence with the mainstem falls just outside the
+      window (so it is a separate D8 component here) instead of discarding it.
+      Such a component stays a disconnected subgraph — it is kept for coverage, not
+      connectivity. Requires ``basin_poly``; with no polygon only the outlet-FAC
+      rule applies.
+
+    Reaches are assigned to the kept watershed(s) by majority vote of their
+    vertices over the kept-cell mask. ``stream_id`` is reset to a contiguous range
+    over the kept reaches.
+    """
+    with rasterio.open(streams_raster_path) as s:
+        streams_arr = s.read(1)
+        transform = s.transform
+        shp = s.shape
+    with rasterio.open(d8_path) as d:
+        d8_arr = d.read(1)
+
+    rows, cols, labels, sizes = d8_stream_cell_components(streams_arr, d8_arr)
+    if len(sizes) == 0:
+        log.warning("  fac-watershed clip: no stream cells; returning input unchanged")
+        return streams_gdf
+
+    with rasterio.open(fac_path) as f:
+        fac_arr = f.read(1)
+    cell_fac = fac_arr[rows, cols].astype(np.float64)
+    ncomp = len(sizes)
+    outlet_fac = np.zeros(ncomp)
+    np.maximum.at(outlet_fac, labels, cell_fac)
+
+    order = np.argsort(outlet_fac)[::-1]
+    max_fac = outlet_fac[order[0]]
+
+    in_basin_frac: dict[int, float] = {}
+    if basin_poly is not None:
+        bpoly = basin_poly
+        if isinstance(bpoly, gpd.GeoDataFrame):
+            bpoly = bpoly.geometry
+        if isinstance(bpoly, gpd.GeoSeries):
+            bpoly = bpoly.union_all()
+        bmask = rasterize(
+            [(bpoly, 1)], out_shape=shp, transform=transform, fill=0, dtype="uint8"
+        ).astype(bool)
+        cell_in = bmask[rows, cols]
+        for k in order:
+            if outlet_fac[k] < min(0.01, min_secondary_fraction) * max_fac:
+                break
+            in_basin_frac[int(k)] = float(cell_in[labels == k].mean())
+
+    # Keep the dominant outlet (and any comparable outlet), plus any substantial,
+    # unambiguously in-HUC tributary whose out-of-window confluence made it a
+    # separate component here.
+    keep_labels: set[int] = set()
+    for k in order:
+        k = int(k)
+        is_dominant = outlet_fac[k] >= min_outlet_fraction * max_fac
+        is_in_basin_trib = (
+            in_basin_frac.get(k, 0.0) >= min_in_basin_fraction
+            and outlet_fac[k] >= min_secondary_fraction * max_fac
+        )
+        if is_dominant or is_in_basin_trib:
+            keep_labels.add(k)
+
+    px, py = abs(transform.a), abs(transform.e)
+    cell_km2 = px * py / 1e6
+    log.info(
+        "  fac-watershed clip: %d components; keeping %d "
+        "(outlet >= %.0f%% of max, or >= %.0f%% in-basin and >= %.0f%% of max)",
+        ncomp,
+        len(keep_labels),
+        100 * min_outlet_fraction,
+        100 * min_in_basin_fraction,
+        100 * min_secondary_fraction,
+    )
+    for rank, k in enumerate(order):
+        if outlet_fac[k] < 0.01 * max_fac:
+            break
+        sub = labels == k
+        oi = int(np.argmax(cell_fac[sub]))
+        orow, ocol = rows[sub][oi], cols[sub][oi]
+        ox, oy = transform * (ocol + 0.5, orow + 0.5)
+        ib = f", in_basin={in_basin_frac[int(k)] * 100:.0f}%" if in_basin_frac else ""
+        log.info(
+            "    rank %d: %d cells, outlet_fac=%.0f km2 at (%.0f,%.0f)%s -> %s",
+            rank,
+            int(sizes[k]),
+            outlet_fac[k] * cell_km2,
+            ox,
+            oy,
+            ib,
+            "KEEP" if int(k) in keep_labels else "drop",
+        )
+    if len(keep_labels) > 1:
+        log.warning(
+            "  fac-watershed clip: %d outlets kept (multi-outlet window) -- review",
+            len(keep_labels),
+        )
+    dropped = [k for k in order if int(k) not in keep_labels]
+    if dropped and outlet_fac[dropped[0]] >= 0.1 * max_fac:
+        log.warning(
+            "  fac-watershed clip: largest DROPPED outlet is %.0f%% of max"
+            " -- possible multi-outlet HUC, review",
+            100 * outlet_fac[dropped[0]] / max_fac,
+        )
+    if in_basin_frac and in_basin_frac.get(int(order[0]), 1.0) < 0.5:
+        log.warning(
+            "  fac-watershed clip: dominant kept component is only %.0f%% in-basin"
+            " -- a foreign river may be clipping through the window; review",
+            100 * in_basin_frac[int(order[0])],
+        )
+
+    keep_cell = np.zeros(shp, dtype=bool)
+    keep_idx = np.isin(labels, list(keep_labels))
+    keep_cell[rows[keep_idx], cols[keep_idx]] = True
+
+    inv = ~transform
+
+    def _on_keep(geom) -> bool:
+        xy = np.asarray(geom.coords)
+        cc, rr = inv * (xy[:, 0], xy[:, 1])
+        rr = rr.astype(int)
+        cc = cc.astype(int)
+        good = (rr >= 0) & (rr < shp[0]) & (cc >= 0) & (cc < shp[1])
+        if not good.any():
+            return False
+        return keep_cell[rr[good], cc[good]].mean() >= 0.5
+
+    n_before = len(streams_gdf)
+    kept = streams_gdf[streams_gdf.geometry.apply(_on_keep)].reset_index(drop=True)
+    kept["stream_id"] = range(len(kept))
+    log.info(
+        "  fac-watershed clip: kept %d of %d reaches (dropped %d off-watershed)",
+        len(kept),
+        n_before,
+        n_before - len(kept),
+    )
+    return kept
+
+
 def compute_regional_fac(
     dem_path: str | Path,
     out_dir: str | Path,
     threshold: int = 5000,
     max_procs: int = 32,
+    basin_poly=None,
 ) -> Path:
     """Run D8 flow accumulation and stream extraction on a regional DEM.
+
+    When ``basin_poly`` (the unbuffered basin polygon, same CRS as the DEM) is
+    supplied, the extracted network is clipped to the FAC-delineated watershed of
+    the dominant window outlet via :func:`clip_streams_to_fac_watershed` — keeping
+    the basin's own connected drainage (including its trunk where it assembles
+    below the HUC pour point, out in the halo) and dropping foreign catchments
+    that exit a different window edge. ``basin_poly`` is also used for the
+    in-basin diagnostic log only. It defaults to ``None`` (no clip), preserving
+    behavior for callers with no associated basin polygon.
 
     Returns the path to the final ``streams_regional.fgb``.
     """
@@ -283,6 +522,10 @@ def compute_regional_fac(
         crs=dem_crs,
     )
     gdf["length_m"] = gdf.geometry.length
+    if basin_poly is not None:
+        gdf = clip_streams_to_fac_watershed(
+            gdf, fdir, streams_ras, acc, basin_poly=basin_poly
+        )
     gdf.to_file(streams_fgb, driver="FlatGeobuf")
     log.info(
         "  wrote %d streams (%.0f km) to %s in %.0fs",
@@ -298,16 +541,18 @@ def compute_regional_fac(
 # 1m FAC with 10m inflow injection
 # ---------------------------------------------------------------------------
 
-# WhiteboxTools D8 pointer encoding: value → (row_offset, col_offset)
+# WhiteboxTools D8 pointer encoding (clockwise from NE): value → (row, col)
+# offset, with row increasing downward. This matches WBT's d8_pointer output and
+# is NOT the ESRI scheme — stepping along it follows flow downstream.
 _D8_OFFSETS = {
-    1: (0, 1),  # E
-    2: (-1, 1),  # NE
-    4: (-1, 0),  # N
-    8: (-1, -1),  # NW
-    16: (0, -1),  # W
-    32: (1, -1),  # SW
-    64: (1, 0),  # S
-    128: (1, 1),  # SE
+    1: (-1, 1),  # NE
+    2: (0, 1),  # E
+    4: (1, 1),  # SE
+    8: (1, 0),  # S
+    16: (1, -1),  # SW
+    32: (0, -1),  # W
+    64: (-1, -1),  # NW
+    128: (-1, 0),  # N
 }
 
 
