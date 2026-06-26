@@ -74,7 +74,14 @@ def core_metrics(pred: np.ndarray, obs: np.ndarray) -> dict:
 
 
 def depth_banded(pred: np.ndarray, obs: np.ndarray) -> dict:
-    """MAD per observed-depth band -- exposes the shallow-good / deep-saturated split."""
+    """Per observed-depth-band error STRUCTURE -- not MAD alone.
+
+    The 30+ m regime is a high-variance catastrophic tail that MAD suppresses; the
+    handoff acceptance turns on it, so each band reports RMSE, the p90/p95 absolute-
+    error percentiles, and the catastrophic-miss fractions (>10 m, >25 m) alongside
+    the central MAD/median/bias. Exposes the shallow-good / deep-saturated split AND
+    the deep tail's spread in the same panel.
+    """
     out = {}
     for lo, hi in DEPTH_BANDS:
         sel = np.isfinite(obs) & np.isfinite(pred) & (obs >= lo) & (obs < hi)
@@ -83,10 +90,17 @@ def depth_banded(pred: np.ndarray, obs: np.ndarray) -> dict:
             out[label] = {"n": 0}
             continue
         r = pred[sel] - obs[sel]
+        a = np.abs(r)
         out[label] = {
             "n": int(sel.sum()),
-            "mad_m": float(np.median(np.abs(r))),
+            "mad_m": float(np.median(a)),
             "median_resid_m": float(np.median(r)),
+            "bias_mean_m": float(np.mean(r)),
+            "rmse_m": float(np.sqrt(np.mean(r**2))),
+            "p90_abs_err_m": float(np.percentile(a, 90)),
+            "p95_abs_err_m": float(np.percentile(a, 95)),
+            "frac_abs_err_gt_10m": float(np.mean(a > 10.0)),
+            "frac_abs_err_gt_25m": float(np.mean(a > 25.0)),
         }
     return out
 
@@ -109,6 +123,63 @@ def shallow_skill(pred: np.ndarray, obs: np.ndarray) -> dict:
             "n_obs_shallow": int(obs_s.sum()),
         }
     return out
+
+
+def gate_diagnostics(df: pd.DataFrame, gate_col: str = "aquifer_gate") -> dict:
+    """Aquifer-router gate behaviour vs depth/region/error -- the fail-flat monitor.
+
+    A learned aquifer router that stays FLAT by depth band is the same dead-gate
+    failure mode as the old FAC gate: it never localizes the deep-regional regime it
+    was added for. Reports mean/median gate by observed-DTW band, by predicted-DTW
+    band, by HUC2, and the gate-vs-absolute-error correlation. NaN gates (no aquifer
+    edge / route off) are dropped per band. Returns ``{}`` if the column is absent.
+    """
+    if gate_col not in df.columns:
+        return {}
+    g = df[gate_col].to_numpy("float64")
+    obs = df["obs_dtw_m"].to_numpy("float64")
+    pred = df["gnn_dtw_m"].to_numpy("float64")
+    fin = np.isfinite(g)
+
+    def _by_band(band_vals: np.ndarray) -> dict:
+        out = {}
+        for lo, hi in DEPTH_BANDS:
+            sel = fin & np.isfinite(band_vals) & (band_vals >= lo) & (band_vals < hi)
+            label = f"{lo:g}-{hi:g}m" if np.isfinite(hi) else f"{lo:g}+m"
+            if sel.sum() == 0:
+                out[label] = {"n": 0}
+                continue
+            out[label] = {
+                "n": int(sel.sum()),
+                "mean_gate": float(np.mean(g[sel])),
+                "median_gate": float(np.median(g[sel])),
+            }
+        return out
+
+    by_huc2 = {}
+    if "huc2" in df.columns:
+        for h2, sub in df.groupby("huc2"):
+            gg = sub[gate_col].to_numpy("float64")
+            m = np.isfinite(gg)
+            if m.sum() < 25:
+                continue
+            by_huc2[str(h2)] = {"n": int(m.sum()), "mean_gate": float(np.mean(gg[m]))}
+
+    abs_err = np.abs(pred - obs)
+    cm = fin & np.isfinite(abs_err)
+    corr = (
+        float(np.corrcoef(g[cm], abs_err[cm])[0, 1])
+        if cm.sum() >= 25 and np.std(g[cm]) > 0
+        else float("nan")
+    )
+    return {
+        "n_finite_gate": int(fin.sum()),
+        "mean_gate": float(np.mean(g[fin])) if fin.any() else float("nan"),
+        "by_obs_depth": _by_band(obs),
+        "by_pred_depth": _by_band(pred),
+        "by_huc2": by_huc2,
+        "gate_vs_abs_err_corr": corr,
+    }
 
 
 def region_banded(df: pd.DataFrame, predcol: str, obscol: str) -> dict:
@@ -260,6 +331,16 @@ def log_panel(title: str, panel: dict, predcols: list[str]) -> None:
             f"{b}:{v['mad_m']:.1f}({v['n']})" for b, v in bands.items() if v.get("n")
         )
         log.info("  %s MAD by obs-depth: %s", c, cells)
+    # Deep-tail RMSE/p95 for the model and the bar: acceptance turns on the 30+ band
+    # spread (MAD hides the catastrophic tail), so log it explicitly side by side.
+    for c in [x for x in ("gnn", "janssen", "ma") if x in predcols]:
+        bands = panel["predictors"][c]["by_depth_band"]
+        cells = " ".join(
+            f"{b}:RMSE{v['rmse_m']:.1f}/p95 {v['p95_abs_err_m']:.1f}(n{v['n']})"
+            for b, v in bands.items()
+            if v.get("n")
+        )
+        log.info("  %s deep-tail RMSE/p95 by obs-depth: %s", c, cells)
 
 
 def main() -> None:
@@ -369,11 +450,29 @@ def main() -> None:
         df["ma"] = sample_ma(df, ma_specs)
         predcols.append("ma")
 
+    # Aquifer-router gate diagnostics (present only when the trainer ran a learned
+    # aquifer route); computed on non-NWIS wells, the headline population.
+    gate_diag = None
+
     non_nwis = df[~df["is_nwis"]].reset_index(drop=True)
     nwis = df[df["is_nwis"]].reset_index(drop=True)
 
     headline = full_panel(non_nwis, predcols, "obs_dtw_m", common)
     log_panel("HEADLINE -- non-NWIS wells", headline, predcols)
+
+    if "aquifer_gate" in df.columns:
+        gate_diag = gate_diagnostics(non_nwis, "aquifer_gate")
+        bands = gate_diag.get("by_obs_depth", {})
+        cells = " ".join(
+            f"{b}:{v['mean_gate']:.3f}(n{v['n']})"
+            for b, v in bands.items()
+            if v.get("n")
+        )
+        log.info("aquifer gate mean OOF by obs-depth: %s", cells)
+        log.info(
+            "aquifer gate vs |err| corr=%.3f (flat-by-depth gate == dead router)",
+            gate_diag.get("gate_vs_abs_err_corr", float("nan")),
+        )
     nwis_panel = full_panel(nwis, predcols, "obs_dtw_m", common) if len(nwis) else None
     if nwis_panel:
         log_panel(
@@ -424,6 +523,18 @@ def main() -> None:
         "ma_covered_panel": ma_panel,
         "wte_identity_check": wte_identity,
         "wte_core_metrics": wte_core,
+        "diagnostics": {
+            "aquifer_gate_by_depth": gate_diag.get("by_obs_depth")
+            if gate_diag
+            else None,
+            "aquifer_gate_by_pred_depth": gate_diag.get("by_pred_depth")
+            if gate_diag
+            else None,
+            "aquifer_gate_by_huc2": gate_diag.get("by_huc2") if gate_diag else None,
+            "aquifer_gate_vs_abs_err_corr": gate_diag.get("gate_vs_abs_err_corr")
+            if gate_diag
+            else None,
+        },
         "ma_specs": ma_specs,
         "metric_definitions": {
             "residual": "pred_dtw - obs_dtw (positive = predicted too deep)",
@@ -458,6 +569,7 @@ def main() -> None:
         + (["fusion"] if "fusion" in predcols else [])
         + (["fac_rem"] if "fac_rem" in predcols else [])
         + (["ma"] if "ma" in predcols else [])
+        + (["aquifer_gate"] if "aquifer_gate" in df.columns else [])
     )
     res = df[keep].copy()
     for c in predcols:
