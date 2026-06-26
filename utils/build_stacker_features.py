@@ -52,6 +52,7 @@ MANIFEST = f"{HYDRO}/wte_frozen_retired_wells.parquet"
 WTE_FROZEN = f"{HYDRO}/coarse_wte_frozen.tif"
 WTE_SUPPORT = f"{HYDRO}/coarse_wte_frozen_support.tif"
 FAC_SHARD_DIR = "/data/ssd2/handily/conus/fac_rem/fac_rem_shards"
+STR7_PRIOR = "/data/ssd2/handily/conus/stacker/str7_idw_dtw.parquet"
 HUC8_POLYS = "/data/ssd2/handily/conus/wte_gnn/huc8_polys.parquet"
 WT_CLASSES = ("unconfined", "unconfined_marginal")
 
@@ -180,6 +181,32 @@ def join_fac(df: pd.DataFrame, shard_dir: str) -> pd.DataFrame:
     return df
 
 
+def join_str7(df: pd.DataFrame, prior_path: str) -> pd.DataFrame:
+    """Left-merge the well-free str>=7 IDW DTW prior on canonical_id.
+
+    A third leakage-free level-0 prior (build_str7_idw_prior.py); NaN outside ConusFAC
+    HUC8s that carry a str>=7 trunk. NaN-tolerant downstream."""
+    if not Path(prior_path).exists():
+        log.warning("no str7 prior at %s; strahler_dtw_m all NaN", prior_path)
+        df["strahler_dtw_m"] = np.nan
+        df["str7_support_dist_m"] = np.nan
+        return df
+    s7 = pd.read_parquet(prior_path).drop_duplicates("canonical_id")
+    df = df.merge(
+        s7[["canonical_id", "strahler_dtw_m", "str7_support_dist_m"]],
+        on="canonical_id",
+        how="left",
+    )
+    n = int(df.strahler_dtw_m.notna().sum())
+    log.info(
+        "str>=7 IDW prior: %d / %d wells covered (%.1f%%)",
+        n,
+        len(df),
+        100.0 * n / max(len(df), 1),
+    )
+    return df
+
+
 COVARIATES = (
     "elev_above_coarse_m",
     "slope_deg",
@@ -265,6 +292,7 @@ def build(
     wte_frozen: str = WTE_FROZEN,
     wte_support: str = WTE_SUPPORT,
     fac_shard_dir: str = FAC_SHARD_DIR,
+    str7_prior: str = STR7_PRIOR,
     huc8_polys: str = HUC8_POLYS,
 ) -> None:
     df = load_clean_wells(wells_path, manifest_path)
@@ -292,6 +320,9 @@ def build(
     # Level-0 predictor 2: ConusFAC HAND depth (target-blind; pilot coverage).
     df = join_fac(df, fac_shard_dir)
 
+    # Level-0 predictor 3: str>=7 IDW DTW (target-blind stream-channel prior).
+    df = join_str7(df, str7_prior)
+
     # Regime discriminators (separate artifact-deep WTE sag from genuinely deep table).
     df = add_covariates(df)
 
@@ -313,6 +344,8 @@ def build(
         "wte_dtw",
         "wte_support_dist_m",
         "fac_rem_dtw_m",
+        "strahler_dtw_m",
+        "str7_support_dist_m",
         "elev_above_coarse_m",
         "slope_deg",
         "tri_100m",

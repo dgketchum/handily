@@ -90,12 +90,28 @@ ETRM = (
 )
 RELIEF_ETRM = RELIEF + ETRM
 FULL_ETRM = FULL + ETRM
+# str>=7 IDW DTW: a third, leakage-free level-0 prior (channel-bed elevation of the
+# str>=7 trunk, IDW'd to wells -- NO wells consumed; build_str7_idw_prior.py). It is the
+# best shallow prior in low-relief alluvial valleys / plains (Mesilla, Missouri HW, High
+# Plains) but blows up with relief (PNW montane) -- the support distance lets the HGB
+# learn where to trust it, gated by the relief covariates. NaN-tolerant, NOT in the
+# footprint mask, so the well population is unchanged from the non-str7 tiers.
+STR7 = (
+    "strahler_dtw_m",
+    "str7_support_dist_m",
+)
+RELIEF_STR7 = RELIEF + STR7
+RELIEF_ETRM_STR7 = RELIEF_ETRM + STR7
+FULL_ETRM_STR7 = FULL_ETRM + STR7
 FEATURE_SETS = {
     "level0": LEVEL0,
     "relief": RELIEF,
     "full": FULL,
     "relief_etrm": RELIEF_ETRM,
     "full_etrm": FULL_ETRM,
+    "relief_str7": RELIEF_STR7,
+    "relief_etrm_str7": RELIEF_ETRM_STR7,
+    "full_etrm_str7": FULL_ETRM_STR7,
 }
 # Superset for the finite-feature footprint mask (kept fixed across ablations so every
 # tier is scored on an identical well population). Deliberately FULL, NOT FULL_ETRM:
@@ -263,6 +279,19 @@ def build(
 
     main_preds = ["pred_Stacker", "pred_ConusWTE", "pred_ConusFAC", "pred_Janssen"]
     rows = _panel(ev, main_preds, footprints, "mean_dtw", "huc4")
+    # Strahler (str>=7 IDW) sub-panel: a level-0 prior present only where a str>=7 trunk
+    # exists -- score it head-to-head with the others on its own (finite) footprint.
+    if "strahler_dtw_m" in ev.columns:
+        ev["pred_Strahler"] = ev.strahler_dtw_m
+        s7_mask = ev.pred_Strahler.notna().to_numpy()
+        ev_s7 = ev[s7_mask].reset_index(drop=True)
+        if len(ev_s7):
+            indep_s7 = (~ev_s7.source.isin(BENCH_SOURCES)).to_numpy()
+            fps_s7 = {"all": np.ones(len(ev_s7), dtype=bool), "independent": indep_s7}
+            s7_preds = main_preds + ["pred_Strahler"]
+            for r in _panel(ev_s7, s7_preds, fps_s7, "mean_dtw", "huc4"):
+                r["group_type"] = "str7_" + r["group_type"]
+                rows.append(r)
     # Ma sub-panel: only where Ma exists (MT/NM regimes), include Ma in the lineup.
     ma_mask = ev.pred_Ma.notna().to_numpy()
     ev_ma = ev[ma_mask].reset_index(drop=True)
