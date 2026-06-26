@@ -139,6 +139,41 @@ def test_aquifer_query_edges_ranks_and_controlling():
     assert c0["aquifer_node_idx"] == 0
 
 
+def test_aquifer_query_edges_radius_rescues_far_same_principal():
+    # P2a: 16 wrong-aquifer cells (code 202) sit inside the global-kNN window; the only
+    # same-principal cell (code 101) is the 17th-nearest, so a kNN(<=16)-only candidate
+    # set would never see it. The radius query must still pick it as the controlling
+    # primary, and P2b: is_controlling + same_component anchor to THAT cell, not the
+    # globally-nearest wrong-aquifer cell.
+    n_wrong = 16
+    aq_xy = np.array(
+        [[float(i + 1), 0.0] for i in range(n_wrong)] + [[float(n_wrong + 1), 0.0]]
+    )
+    aq_code = np.array([202] * n_wrong + [101])
+    aq_comp = np.array([0] * n_wrong + [1])
+    same_idx = n_wrong  # the lone same-principal cell
+    e = ba.build_aquifer_query_edges(
+        aq_xy,
+        aq_code,
+        aq_comp,
+        np.array([7]),
+        np.array([[0.0, 0.0]]),
+        np.array([101]),
+        k=3,
+        max_dist_m=100.0,
+    )
+    ctrl = e[e["is_controlling"] == 1.0].iloc[0]
+    assert ctrl["aquifer_node_idx"] == same_idx  # far same-principal won, not nearest
+    assert ctrl["rank"] == 0
+    assert ctrl["same_principal_aquifer"] == 1.0
+    assert ctrl["same_component"] == 1.0
+    # the backfilled wrong-aquifer cells are not same-principal, not same-component.
+    fill = e[e["aquifer_node_idx"] != same_idx]
+    assert (fill["same_principal_aquifer"] == 0.0).all()
+    assert (fill["same_component"] == 0.0).all()
+    assert (fill["is_controlling"] == 0.0).all()
+
+
 def test_leakage_guard_blocks_target_and_benchmark_cols():
     # the real feature set is clean.
     ba.assert_target_blind(ba.AQUIFER_FEATURE_COLS)

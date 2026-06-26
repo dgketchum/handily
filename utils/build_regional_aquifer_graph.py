@@ -194,7 +194,15 @@ def check_and_sample(
         raw = _sample_raster(path, x5070, y5070)
         finite = np.isfinite(raw)
         if not finite.any():
-            raise SystemExit(f"{name}: all-nodata over the well footprint ({path})")
+            # A required layer with no signal is a real failure; an optional layer
+            # (karst, sediment) may legitimately be all-nodata over a small/clipped
+            # footprint -> warn and treat as absent (skipped, like a missing file).
+            if spec.get("required"):
+                raise SystemExit(f"{name}: all-nodata over the well footprint ({path})")
+            log.warning(
+                "optional geology raster all-nodata over footprint, skipping: %s", path
+            )
+            continue
         if spec.get("glhymps_logk"):
             # stored value is logk x100 (~ -1000 .. -1600); a finite median > -50
             # means the file is already logk (unconverted) -> the x0.01 scale is wrong.
@@ -457,45 +465,67 @@ def build_aquifer_query_edges(
 ) -> pd.DataFrame:
     """Attach each query to its k nearest aquifer cells (prefer same principal aquifer).
 
-    Candidates within ``max_dist_m`` that share the query's principal-aquifer code are
-    taken first (distance order), then the nearest remaining cells backfill to k.
-    ``rank`` is the final selection order; ``is_controlling`` marks the globally
-    nearest cell; ``same_component`` is membership in the controlling cell's component.
-    Every query gets k edges as long as >=1 aquifer node exists (100% coverage).
+    Same-principal candidates are found by a **radius** query within ``max_dist_m`` (so a
+    same-aquifer cell that ranks far in the global kNN is still considered), taken in
+    distance order; the nearest remaining **global** cells then backfill to k. The
+    rank-0 selection is the query's *controlling primary* — the nearest same-principal
+    cell within range, else the nearest global cell. ``is_controlling`` marks that
+    primary and ``same_component`` is membership in the primary's component, so both
+    fields share one anchor. Every query gets up to k edges as long as >=1 aquifer node
+    exists (100% coverage).
     """
     if len(aq_xy) == 0:
         raise SystemExit("no aquifer nodes to attach queries to")
     tree = cKDTree(aq_xy)
-    kk = min(len(aq_xy), max(k, 8))
-    dists, idxs = tree.query(q_xy, k=kk)
+    # Generous global-NN pool for backfill + the always-attach guarantee.
+    kk = min(len(aq_xy), max(k * 4, 16))
+    g_dists, g_idxs = tree.query(q_xy, k=kk)
     if kk == 1:
-        dists = dists[:, None]
-        idxs = idxs[:, None]
+        g_dists = g_dists[:, None]
+        g_idxs = g_idxs[:, None]
+    # All cells within max_dist_m, regardless of global-kNN rank (the P2a fix).
+    within = tree.query_ball_point(q_xy, r=max_dist_m)
 
     rows = []
     for qi in range(len(q_xy)):
-        di = dists[qi]
-        ai = idxs[qi]
-        order = np.argsort(di, kind="stable")
-        di, ai = di[order], ai[order]
-        home_comp = aq_comp[ai[0]]  # component of the nearest cell
-        same_p = (aq_code[ai] == q_code[qi]) & (q_code[qi] > 0) & (aq_code[ai] > 0)
-        prefer = np.where(same_p & (di <= max_dist_m))[0]
-        backfill = np.array(
-            [p for p in range(len(ai)) if p not in set(prefer.tolist())]
-        )
-        sel = np.concatenate([prefer, backfill]).astype("int64")[:k]
-        nearest_pos = sel[np.argmin(di[sel])]
+        qc = q_code[qi]
+        gi = g_idxs[qi]
+        order = np.argsort(g_dists[qi], kind="stable")
+        gi = gi[order]
+        # same-principal candidates in range, distance-sorted
+        cand = np.asarray(within[qi], dtype="int64")
+        if qc > 0 and len(cand):
+            cand = cand[(aq_code[cand] == qc) & (aq_code[cand] > 0)]
+            if len(cand):
+                cd = np.linalg.norm(aq_xy[cand] - q_xy[qi], axis=1)
+                cand = cand[np.argsort(cd, kind="stable")]
+        else:
+            cand = np.empty(0, dtype="int64")
+        # backfill with nearest global cells not already chosen
+        chosen: list[int] = [int(c) for c in cand[:k]]
+        seen = set(chosen)
+        for c in gi:
+            if len(chosen) >= k:
+                break
+            ci = int(c)
+            if ci not in seen:
+                chosen.append(ci)
+                seen.add(ci)
+        sel = np.asarray(chosen[:k], dtype="int64")
+        # single anchor for both fields: the rank-0 (controlling) primary.
+        home_comp = aq_comp[sel[0]]
         for rank, pos in enumerate(sel):
+            dist = float(np.linalg.norm(aq_xy[pos] - q_xy[qi]))
+            same_p = qc > 0 and aq_code[pos] == qc and aq_code[pos] > 0
             rows.append(
                 (
-                    int(ai[pos]),
+                    int(pos),
                     int(q_node_idx[qi]),
-                    float(di[pos]),
+                    dist,
                     int(rank),
-                    1.0 if pos == nearest_pos else 0.0,
-                    1.0 if same_p[pos] else 0.0,
-                    1.0 if aq_comp[ai[pos]] == home_comp else 0.0,
+                    1.0 if rank == 0 else 0.0,
+                    1.0 if same_p else 0.0,
+                    1.0 if aq_comp[pos] == home_comp else 0.0,
                 )
             )
     out = pd.DataFrame(
