@@ -143,6 +143,38 @@ def test_aquifer_fixed_stream_is_exact_noop():
         assert torch.allclose(base(g), aq(g), atol=1e-6)
 
 
+def test_aquifer_fixed_stream_same_seed_param_and_rng_identity():
+    # The run-level no-op contract, proved on a deterministic (CPU) device: two models
+    # built from the SAME seed must (a) share byte-identical stream params -- proving the
+    # aquifer modules are constructed LAST so they never perturb baseline init -- and (b)
+    # consume identical RNG through a TRAIN-mode forward -- proving fixed_stream draws no
+    # aquifer dropout, so two independent training runs stay locked step-for-step. (The
+    # ~140 m cross-process run diff is GPU scatter/index_add nondeterminism, identical in
+    # magnitude to baseline-vs-baseline, NOT a branch contribution.)
+    g = _tiny_graph()
+    base = _base_model(seed=3)
+    aq = _aquifer_model("fixed_stream", seed=3)
+    bsd = aq.state_dict()
+    for k, v in base.state_dict().items():
+        assert torch.equal(v, bsd[k]), f"stream param {k} diverged at init"
+    base.train()
+    aq.train()
+    # a train-mode forward must consume the same RNG in both -> trajectories stay locked.
+    torch.manual_seed(123)
+    base(g)
+    rng_after_base = torch.rand(4)
+    torch.manual_seed(123)
+    aq(g)
+    rng_after_aq = torch.rand(4)
+    assert torch.equal(rng_after_base, rng_after_aq)
+    # and the train-mode outputs match given the same pre-forward seed.
+    torch.manual_seed(123)
+    ob = base(g)
+    torch.manual_seed(123)
+    oa = aq(g)
+    assert torch.allclose(ob, oa, atol=1e-6)
+
+
 def test_aquifer_learned_delta_init_zero_is_noop_at_init():
     # delta head zeroed at init => learned route == stream output at epoch 0 (eval).
     g = _tiny_graph()
