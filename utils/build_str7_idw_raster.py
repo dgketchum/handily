@@ -42,6 +42,7 @@ from scipy.spatial import cKDTree
 from shapely.geometry import LineString, MultiLineString
 
 H = Path("/data/ssd2/handily")
+HUC8_ROOT = H / "huc8"
 STUDY_BASINS = [
     "huc8/mt_ruby",
     "huc8/mt_big_hole",
@@ -50,6 +51,25 @@ STUDY_BASINS = [
     "huc8/nv_upper_humboldt",
 ]
 NODATA = -9999.0
+
+
+def discover_all_fac(top_orders, str_min):
+    """Every FAC basin under huc8/ that lacks the str output (resume-safe).
+
+    The str prior is a downstream product of the per-basin FAC build, so the
+    universe is "basins with a FAC-REM raster"; basins whose str output already
+    exists are skipped so a rerun only fills gaps. Returns rel-paths under
+    ``/data/ssd2/handily`` (e.g. ``huc8/10030102``)."""
+    stem = f"str{str_min}" if str_min is not None else f"str_top{top_orders}"
+    out = []
+    for d in sorted(HUC8_ROOT.iterdir()):
+        if not d.is_dir() or d.name == "dem_tiles":
+            continue
+        fac = d / "rem" / f"{d.name}_scalable" / "fac_head_depth_rem_10m.tif"
+        if not fac.exists() or (d / f"{stem}_idw_wte_100m.tif").exists():
+            continue
+        out.append(f"huc8/{d.name}")
+    return out
 
 
 def densify(geom, step):
@@ -207,6 +227,12 @@ def main():
         help="basin rel-paths under /data/ssd2/handily",
     )
     ap.add_argument(
+        "--all-fac",
+        action="store_true",
+        help="build for every FAC basin under huc8/ lacking the str output "
+        "(overrides --basins; resume-safe)",
+    )
+    ap.add_argument(
         "--top-orders",
         type=int,
         default=2,
@@ -224,17 +250,32 @@ def main():
     ap.add_argument("--dmax-km", type=float, default=50.0)
     ap.add_argument("--res", type=float, default=100.0)
     args = ap.parse_args()
-    for rel in args.basins:
-        build_basin(
-            rel,
-            args.top_orders,
-            args.str_min,
-            args.step_m,
-            args.idw_k,
-            args.idw_power,
-            args.dmax_km,
-            args.res,
-        )
+    basins = (
+        discover_all_fac(args.top_orders, args.str_min) if args.all_fac else args.basins
+    )
+    print(f"str_top build: {len(basins)} basin(s)")
+    ok = failed = 0
+    failed_ids = []
+    for rel in basins:
+        try:
+            build_basin(
+                rel,
+                args.top_orders,
+                args.str_min,
+                args.step_m,
+                args.idw_k,
+                args.idw_power,
+                args.dmax_km,
+                args.res,
+            )
+            ok += 1
+        except Exception as e:  # isolate per-basin failures over a large batch
+            print(f"  FAILED {rel}: {type(e).__name__}: {e}")
+            failed += 1
+            failed_ids.append(rel)
+    print(f"str_top2 build: ok={ok} failed={failed} of {len(basins)}")
+    if failed_ids:
+        print(f"  failed basins -> rerun to retry: {failed_ids}")
 
 
 if __name__ == "__main__":
