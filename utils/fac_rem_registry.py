@@ -36,19 +36,45 @@ def _fac_path(basin: str) -> str:
     return f"{_SCALABLE_ROOT}/{basin}/rem/{basin}_scalable/fac_head_depth_rem_10m.tif"
 
 
-# Ordered best -> worst. First finite sample wins where basins overlap (they do
-# not today, but the order is the contract). Grows as basins are built; keep the
-# 5 native-10 m EPSG:5070 scalable products that back the wall-to-wall product.
-FAC_REM_REGISTRY: list[str] = [
-    _fac_path(b)
-    for b in (
-        "nm_rio_grande_abq",
-        "nv_upper_humboldt",
-        "mt_big_hole",
-        "mt_beaverhead",
-        "mt_ruby",
-    )
-]
+# The 5 native-10 m EPSG:5070 pilots that back the wall-to-wall product. Listed
+# first so they take precedence (first finite sample wins) where a pilot overlaps
+# its HUC8-code equivalent.
+_NAMED_PILOTS = (
+    "nm_rio_grande_abq",
+    "nv_upper_humboldt",
+    "mt_big_hole",
+    "mt_beaverhead",
+    "mt_ruby",
+)
+
+
+def _discover(path_fn) -> list[str]:
+    """Auto-discover every basin under huc8/ whose raster exists, ordered best->worst.
+
+    Named pilots first (precedence contract), then the remaining basins (HUC8 codes)
+    sorted. Globbing the root means new HUC8 builds are picked up automatically -- the
+    registry no longer needs hand-editing per basin (see notes/HUC8_DATA.md).
+    """
+    root = Path(_SCALABLE_ROOT)
+    out: list[str] = []
+    seen: set[str] = set()
+    for b in _NAMED_PILOTS:
+        p = path_fn(b)
+        if Path(p).exists():
+            out.append(p)
+        seen.add(b)
+    if root.is_dir():
+        for d in sorted(root.iterdir()):
+            if not d.is_dir() or d.name in seen:
+                continue
+            p = path_fn(d.name)
+            if Path(p).exists():
+                out.append(p)
+    return out
+
+
+# Ordered best -> worst. First finite sample wins where basins overlap.
+FAC_REM_REGISTRY: list[str] = _discover(_fac_path)
 
 
 def existing_registry(registry: list[str] | None = None) -> list[str]:
@@ -129,16 +155,7 @@ def _str_top2_wte_path(basin: str) -> str:
 # build_str7_idw_raster.py). Same basins/precedence contract as FAC_REM_REGISTRY,
 # but a 100 m EPSG:5070 water-table ELEVATION (not a depth). It consumes zero well
 # labels, so as the GNN's regional base it is leakage-free and needs no cross-fit.
-STR_TOP2_WTE_REGISTRY: list[str] = [
-    _str_top2_wte_path(b)
-    for b in (
-        "nm_rio_grande_abq",
-        "nv_upper_humboldt",
-        "mt_big_hole",
-        "mt_beaverhead",
-        "mt_ruby",
-    )
-]
+STR_TOP2_WTE_REGISTRY: list[str] = _discover(_str_top2_wte_path)
 
 
 def sample_str_top2_wte(
