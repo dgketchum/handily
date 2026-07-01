@@ -465,6 +465,70 @@ def build_lateral_edges(
     )
 
 
+def build_octant_lateral_edges(
+    qxy: np.ndarray,
+    geom: gpd.GeoDataFrame,
+    comid_to_idx: dict,
+    k_search: int,
+    n_sectors: int = 8,
+) -> pd.DataFrame:
+    """Azimuthal lateral attachment: the NEAREST reach in each of ``n_sectors`` compass
+    sectors (chosen from the ``k_search`` nearest rep-points), giving each well a
+    spatially-REPRESENTATIVE set of surrounding drainages instead of the redundant
+    knn-nearest cluster the topology review flagged (50% of wells piled all knn onto
+    one Strahler-0 fingertip; +-8 m rel-elev instability across the knn). A well sitting
+    in a valley bottom gets reaches on many sides (small rel-elev, large drainage); one
+    on a divide gets edges mostly downslope -- so the DISTRIBUTION of the per-sector
+    edges' (distance, rel-elev, drainage) attrs encodes topographic position on the
+    network. Orientation-invariant: NO absolute-bearing feature is emitted (a global
+    N/E orientation signal would be arbitrary), so the schema matches build_lateral_edges
+    and the trainer is unchanged; only the connectivity differs.
+
+    Rank/is_controlling follow the knn build (rank 0 == globally nearest). Columns are
+    dist-sorted from the KD-tree, so the nearest candidate per sector is the lowest
+    column index landing in that sector. No distance cap (same as build_lateral_edges);
+    every well keeps >=1 edge since k_search >> n_sectors.
+    """
+    gx = geom["cx"].to_numpy("float64")
+    gy = geom["cy"].to_numpy("float64")
+    gidx = geom["reach_node_idx"].to_numpy("int64")
+    tree = cKDTree(np.c_[gx, gy])
+    k = min(k_search, len(gx))
+    dist, cand = tree.query(qxy, k=k)  # ascending by distance
+    if k == 1:
+        dist, cand = dist[:, None], cand[:, None]
+    n_q = len(qxy)
+    dx = gx[cand] - qxy[:, 0:1]
+    dy = gy[cand] - qxy[:, 1:2]
+    ang = np.arctan2(dy, dx) % (2.0 * np.pi)  # (n_q, k), 0..2pi
+    sector = np.clip(
+        (ang / (2.0 * np.pi / n_sectors)).astype("int64"), 0, n_sectors - 1
+    )
+    # Nearest candidate per (well, sector): walk columns high->low so the final write
+    # per sector is the lowest (nearest) column index; -1 == that sector is empty.
+    chosen = np.full((n_q, n_sectors), -1, dtype="int64")
+    rows = np.arange(n_q)
+    for j in range(k - 1, -1, -1):
+        chosen[rows, sector[:, j]] = j
+    occ = chosen >= 0
+    qn_idx = np.repeat(rows, n_sectors)[occ.ravel()]
+    col = chosen[occ]
+    d = dist[qn_idx, col]
+    out = pd.DataFrame(
+        {
+            "query_node_idx": qn_idx,
+            "reach_node_idx": gidx[cand[qn_idx, col]],
+            "lateral_dist_m": d,
+            "log1p_lateral_dist_m": np.log1p(d),
+        }
+    )
+    # rank by distance within each well; rank 0 == globally-nearest = the controller.
+    out = out.sort_values(["query_node_idx", "lateral_dist_m"]).reset_index(drop=True)
+    out["rank"] = out.groupby("query_node_idx").cumcount().astype("int64")
+    out["is_controlling"] = (out["rank"] == 0).astype("float64")
+    return out
+
+
 def sample_relief_etrm(
     x: np.ndarray, y: np.ndarray, well_surf_m: np.ndarray
 ) -> dict[str, np.ndarray]:
@@ -689,7 +753,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--residual-base",
-        choices=["str_top2", "fac_rem", "relief_idw"],
+        choices=["str_top2", "fac_rem", "relief_idw", "ensemble_median"],
         default="str_top2",
         help="(wte_residual only) the regional surface R the residual target/base/"
         "anomalies are taken over. str_top2 = the well-free streams-Strahler regional "
@@ -701,7 +765,12 @@ def main() -> None:
         "relief_idw = the cross-fit (leave-fold-out) relief-aware well-IDW WTE surface "
         "(set --r-relief-vw 100): our most-accurate regional R. The GNN predicts the "
         "graph-structured residual over it; FAC + deep enter as anomaly features. Needs "
-        "NO str_top2, so it runs over the full FAC footprint (not the trunk-only subset).",
+        "NO str_top2, so it runs over the full FAC footprint (not the trunk-only subset). "
+        "ensemble_median = per-well median of three level-0 members {relief_idw well-IDW "
+        "(vw=100), simple well-IDW (vw=0), FAC-REM water surface}: a robust R that damps "
+        "the relief-lift over-mounding on benches while keeping the valley-floor accuracy. "
+        "All three members are leak-free (well-IDW cross-fit leave-fold-out; FAC well-"
+        "free); same full FAC footprint as relief_idw; FAC + deep enter as anomalies.",
     )
     ap.add_argument(
         "--stacker-features",
@@ -813,6 +882,30 @@ def main() -> None:
         "signal only indirectly (entangled in fac_rem_wte_anom_m / on lateral edges). "
         "The graph-topology rep-point rel-elev was rejected as a noisy ~2x-weaker proxy "
         "(50%% of wells attach to Strahler-0 fingertips; see the topology review).",
+    )
+    ap.add_argument(
+        "--octant-lateral",
+        action="store_true",
+        help="build lateral edges by azimuthal sector instead of plain k-NN: the "
+        "nearest FAC reach in each of --octant-sectors compass directions (from the "
+        "--octant-k-search nearest rep-points). Gives every well DIRECTIONAL drainage "
+        "geometry (valley-confluence vs divide, mainstem access from each side) rather "
+        "than the k nearest reaches, which pile onto one dense cluster. "
+        "Orientation-invariant (no absolute-bearing feature) so the edge-attr schema is "
+        "identical to k-NN -> clean A/B; only connectivity changes.",
+    )
+    ap.add_argument(
+        "--octant-k-search",
+        type=int,
+        default=64,
+        help="nearest rep-points to scan when bucketing into octant sectors "
+        "(--octant-lateral); larger fills far/empty sectors but costs KD-tree query time",
+    )
+    ap.add_argument(
+        "--octant-sectors",
+        type=int,
+        default=8,
+        help="number of azimuthal sectors for --octant-lateral (8 = octants)",
     )
     args = ap.parse_args()
     gdir = Path(args.graph_dir)
@@ -1116,6 +1209,44 @@ def main() -> None:
                     "-- investigate (do not patch)"
                 )
             head_anom_cols = [FAC_REM_WTE_ANOM_COL, DEEP_REGIONAL_WTE_ANOM_COL]
+        elif args.residual_base == "ensemble_median":
+            # Per-well median of three physically-distinct level-0 members: the
+            # relief-aware well-IDW (vw=100, valley heads off ridges), the plain
+            # well-IDW (vw=0, no relief over-mounding -- best on benches), and the
+            # FAC-REM water surface (well-free terrain HAND). The median damps the
+            # relief-lift over-mound where members disagree while keeping the shared
+            # valley-floor level. Both well-IDW members are cross-fit LEAVE-ONE-FOLD-
+            # OUT (leak-free w.r.t. evaluation); FAC-REM is well-free.
+            relief_wte = crossfit_idw(
+                xy,
+                wte,
+                fold,
+                args.idw_k,
+                args.idw_power,
+                z=well_surf_m,
+                vw=args.r_relief_vw,
+            )
+            simple_wte = crossfit_idw(
+                xy,
+                wte,
+                fold,
+                args.idw_k,
+                args.idw_power,
+                z=well_surf_m,
+                vw=0.0,
+            )
+            for nm, member in (
+                ("relief", relief_wte),
+                ("simple", simple_wte),
+                ("fac", fac_wte),
+            ):
+                if not np.isfinite(member).all():
+                    raise SystemExit(
+                        f"{int((~np.isfinite(member)).sum())} wells lack finite "
+                        f"{nm} member of ensemble_median R -- investigate (do not patch)"
+                    )
+            r_wte = np.median(np.vstack([relief_wte, simple_wte, fac_wte]), axis=0)
+            head_anom_cols = [FAC_REM_WTE_ANOM_COL, DEEP_REGIONAL_WTE_ANOM_COL]
         else:
             r_wte = str_top2
             head_anom_cols = [FAC_REM_WTE_ANOM_COL, DEEP_REGIONAL_WTE_ANOM_COL]
@@ -1175,6 +1306,8 @@ def main() -> None:
                 "fac_rem": "fac_rem(z_surf-fac_rem_dtw)",
                 "relief_idw": f"relief_idw(crossfit well-IDW WTE, vw={args.r_relief_vw:g})",
                 "str_top2": "str_top2(streams-Strahler, well-free)",
+                "ensemble_median": f"ensemble_median(relief-IDW vw={args.r_relief_vw:g} "
+                "/ simple-IDW vw=0 / FAC-REM surface)",
             }[args.residual_base],
             float(np.nanmedian(np.abs((well_surf_m - r_wte) - dtw))),
             float(np.sqrt(np.nanmean(((well_surf_m - r_wte) - dtw) ** 2))),
@@ -1223,7 +1356,12 @@ def main() -> None:
         )
         wells["dist_to_wet_reach_m"] = dwr
         wells["log1p_dist_to_wet_reach_m"] = np.log1p(dwr)
-    lat = build_lateral_edges(xy, geom, comid_to_idx, args.knn_lateral)
+    if args.octant_lateral:
+        lat = build_octant_lateral_edges(
+            xy, geom, comid_to_idx, args.octant_k_search, args.octant_sectors
+        )
+    else:
+        lat = build_lateral_edges(xy, geom, comid_to_idx, args.knn_lateral)
     lat["reach_log1p_drainage_km2"] = r_logdr.reindex(lat["reach_node_idx"]).to_numpy()
     lat["reach_strahler"] = r_strah.reindex(lat["reach_node_idx"]).to_numpy()
     # Darcy attrs: well-vs-reach relative elevation (the missing shallow signal, in
@@ -1238,9 +1376,24 @@ def main() -> None:
     ) - args.conductance_p * np.log1p(
         np.clip(lat["lateral_dist_m"].to_numpy(), 0, None)
     )
-    log.info(
-        "lateral edges: %d (%d wells x knn=%d)", len(lat), len(wells), args.knn_lateral
-    )
+    if args.octant_lateral:
+        log.info(
+            "lateral edges: %d (OCTANT: %d wells, %d sectors, k_search=%d, mean %.2f "
+            "edges/well, %d wells with all sectors filled)",
+            len(lat),
+            len(wells),
+            args.octant_sectors,
+            args.octant_k_search,
+            len(lat) / max(len(wells), 1),
+            int((lat.groupby("query_node_idx").size() == args.octant_sectors).sum()),
+        )
+    else:
+        log.info(
+            "lateral edges: %d (%d wells x knn=%d)",
+            len(lat),
+            len(wells),
+            args.knn_lateral,
+        )
     if args.fac_rem_feature:
         log.info(
             "fac-rem-feature ON: fac_rem_dtw_m added as a direct query feature "
@@ -1488,6 +1641,27 @@ def main() -> None:
                 "Anchors not supported in this mode yet (anchor BC would need a "
                 "head-anomaly anchor_head - R(anchor)); the build errors if requested.",
             ]
+        elif args.residual_base == "ensemble_median":
+            wte_features = {
+                FAC_REM_WTE_ANOM_COL: "(z_surf - fac_rem_dtw) - R, from the FAC raster "
+                "registry; NaN outside the built basins (NaN+indicator)",
+                DEEP_REGIONAL_WTE_ANOM_COL: "deep-well WTE IDW - R (deep-regime anomaly)",
+            }
+            leakage_notes += [
+                "wte_residual / residual_base=ensemble_median: R = the per-well MEDIAN of "
+                "three level-0 members -- relief-aware well-IDW WTE (crossfit_idw, "
+                f"vw={args.r_relief_vw:g}), plain well-IDW WTE (crossfit_idw, vw=0), and the "
+                "FAC-REM water surface (z_surf - fac_rem_dtw). The median damps the relief-"
+                "lift over-mounding on benches while retaining the shared valley-floor "
+                "level. Both well-IDW members are cross-fit LEAVE-ONE-FOLD-OUT on the GNN's "
+                "CV folds (leak-free w.r.t. evaluation); FAC-REM is well-free. Same full FAC "
+                "footprint as relief_idw (no str_top2). The model predicts the graph-"
+                "structured head residual over R; FAC + deep enter as anomalies-from-R.",
+                "HAND features removed; gridMET aridity KEPT. FAC-REM sourced from "
+                "fac_rem_registry (same as the inference grid), not the stacker shard.",
+                "Anchors not supported in this mode yet (anchor BC would need a "
+                "head-anomaly anchor_head - R(anchor)); the build errors if requested.",
+            ]
         else:
             wte_features = {
                 FAC_REM_WTE_ANOM_COL: "(z_surf - fac_rem_dtw) - R, from the FAC raster "
@@ -1604,7 +1778,16 @@ def main() -> None:
         else None,
         "anchors": anchor_block,
         "conductance_p": args.conductance_p,
+        "lateral_topology": "octant" if args.octant_lateral else "knn",
         "knn_lateral": args.knn_lateral,
+        "octant_lateral": bool(args.octant_lateral),
+        "octant_params": {
+            "sectors": args.octant_sectors,
+            "k_search": args.octant_k_search,
+            "mean_edges_per_well": float(len(lat) / max(len(wells), 1)),
+        }
+        if args.octant_lateral
+        else None,
         "idw_k": args.idw_k,
         "idw_power": args.idw_power,
         "r_relief_vw": args.r_relief_vw,
@@ -1620,7 +1803,17 @@ def main() -> None:
         "approximations": [
             "Lateral attachment uses flowline representative-point nearest, not "
             "exact point-to-line distance (CONUS-scale tractability).",
-        ],
+        ]
+        + (
+            [
+                "Octant lateral edges bucket the k_search nearest rep-points by "
+                "azimuth and keep the nearest per sector; sector membership uses "
+                "rep-point bearing (not the reach line), and sparse sectors may go "
+                "empty (variable edges/well).",
+            ]
+            if args.octant_lateral
+            else []
+        ),
         "deferred": [
             "StreamCat per-COMID covariates (recharge/BFI/bedrock/soils): pynhd "
             "0.19.4 StreamCat is broken (year-range parse bug); reach side uses VAA "
