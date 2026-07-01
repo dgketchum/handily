@@ -145,6 +145,26 @@ RELIEF_ETRM_FEATURE_COLS = [
     "perm_logk_m2",
     "sediment_thickness_m",
 ]
+# Multi-scale terrain-position family (built by build_terrain_covariates.py on the
+# canonical 100 m grid, EPSG:5070). Behind --terrain-multiscale-features. The residual
+# over R is organized by terrain position (valley floor vs terrace/bench) but the wired
+# elev_above_coarse_m proxy is ~dead (corr ~0); height-above-local-floor (z - focal_min)
+# is the proven lever (GBM R2 0.06->0.13 on obs_wte-R). TPI (DevFromMeanElev) adds the
+# terrace-vs-valley position axis; multi-scale TWI (slope-at-scale, true SCA retained)
+# adds convergence/wetness. 4 scales each (500 m/2 km/5 km/10 km). All target-blind +
+# translation-invariant (relative-elevation / dimensionless), so RGA-safe.
+TERRAIN_DIR = "/nas/handily/covariates/terrain"
+_TERRAIN_SCALES = ("500m", "2km", "5km", "10km")
+TERRAIN_MULTISCALE_FEATURE_COLS = (
+    [f"haf_{s}" for s in _TERRAIN_SCALES]  # height above local floor (m)
+    + [
+        f"tpi_{s}" for s in _TERRAIN_SCALES
+    ]  # elevation deviation from mean (DevFromMean)
+    + [f"twi_{s}" for s in _TERRAIN_SCALES]  # multi-scale wetness index
+)
+TERRAIN_MULTISCALE_RASTERS = {
+    c: f"{TERRAIN_DIR}/{c}.tif" for c in TERRAIN_MULTISCALE_FEATURE_COLS
+}
 # Anchor BC schema (v2). anchor_x = class/source one-hot + head_uncertainty ONLY
 # (head_m is audit-only -- feeding raw head would violate the no-absolute-elevation
 # rule). Anchor classes/sources mirror build_conus_anchors.py.
@@ -560,6 +580,16 @@ def sample_relief_etrm(
     }
 
 
+def sample_terrain_multiscale(x: np.ndarray, y: np.ndarray) -> dict[str, np.ndarray]:
+    """Multi-scale terrain-position family (haf/tpi/twi x 4 scales), EPSG:5070 rasters.
+
+    height-above-local-floor is meters (relative elevation, translation-invariant); TPI
+    and TWI are dimensionless. All sampled at x5070/y5070. Off-footprint / nodata stay
+    NaN (the trainer median-imputes + flags), consistent with the other query rasters.
+    """
+    return {c: sample_coarse(p, x, y) for c, p in TERRAIN_MULTISCALE_RASTERS.items()}
+
+
 def sample_gridmet(x: np.ndarray, y: np.ndarray) -> dict[str, np.ndarray]:
     """gridMET aridity + mean-annual-precip at EPSG:5070 coords.
 
@@ -902,6 +932,17 @@ def main() -> None:
         "Leak-free (crossfit leave-fold-out) + translation-invariant.",
     )
     ap.add_argument(
+        "--terrain-multiscale-features",
+        action="store_true",
+        help="(wte_residual only) add the multi-scale terrain-position family "
+        "(height-above-local-floor + TPI + multi-scale TWI, 4 scales each: "
+        "500 m/2 km/5 km/10 km) as DIRECT query-node features from "
+        "/nas/handily/covariates/terrain (build_terrain_covariates.py). The residual "
+        "over R is terrain-organized but the wired elev_above_coarse_m proxy is ~dead; "
+        "height-above-local-floor is the proven lever (GBM R2 0.06->0.13 on obs_wte-R). "
+        "All target-blind + translation-invariant (relative elevation / dimensionless).",
+    )
+    ap.add_argument(
         "--octant-lateral",
         action="store_true",
         help="build lateral edges by azimuthal sector instead of plain k-NN: the "
@@ -941,6 +982,21 @@ def main() -> None:
         raise SystemExit(
             "--ensemble-member-features is wired into the wte_residual query bank only; "
             f"got target={args.target}"
+        )
+    if args.terrain_multiscale_features and args.target != TARGET_WTE_RESIDUAL:
+        raise SystemExit(
+            "--terrain-multiscale-features is wired into the wte_residual query bank only; "
+            f"got target={args.target}"
+        )
+    missing_terr = (
+        [p for p in TERRAIN_MULTISCALE_RASTERS.values() if not Path(p).exists()]
+        if args.terrain_multiscale_features
+        else []
+    )
+    if missing_terr:
+        raise SystemExit(
+            "--terrain-multiscale-features: missing terrain rasters "
+            f"(build with build_terrain_covariates.py --only haf,twi_multiscale,wbt): {missing_terr}"
         )
 
     reach_nodes = pd.read_parquet(gdir / "reach_nodes.parquet")
@@ -1322,6 +1378,11 @@ def main() -> None:
             wells[col] = vals
         for col, vals in sample_gridmet(xy[:, 0], xy[:, 1]).items():
             wells[col] = vals
+        # Multi-scale terrain-position family (height-above-floor + TPI + TWI x 4 scales).
+        if args.terrain_multiscale_features:
+            for col, vals in sample_terrain_multiscale(xy[:, 0], xy[:, 1]).items():
+                wells[col] = vals
+                log.info("  %s: %.3f finite frac", col, float(np.isfinite(vals).mean()))
         # Observable evidence bank (NDVI greenness here; the GSW wet-reach distance is
         # added after the flowline geom loads below).
         if args.evidence_features:
@@ -1339,6 +1400,11 @@ def main() -> None:
             # fac_rem_dtw_m is already on the wells table (sampled up front); adding the
             # name here surfaces it as a direct query-node feature + lands it in the manifest.
             + (["fac_rem_dtw_m"] if args.fac_rem_feature else [])
+            + (
+                TERRAIN_MULTISCALE_FEATURE_COLS
+                if args.terrain_multiscale_features
+                else []
+            )
         )
         log.info(
             "target=wte_residual  residual_base=%s  R=%s  R-MAD(DTW)=%.2f m  "
@@ -1759,6 +1825,28 @@ def main() -> None:
                 "The vw=0 member is cross-fit LEAVE-ONE-FOLD-OUT (leak-free w.r.t. eval) "
                 "and the anomaly is translation-invariant (difference of two WTE surfaces). "
                 "FAC-REM already enters as fac_rem_wte_anom_m; relief-IDW is the base frame."
+            )
+        if args.terrain_multiscale_features:
+            for c in TERRAIN_MULTISCALE_FEATURE_COLS:
+                wte_features[c] = (
+                    "multi-scale terrain position: "
+                    + {
+                        "haf": "height above local floor z - focal_min(z) (m)",
+                        "tpi": "elevation deviation from mean (DevFromMeanElev)",
+                        "twi": "multi-scale wetness ln(SCA/tan(slope_scale))",
+                    }[c.split("_")[0]]
+                    + f" at {c.split('_', 1)[1]}"
+                )
+            leakage_notes.append(
+                "Multi-scale terrain family (--terrain-multiscale-features): "
+                "height-above-local-floor + TPI + TWI, 4 scales each (500 m/2 km/5 km/"
+                "10 km), sampled from /nas/handily/covariates/terrain "
+                "(build_terrain_covariates.py, canonical 100 m grid). The residual over R "
+                "is terrain-position-organized (valley floor vs terrace/bench) but the "
+                "wired elev_above_coarse_m proxy is ~dead (corr ~0); height-above-local-"
+                "floor is the proven lever (GBM R2 0.06->0.13 on obs_wte-R, TPI +0.01 on "
+                "top; single-scale TWI ~wash). All target-blind + translation-invariant "
+                "(relative elevation / dimensionless) -> RGA-safe, no leakage."
             )
     else:
         target_mode = TARGET_DTW_RESIDUAL
