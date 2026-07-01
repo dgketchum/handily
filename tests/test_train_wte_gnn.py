@@ -235,3 +235,75 @@ def test_aquifer_disallowed_with_pinball():
             n_aquifer_layers=2,
             aquifer_route="learned",
         )
+
+
+# ---------------------------------------------------------------------------
+# Mainstem-read conv (item 2): query -> downstream-datum read edge
+# ---------------------------------------------------------------------------
+F_MS = 5
+
+
+def _ms_graph():
+    """_tiny_graph + one datum-read edge for queries 0 and 1; query 2 has none."""
+    g = _tiny_graph()
+    g["ms_ei"] = torch.tensor([[0, 1], [0, 1]])  # reach 0->query 0, reach 1->query 1
+    g["ms_ea"] = torch.randn(2, F_MS)
+    return g
+
+
+def _ms_model(seed=0):
+    torch.manual_seed(seed)
+    return tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, f_ms=F_MS)
+
+
+def test_mainstem_read_forward_shape_and_zero_context():
+    g = _ms_graph()
+    m = _ms_model().eval()
+    assert m.has_ms
+    assert m.head[0].in_features == HIDDEN * 3  # [q, ctx_reach, ctx_ms]
+    with torch.no_grad():
+        out = m(g)
+    assert out.shape == (3,)
+    # query 2 has no incoming ms edge -> zero context -> still a finite prediction.
+    assert torch.isfinite(out).all()
+
+
+def test_mainstem_read_none_is_baseline_state_dict():
+    # f_ms=None must add no params and keep the plain hidden*2 head (keys unchanged).
+    base = tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1)
+    assert not base.has_ms
+    assert not hasattr(base, "ms_read")
+    assert base.head[0].in_features == HIDDEN * 2
+    assert not any(k.startswith("ms_read") for k in base.state_dict())
+
+
+def test_mainstem_read_uses_the_edge_context():
+    # dropping the ms edge attrs to zero magnitude changes the gate -> output moves,
+    # proving ctx_ms is actually wired into the head (not a dead branch).
+    g = _ms_graph()
+    m = _ms_model().eval()
+    with torch.no_grad():
+        out_full = m(g)
+        g2 = dict(g)
+        g2["ms_ei"] = torch.empty(2, 0, dtype=torch.long)  # no ms edges at all
+        g2["ms_ea"] = torch.empty(0, F_MS)
+        out_none = m(g2)
+    # queries 0/1 had edges; removing them must change their prediction.
+    assert not torch.allclose(out_full[:2], out_none[:2], atol=1e-5)
+
+
+def test_mainstem_read_rejects_anchor_combo():
+    with pytest.raises(ValueError):
+        tg.WTEGraphNet(
+            F_REACH,
+            F_QUERY,
+            F_CH,
+            F_LAT,
+            HIDDEN,
+            2,
+            0.1,
+            f_ms=F_MS,
+            f_anchor=F_AQ,
+            f_anchor_reach=F_AQ_E,
+            f_anchor_query=F_AQ_Q,
+        )

@@ -231,6 +231,7 @@ class WTEGraphNet(nn.Module):
         f_anchor: int | None = None,
         f_anchor_reach: int | None = None,
         f_anchor_query: int | None = None,
+        f_ms: int | None = None,
         pinball: bool = False,
         fac_skip: bool = False,
         fac_gate: bool = False,
@@ -247,6 +248,11 @@ class WTEGraphNet(nn.Module):
         if fac_gate and not fac_skip:
             raise ValueError("fac_gate requires fac_skip")
         self.has_anchor = f_anchor is not None
+        self.has_ms = f_ms is not None
+        if self.has_ms and self.has_anchor:
+            # anchors are off in prod; keep the head bookkeeping ([q, ctx_reach, ctx_*])
+            # single-branch so we never have to reconcile two hidden*3 read contexts.
+            raise ValueError("mainstem-read (f_ms) is not supported with anchors")
         self.pinball = pinball
         self.fac_skip = fac_skip
         self.fac_gate = fac_gate
@@ -317,6 +323,14 @@ class WTEGraphNet(nn.Module):
                 hidden, hidden, f_anchor_query, hidden, dropout=dropout
             )
             head_in = hidden * 3  # [q, ctx_reach, ctx_anchor]
+        if self.has_ms:
+            # mainstem-read (item 2): one query->downstream-datum read conv over the
+            # POST-channel-stack reach states, so the query attends to its basin's
+            # discharge-datum reach's LEARNED state (seed evidence, drainage, 2-hop
+            # context) in a single hop -- bypassing the med-7/p90-28-hop receptive-field
+            # gap. Queries with no ms edge get a zero context (mean-agg default).
+            self.ms_read = EdgeGatedConv(hidden, hidden, f_ms, hidden, dropout=dropout)
+            head_in = hidden * 3  # [q, ctx_reach, ctx_ms]
         if self.fac_skip:
             # raw-FAC bypass: the standardized FAC target-estimate + its presence flag
             # ride straight to the head (un-smoothed), and the output is anchored on
@@ -460,7 +474,12 @@ class WTEGraphNet(nn.Module):
                 r = r + layer(r, r, g["ch_ei"], g["ch_ea"], dir_sign=ch_dir)
             q = self.query_enc(g["query_x"])
             ctx_reach = self.lateral(r, q, g["lat_ei"], g["lat_ea"], dir_sign=lat_dir)
-            h = torch.cat([q, ctx_reach], dim=-1)
+            if self.has_ms:
+                # read the datum reach's post-channel-stack state; no ms edge -> zeros.
+                ctx_ms = self.ms_read(r, q, g["ms_ei"], g["ms_ea"])
+                h = torch.cat([q, ctx_reach, ctx_ms], dim=-1)
+            else:
+                h = torch.cat([q, ctx_reach], dim=-1)
         # FAC raw-skip / confidence-gate pieces (no-op when fac_skip is off).
         h, skip = self._augment_for_skip(h, g)
         primary = self.head(h).squeeze(-1) + skip
