@@ -95,6 +95,12 @@ DEEP_REGIONAL_WTE_ANOM_COL = "deep_regional_wte_anom_m"  # deep_wte_idw - R
 # regional-context anomaly feature (str_top2 WTE - R) + a diagnostic surface column.
 STR_TOP2_WTE_COL = "str_top2_wte_m"  # the str_top2 regional WTE surface (diagnostic)
 STR_TOP2_WTE_ANOM_COL = "str_top2_wte_anom_m"  # str_top2 WTE - R (regional anomaly)
+# --ensemble-member-features only: the plain (vw=0, no relief-lift) well-IDW WTE member
+# exposed as an anomaly-over-R feature. In relief_idw mode R IS the vw=100 member, so
+# (simple - R) IS the relief-lift disagreement -- strongly negative where relief
+# over-mounds a bench, which is the missing bench signal.
+SIMPLE_IDW_WTE_COL = "simple_idw_wte_m"  # plain vw=0 well-IDW WTE surface (diagnostic)
+SIMPLE_IDW_WTE_ANOM_COL = "simple_idw_wte_anom_m"  # simple(vw=0) WTE - R
 # gridMET climate (EPSG:4326 -> sampled at lon/lat). Kept in wte_residual mode: a
 # NEGATIVE result in the pilot stacker does not mean it cannot help the GNN.
 CLIMATE_FEATURE_COLS = ["aridity_index", "mean_annual_precip_mm"]
@@ -884,6 +890,18 @@ def main() -> None:
         "(50%% of wells attach to Strahler-0 fingertips; see the topology review).",
     )
     ap.add_argument(
+        "--ensemble-member-features",
+        action="store_true",
+        help="(wte_residual only) expose the ensemble members that are NOT the base as "
+        "anomaly-over-R query features, so the GNN sees where the members DISAGREE rather "
+        "than being handed a pre-blended base (which washed out; see ensemble_median). "
+        "Adds simple_idw_wte_anom_m = plain vw=0 well-IDW WTE - R; in relief_idw mode R is "
+        "the vw=100 member so this IS the relief-lift disagreement (negative where relief "
+        "over-mounds a bench = the missing bench signal). FAC-REM already enters as "
+        "fac_rem_wte_anom_m (+ fac_rem_dtw_m); relief-IDW is the base frame (anomaly 0). "
+        "Leak-free (crossfit leave-fold-out) + translation-invariant.",
+    )
+    ap.add_argument(
         "--octant-lateral",
         action="store_true",
         help="build lateral edges by azimuthal sector instead of plain k-NN: the "
@@ -917,6 +935,11 @@ def main() -> None:
     if args.fac_rem_feature and args.target != TARGET_WTE_RESIDUAL:
         raise SystemExit(
             "--fac-rem-feature is wired into the wte_residual query bank only; "
+            f"got target={args.target}"
+        )
+    if args.ensemble_member_features and args.target != TARGET_WTE_RESIDUAL:
+        raise SystemExit(
+            "--ensemble-member-features is wired into the wte_residual query bank only; "
             f"got target={args.target}"
         )
 
@@ -1275,6 +1298,24 @@ def main() -> None:
         wells[STR_TOP2_WTE_COL] = str_top2
         wells[STR_TOP2_WTE_ANOM_COL] = str_top2 - r_wte
         wells[DEEP_REGIONAL_WTE_ANOM_COL] = deep_wte - r_wte
+        # Ensemble members AS FEATURES (not a blended base): let the GNN see where the
+        # members DISAGREE. Adds the plain vw=0 well-IDW anomaly-over-R; in relief_idw
+        # mode R is the vw=100 member, so (simple - R) IS the relief-lift disagreement
+        # (negative where relief over-mounds a bench). Leak-free (crossfit leave-fold-out)
+        # + translation-invariant (difference of two WTE surfaces).
+        ensemble_member_anom_cols = []
+        if args.ensemble_member_features:
+            simple_wte_feat = crossfit_idw(
+                xy, wte, fold, args.idw_k, args.idw_power, z=well_surf_m, vw=0.0
+            )
+            if not np.isfinite(simple_wte_feat).all():
+                raise SystemExit(
+                    f"{int((~np.isfinite(simple_wte_feat)).sum())} wells lack finite "
+                    "simple-IDW (vw=0) ensemble-member feature -- investigate (do not patch)"
+                )
+            wells[SIMPLE_IDW_WTE_COL] = simple_wte_feat
+            wells[SIMPLE_IDW_WTE_ANOM_COL] = simple_wte_feat - r_wte
+            ensemble_member_anom_cols = [SIMPLE_IDW_WTE_ANOM_COL]
         # Exogenous target-blind covariates (terrain relief + ETRM fluxes + gridMET
         # climate), always sampled in this mode (not gated behind --relief-etrm).
         for col, vals in sample_relief_etrm(xy[:, 0], xy[:, 1], well_surf_m).items():
@@ -1291,6 +1332,7 @@ def main() -> None:
         regional_prior_col = REGIONAL_WTE_COL  # carried; the DTW base is wte_resid_base
         query_feature_cols = (
             head_anom_cols
+            + ensemble_member_anom_cols
             + RELIEF_ETRM_FEATURE_COLS
             + CLIMATE_FEATURE_COLS
             + (EVIDENCE_FEATURE_COLS if args.evidence_features else [])
@@ -1702,6 +1744,21 @@ def main() -> None:
                 "graph-topology rep-point rel-elev (hand_fac_m) was rejected in review as "
                 "a noisy ~2x-weaker proxy (50% of wells attach to Strahler-0 fingertips, "
                 "24% negative, +-8m unstable across the knn; shallow rho <=0.12 vs 0.184)."
+            )
+        if args.ensemble_member_features:
+            wte_features[SIMPLE_IDW_WTE_ANOM_COL] = (
+                "plain vw=0 well-IDW WTE - R (ensemble member as a feature); in relief_idw "
+                "mode R is the vw=100 member so this is the relief-lift disagreement "
+                "(negative where relief over-mounds a bench)"
+            )
+            leakage_notes.append(
+                "Ensemble members as features (--ensemble-member-features): adds "
+                "simple_idw_wte_anom_m = plain vw=0 well-IDW WTE - R, so the GNN sees the "
+                "relief-vs-simple DISAGREEMENT (the bench over-mound signal) directly "
+                "rather than being handed a pre-blended base (ensemble_median washed out). "
+                "The vw=0 member is cross-fit LEAVE-ONE-FOLD-OUT (leak-free w.r.t. eval) "
+                "and the anomaly is translation-invariant (difference of two WTE surfaces). "
+                "FAC-REM already enters as fac_rem_wte_anom_m; relief-IDW is the base frame."
             )
     else:
         target_mode = TARGET_DTW_RESIDUAL
