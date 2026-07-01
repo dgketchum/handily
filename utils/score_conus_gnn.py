@@ -574,6 +574,16 @@ def main() -> None:
     res = df[keep].copy()
     for c in predcols:
         res[f"resid_{c}"] = res[c] - res["obs_dtw_m"]
+    # Head-space WTE ELEVATION surface (head-space modes only): the GNN's native
+    # output is the predicted water-table elevation, dtw = z_surf - wte_m. Carry it
+    # (+ observed WTE + land surface) so the predicted water-table surface can be
+    # rendered/compared directly in QGIS, not only as a DTW depth.
+    if "gnn_wte_hat_m" in df.columns:
+        res["wte_m"] = df["gnn_wte_hat_m"].to_numpy("float64")
+        if "obs_wte_m" in df.columns:
+            res["obs_wte_m"] = df["obs_wte_m"].to_numpy("float64")
+        if "z_surf_well_m" in df.columns:
+            res["z_surf_m"] = df["z_surf_well_m"].to_numpy("float64")
     gres = gpd.GeoDataFrame(
         res, geometry=gpd.points_from_xy(df["x5070"], df["y5070"]), crs=5070
     )
