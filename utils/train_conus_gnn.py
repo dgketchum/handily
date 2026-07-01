@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy.sparse import csr_matrix
+from scipy.spatial import cKDTree
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -190,6 +191,40 @@ def _combine_native(out, y_s: float, y_c: float, base: np.ndarray, mode: str, ar
     return out.detach().cpu().numpy() * y_s + y_c
 
 
+def build_train_pairs(
+    x5070: np.ndarray,
+    y5070: np.ndarray,
+    radius_m: float = 1000.0,
+    k: int = 3,
+    seed: int = 0,
+) -> np.ndarray:
+    """(n_pairs, 2) int64 query-node index pairs (i<j, deduped, no self-pairs).
+
+    Each well is linked to its <=``k`` nearest neighbours within ``radius_m`` (cKDTree).
+    The anti-compression pair loss uses these to penalize a flattened LOCAL WTE gradient
+    between nearby wells -- the diagnosed amplitude-compression pathology (pred std 28 vs
+    obs 37.6, coherent <500 m patch bias). ``seed`` is accepted for signature stability;
+    neighbour order is deterministic so no randomness is drawn.
+    """
+    xy = np.c_[x5070, y5070]
+    n = len(xy)
+    tree = cKDTree(xy)
+    # k+1 to allow for the self-match at distance 0; missing neighbours come back with
+    # idx == n and dist == inf (distance_upper_bound), filtered below.
+    dist, idx = tree.query(xy, k=k + 1, distance_upper_bound=radius_m)
+    dist = np.atleast_2d(dist)
+    idx = np.atleast_2d(idx)
+    src = np.repeat(np.arange(n), idx.shape[1])
+    dst = idx.ravel()
+    dd = dist.ravel()
+    valid = (dst < n) & np.isfinite(dd) & (dst != src)
+    a = np.minimum(src[valid], dst[valid])
+    b = np.maximum(src[valid], dst[valid])
+    if a.size == 0:
+        return np.empty((0, 2), dtype="int64")
+    return np.unique(np.stack([a, b], axis=1), axis=0).astype("int64")
+
+
 def train_fold(
     model,
     feat,
@@ -205,6 +240,8 @@ def train_fold(
     args,
     device,
     sample_w_t=None,
+    pair_idx=None,
+    pair_w=0.0,
 ):
     """Train one fold; early-stop on val DTW-MAD; return native_hat over all queries.
 
@@ -215,12 +252,14 @@ def train_fold(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
     weighted = sample_w_t is not None
+    pair_delta = _huber_delta_std(args, mode, y_s)
     huber = nn.HuberLoss(
-        delta=_huber_delta_std(args, mode, y_s),
+        delta=pair_delta,
         reduction="none" if weighted else "mean",
     )
     tr_t = torch.as_tensor(tr, device=device)
     w_tr = sample_w_t[tr_t] if weighted else None
+    use_pairs = pair_w > 0.0 and pair_idx is not None and pair_idx.numel() > 0
     best_mad, best_state, best_epoch, since = np.inf, None, -1, 0
     for epoch in range(args.epochs):
         model.train()
@@ -233,9 +272,21 @@ def train_fold(
             loss = hl + args.pinball_weight * pinball_loss(
                 pin[tr_t], y_std[tr_t], eff_tau, w_tr
             )
+            pred_point = primary
         else:
             hl = huber(out[tr_t], y_std[tr_t])
             loss = (hl * w_tr).sum() / w_tr.sum() if weighted else hl
+            pred_point = out
+        if use_pairs:
+            # Anti-compression pair term: match the LOCAL predicted WTE-residual
+            # gradient between nearby train wells (dp) to the observed one (dy). The
+            # regional base R cancels in the difference, so standardized-residual
+            # space is the correct arena. delta is the POINT-loss Huber knee
+            # (_huber_delta_std) -- NOT eff_tau, which is the pinball QUANTILE and
+            # dimensionally wrong as a knee; the plan asks for no second tau knob.
+            dp = pred_point[pair_idx[0]] - pred_point[pair_idx[1]]
+            dy = y_std[pair_idx[0]] - y_std[pair_idx[1]]
+            loss = loss + pair_w * nn.functional.huber_loss(dp, dy, delta=pair_delta)
         loss.backward()
         opt.step()
         model.eval()
@@ -255,6 +306,14 @@ def train_fold(
     model.eval()
     with torch.no_grad():
         native = _combine_native(model(feat), y_s, y_c, base, mode, args)
+    if use_pairs:
+        # Compression ratio at the best epoch: std(pred_dtw)/std(obs_dtw) over val.
+        # <1 == the pathology (predictions flattened toward the mean); the pair term
+        # is meant to push this toward 1.
+        pred_dtw = _native_to_dtw(native, base, mode)
+        den = float(np.nanstd(obs_dtw[va]))
+        ratio = float(np.nanstd(pred_dtw[va])) / den if den > 0 else float("nan")
+        log.info("  compression std(pred_dtw)/std(obs_dtw)=%.3f (val)", ratio)
     return native, best_mad, best_epoch
 
 
@@ -381,6 +440,31 @@ def main() -> None:
         "Uses columns already in the bundle (no rebuild); the production arm is the "
         "no-flag default.",
     )
+    p.add_argument(
+        "--mainstem-read",
+        action="store_true",
+        help="(item 2) add the query->downstream-datum read conv: each well attends to "
+        "its basin's discharge-datum reach's LEARNED state in ONE hop, bypassing the "
+        "med-7/p90-28-hop receptive-field gap. Requires a bundle built with "
+        "build_conus_graph_inputs.py --mainstem-read (mainstem_edges.parquet). The datum "
+        "reaches (+ their 2-hop channel context) are unioned into the prune set so they "
+        "actually enter the GPU graph. See notes/GNN_TOPOLOGY_PLAN.md item 2.",
+    )
+    # --- anti-compression pair loss (item 4): regularize the LOCAL WTE gradient -----
+    p.add_argument(
+        "--pair-loss-weight",
+        type=float,
+        default=0.0,
+        help="(item 4) weight on the anti-compression pair term (0 = off, the "
+        "production default). Nearby train wells (<= --pair-k neighbours within "
+        "--pair-radius-m) get their predicted residual DIFFERENCE matched to the "
+        "observed one via a Huber on (dp - dy). Targets the amplitude-compression "
+        "pathology (std(pred) << std(obs), coherent <500 m patch bias) that the "
+        "point loss + median early-stop does not penalize. Only train-train pairs "
+        "are used (leak-free). See notes/GNN_TOPOLOGY_PLAN.md item 4.",
+    )
+    p.add_argument("--pair-radius-m", type=float, default=1000.0)
+    p.add_argument("--pair-k", type=int, default=3)
     # --- regional-aquifer substrate (Phase 1): optional gated correction branch -----
     p.add_argument(
         "--aquifer",
@@ -465,8 +549,30 @@ def main() -> None:
     assert (rn["reach_node_idx"].to_numpy() == np.arange(len(rn))).all()
     assert (qn["query_node_idx"].to_numpy() == np.arange(len(qn))).all()
 
+    # --- mainstem-read edges (item 2): one query->datum read edge per covered well ----
+    use_ms = args.mainstem_read
+    me = None
+    ms_cols = None
+    if use_ms:
+        ms_path = gdir / "mainstem_edges.parquet"
+        if not ms_path.exists() or not man.get("mainstem_read"):
+            raise SystemExit(
+                "--mainstem-read set but the bundle has no mainstem_edges.parquet / "
+                "mainstem_read manifest block -- rebuild the graph with "
+                "build_conus_graph_inputs.py --mainstem-read"
+            )
+        me = pd.read_parquet(ms_path)
+        ms_cols = man["mainstem_read"]["ms_edge_feature_cols"]
+
     # --- prune reach graph to the n-hop neighborhood of attached reaches -------
+    # The mainstem datum reaches (+ their own 2-hop channel context) are unioned in so
+    # the read edge actually reaches a node in the pruned GPU graph -- this is what puts
+    # the mainstem back into the receptive field.
     attached = np.unique(le["reach_node_idx"].to_numpy("int64"))
+    if use_ms:
+        attached = np.unique(
+            np.concatenate([attached, me["reach_node_idx"].to_numpy("int64")])
+        )
     kept, edge_keep = prune_reach_graph(len(rn), ce, attached, args.channel_layers)
     old2new = np.full(len(rn), -1, dtype="int64")
     old2new[kept] = np.arange(len(kept), dtype="int64")
@@ -477,6 +583,13 @@ def main() -> None:
     le = le.copy()
     le["reach_node_idx"] = old2new[le["reach_node_idx"].to_numpy("int64")]
     assert (le["reach_node_idx"] >= 0).all(), "attached reach pruned away (bug)"
+    if use_ms:
+        me = me.copy()
+        me["reach_node_idx"] = old2new[me["reach_node_idx"].to_numpy("int64")]
+        assert (me["reach_node_idx"] >= 0).all(), "mainstem datum reach pruned (bug)"
+        log.info(
+            "mainstem-read: %d datum read edges (unioned into the prune set)", len(me)
+        )
     log.info(
         "pruned reaches %d -> %d (%.1f%%); channel edges %d -> %d; lateral %d",
         len(old2new),
@@ -574,6 +687,20 @@ def main() -> None:
         "lat_ei": lat_ei,
         "lat_ea": lat_ea,
     }
+    # mainstem-read edges: standardized exactly like lat_ea (train-blind edge attrs,
+    # median-impute + missingness flag), reach->query direction (datum reach = src).
+    ms_ea = None
+    if use_ms:
+        ms_stats = fit_stats(me, ms_cols, None)
+        ms_ea = torch.as_tensor(
+            apply_stats(me, ms_stats), dtype=torch.float32, device=device
+        )
+        ms_ei = torch.as_tensor(
+            me[["reach_node_idx", "query_node_idx"]].to_numpy().T,
+            dtype=torch.long,
+            device=device,
+        )
+        graph_tensors |= {"ms_ei": ms_ei, "ms_ea": ms_ea}
     # Flow-direction sign per edge (row-aligned with ch_ea/lat_ea), from columns
     # already in the bundle: channel `direction` (+1 down / -1 reverse, never NaN) and
     # lateral sign(well_surf - reach_elev) (well-above-reach +1 / below -1). A rare
@@ -802,6 +929,7 @@ def main() -> None:
         )
 
     f_ch, f_lat = ch_ea.shape[1], lat_ea.shape[1]
+    f_ms = ms_ea.shape[1] if use_ms else None  # width incl. missingness flags
     native_oof = np.full(len(qn), np.nan)
     gate_oof = np.full(len(qn), np.nan) if fac_gate else None
     learned_aquifer = use_aquifer and args.aquifer_route == "learned"
@@ -841,6 +969,7 @@ def main() -> None:
             f_anchor=f_anchor,
             f_anchor_reach=f_ar,
             f_anchor_query=f_aq,
+            f_ms=f_ms,
             pinball=args.pinball,
             fac_skip=fac_skip,
             fac_gate=fac_gate,
@@ -888,11 +1017,40 @@ def main() -> None:
         hidden = args.hidden
     del probe_x
 
+    # Anti-compression pairs (item 4): built ONCE over all query nodes on the shared
+    # EPSG:5070 grid, then per-fold restricted to train-train pairs so no held-out
+    # label leaks through the difference term.
+    pair_w = float(args.pair_loss_weight)
+    all_pairs = None
+    if pair_w > 0.0:
+        all_pairs = build_train_pairs(
+            qn["x5070"].to_numpy("float64"),
+            qn["y5070"].to_numpy("float64"),
+            radius_m=args.pair_radius_m,
+            k=args.pair_k,
+        )
+        log.info(
+            "anti-compression pair loss ON: lambda=%.2f radius=%.0fm k=%d -> "
+            "%d global nearby-well pairs",
+            pair_w,
+            args.pair_radius_m,
+            args.pair_k,
+            len(all_pairs),
+        )
+
     for f in folds:
         test = qn[fold_col].to_numpy() == f
         trainval = ~test
         va = val_blocks(trainval, blocks, args.val_frac, rng)
         tr = trainval & ~va
+        pair_idx = None
+        if all_pairs is not None and len(all_pairs):
+            both_tr = tr[all_pairs[:, 0]] & tr[all_pairs[:, 1]]
+            log.info("fold %d: %d train-train pairs", f, int(both_tr.sum()))
+            if both_tr.any():
+                pair_idx = torch.as_tensor(
+                    all_pairs[both_tr].T, dtype=torch.long, device=device
+                )
         q_stats = fit_stats(qn, query_cols, tr)
         query_x = torch.as_tensor(
             apply_stats(qn, q_stats), dtype=torch.float32, device=device
@@ -934,6 +1092,7 @@ def main() -> None:
             f_anchor=f_anchor,
             f_anchor_reach=f_ar,
             f_anchor_query=f_aq,
+            f_ms=f_ms,
             pinball=args.pinball,
             fac_skip=fac_skip,
             fac_gate=fac_gate,
@@ -955,6 +1114,8 @@ def main() -> None:
             args,
             device,
             sample_w_t,
+            pair_idx=pair_idx,
+            pair_w=pair_w,
         )
         if fac_gate and model.last_fac_gate is not None:
             # last_fac_gate is from train_fold's final full-batch forward (all queries).
@@ -1156,6 +1317,18 @@ def main() -> None:
             else None,
         },
         "directional_edges": bool(args.directional_edges),
+        "pair_loss": {
+            "weight": pair_w,
+            "radius_m": args.pair_radius_m if pair_w > 0.0 else None,
+            "k": args.pair_k if pair_w > 0.0 else None,
+            "n_global_pairs": int(len(all_pairs)) if all_pairs is not None else None,
+        },
+        "mainstem_read": {
+            "enabled": bool(use_ms),
+            "n_edges": int(len(me)) if use_ms else None,
+            "ms_edge_feature_cols": ms_cols if use_ms else None,
+            "f_ms": int(f_ms) if use_ms else None,
+        },
         "target_mode": target_mode,
         "native_prediction_col": man.get(
             "native_prediction_col",
