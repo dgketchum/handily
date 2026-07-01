@@ -40,6 +40,8 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -223,6 +225,44 @@ LATERAL_EDGE_FEATURE_COLS = [
     "rel_elev_query_reach_m",
     "lateral_conductance",
 ]
+# --ds-datum-features (item 1): the regional-HAND-along-flowpath query columns -- the
+# elevation drop / along-network distance / order-jump from a well to its down-gradient
+# high-order (regional discharge) channel. Relative-elevation + topology only ->
+# target-blind + translation-invariant (RGA-safe). ds_datum_drop_m is the regional HAND.
+DS_DATUM_FEATURE_COLS = [
+    "ds_datum_drop_m",  # z_surf_well - datum_elev (regional HAND, m)
+    "log1p_ds_datum_dist_m",  # log1p(rank0_lateral_dist + along-network dist to datum)
+    "ds_datum_order_rel",  # datum_order - attached-reach streamorde
+    "ds_datum_missing",  # 0/1 the downstream walk dead-ended (no datum reachable)
+]
+# --mainstem-read (item 2): one query->downstream-datum edge per well whose datum exists,
+# letting the query attend to the datum reach's LEARNED state (its seed evidence,
+# drainage, channel context) -- fixes the med-7/p90-28-hop receptive-field gap without
+# deepening the channel stack. All relative / dimensionless / topological -> leak-free.
+MS_EDGE_FEATURE_COLS = [
+    "rel_elev_query_datum_m",  # z_surf_well - datum_elev
+    "log1p_ds_datum_dist_m",  # log1p(rank0_lateral_dist + along-network dist to datum)
+    "datum_order_rel",  # datum_order - basin_max_order (<= 0)
+    "datum_is_self",  # attached reach is already a datum (0/1)
+    "log1p_datum_da_km2",  # log1p(totdasqkm at the datum reach)
+]
+# --wet-propagation-features (item 5): REACH-SIDE, NETWORK-METRIC surface-water evidence
+# (distinct from the rejected query-side + Euclidean evidence bank). A per-reach GSW wet
+# flag is propagated along the FAC channel graph so every reach -- and through the convs
+# every well -- carries distance-to-permanent-water in NETWORK metric (the physically
+# right metric for GW connection to losing/gaining channels; dist-to-water != dist-to-
+# drainage per the R-eval). Appended to the bundle manifest's reach_feature_cols; the
+# trainer reads reach cols generically -> zero trainer changes.
+WET_PROP_REACH_FEATURE_COLS = [
+    "wet_reach",  # 0/1: reach rep-point on GSW occurrence >= threshold
+    "log1p_net_dist_wet_m",  # along-network dist to nearest wet reach (any direction)
+    "log1p_ds_dist_wet_m",  # along-network dist to nearest wet reach DOWNSTREAM only
+    "upstream_wet_fraction",  # length-weighted wet / total upstream channel length
+    "no_wet_in_component",  # 0/1: reach's channel component has zero wet reaches
+]
+# §5.2 gate: the rank-0 query projection of two reach-side features, carried on the query
+# node (NOT model features) so the Phase-0a GBM gate can probe them tabularly.
+WET_PROP_QUERY_GATE_COLS = ["q_log1p_net_dist_wet_m", "q_upstream_wet_fraction"]
 
 
 def load_wells_hand(path: str) -> pd.DataFrame:
@@ -553,6 +593,345 @@ def build_octant_lateral_edges(
     out["rank"] = out.groupby("query_node_idx").cumcount().astype("int64")
     out["is_controlling"] = (out["rank"] == 0).astype("float64")
     return out
+
+
+def downstream_datum(
+    rn: pd.DataFrame,
+    ce: pd.DataFrame,
+    order_band: int = 1,
+    stop_mask: np.ndarray | None = None,
+    max_iter: int = 5000,
+) -> pd.DataFrame:
+    """Per-reach first-downstream-datum via vectorized pointer stepping.
+
+    The single topology primitive behind the regional-HAND-along-flowpath features
+    (item 1), the mainstem-read edge set (item 2), and -- with ``stop_mask`` -- the
+    downstream-wet-distance feature (item 5). Walks each reach down the FAC channel
+    network to the first reach in the DATUM set and reports the along-network
+    distance/elevation/order/hops to it.
+
+    ``rn`` must expose ``reach_node_idx`` (contiguous 0..n-1, the trainer invariant),
+    ``basin``, ``streamorde``, ``reach_elev_m``, ``totdasqkm`` and ``log1p_length_m``;
+    ``ce`` is ``channel_edges`` (``direction == 1`` rows are src->dst downstream).
+
+    Datum set: an explicit ``stop_mask`` (item 5's wet reaches) OR, by default, the
+    per-basin top-``(order_band+1)`` Strahler band -- the SAME mainstem definition as
+    ``build_conus_fac_reach_graph.network_distance_to_mainstem`` / the str_top2 concept,
+    so the feature and the regional R stay aligned. Braids/diffluences (a reach with
+    >1 downstream edge -- expected rare) resolve to the downstream reach with the
+    largest ``totdasqkm`` (the mainstem branch); the count is logged.
+
+    Returns a DataFrame indexed by ``reach_node_idx`` (int64, -1/NaN where no datum is
+    reachable -- NEVER silently imputed; ``datum_missing`` is the authoritative flag):
+      datum_reach_idx  int64  (-1 where missing)
+      datum_dist_m     float  (NaN where missing; 0 for a self-datum reach)
+      datum_elev_m     float  reach_elev_m at the datum (NaN where missing)
+      datum_order      float  streamorde at the datum (NaN where missing)
+      datum_n_hops     int64  channel hops walked (0 for self-datum)
+      datum_missing    bool   walk dead-ended at a component outlet (no datum)
+      datum_is_self    bool   the reach is itself a datum
+      basin_max_order  float  per-basin max streamorde (the mainstem band reference)
+    """
+    rn = rn.sort_values("reach_node_idx").reset_index(drop=True)
+    n = len(rn)
+    if not (rn["reach_node_idx"].to_numpy("int64") == np.arange(n)).all():
+        raise SystemExit(
+            "downstream_datum: reach_node_idx must be contiguous 0..n-1 "
+            "(the reach-graph builder + trainer invariant)"
+        )
+    strah = rn["streamorde"].to_numpy("float64")
+    basin = rn["basin"].to_numpy()
+    elev = rn["reach_elev_m"].to_numpy("float64")
+    totda = rn["totdasqkm"].to_numpy("float64")
+    seg_len = np.expm1(rn["log1p_length_m"].to_numpy("float64"))  # per-reach length (m)
+    seg_len = np.where(np.isfinite(seg_len) & (seg_len > 0.0), seg_len, 0.0)
+
+    # single downstream pointer per reach; on braids keep the max-drainage branch.
+    down = ce[ce["direction"] == 1]
+    s = down["src_reach_idx"].to_numpy("int64")
+    d = down["dst_reach_idx"].to_numpy("int64")
+    n_braids = int(len(s) - pd.unique(s).size)
+    order = np.lexsort((totda[d], s))  # ascending dst-drainage within each src
+    down_ptr = np.full(n, -1, dtype="int64")
+    down_ptr[s[order]] = d[order]  # last write per src == the max-drainage dst
+
+    basin_max = np.full(n, np.nan)
+    for b in np.unique(basin):
+        m = basin == b
+        basin_max[m] = np.nanmax(strah[m])
+
+    if stop_mask is not None:
+        is_datum = np.asarray(stop_mask, dtype=bool)
+        if len(is_datum) != n:
+            raise SystemExit("downstream_datum: stop_mask length != n reaches")
+    else:
+        is_datum = strah >= (basin_max - order_band)
+
+    datum_idx = np.full(n, -1, dtype="int64")
+    datum_dist = np.zeros(n, dtype="float64")
+    datum_hops = np.zeros(n, dtype="int64")
+    self_datum = is_datum.copy()
+    datum_idx[self_datum] = np.where(self_datum)[0]  # datum reaches terminate at self
+    cur = np.arange(n, dtype="int64")
+    active = ~is_datum
+    guard = 0
+    while active.any():
+        guard += 1
+        if guard > max_iter:
+            raise RuntimeError(
+                f"downstream_datum did not converge in {max_iter} steps "
+                "(cycle in the down-pointer graph?)"
+            )
+        nxt = np.where(active, down_ptr[cur], -1)
+        active = active & ~(nxt < 0)  # dead-end at a component outlet -> stays missing
+        step = active  # survivors all have a downstream reach
+        datum_dist[step] += seg_len[cur[step]]  # length of the reach being left
+        datum_hops[step] += 1
+        cur[step] = nxt[step]
+        landed = step & is_datum[cur]
+        datum_idx[landed] = cur[landed]
+        active = active & ~landed
+
+    missing = datum_idx < 0
+    found = ~missing
+    datum_elev = np.full(n, np.nan)
+    datum_order = np.full(n, np.nan)
+    datum_elev[found] = elev[datum_idx[found]]
+    datum_order[found] = strah[datum_idx[found]]
+    datum_dist[missing] = np.nan
+    log.info(
+        "downstream_datum: order_band=%s datum-reaches=%d/%d missing=%d (%.2f%%) "
+        "braids-resolved=%d hops med/p90 %.0f/%.0f",
+        "stop_mask" if stop_mask is not None else order_band,
+        int(is_datum.sum()),
+        n,
+        int(missing.sum()),
+        100.0 * missing.mean(),
+        n_braids,
+        float(np.median(datum_hops[found])) if found.any() else 0.0,
+        float(np.percentile(datum_hops[found], 90)) if found.any() else 0.0,
+    )
+    return pd.DataFrame(
+        {
+            "datum_reach_idx": datum_idx,
+            "datum_dist_m": datum_dist,
+            "datum_elev_m": datum_elev,
+            "datum_order": datum_order,
+            "datum_n_hops": datum_hops,
+            "datum_missing": missing,
+            "datum_is_self": self_datum,
+            "basin_max_order": basin_max,
+        },
+        index=pd.Index(np.arange(n, dtype="int64"), name="reach_node_idx"),
+    )
+
+
+def project_datum_to_queries(
+    dd: pd.DataFrame,
+    lat: pd.DataFrame,
+    reach_nodes: pd.DataFrame,
+    well_surf_m: np.ndarray,
+) -> dict:
+    """Project the per-reach ``downstream_datum`` result onto each query via its rank-0
+    (globally-nearest) attached lateral reach.
+
+    Shared by ``--ds-datum-features`` (item 1) and ``--mainstem-read`` (item 2). Every
+    well has a rank-0 lateral edge (both lateral builders guarantee >=1), so ``have`` is
+    all-True in practice; it is carried so a query with no attachment falls to
+    ``datum_missing`` rather than being silently dropped. Returns numpy arrays aligned to
+    ``query_node_idx`` (0..n_wells-1) -- NaN/-1 where no datum is reachable (NEVER
+    imputed; the trainer median-imputes + flags at standardization).
+    """
+    n = len(well_surf_m)
+    r0 = (
+        lat[lat["rank"] == 0]
+        .drop_duplicates("query_node_idx")
+        .set_index("query_node_idx")
+    )
+    reach0 = np.full(n, -1, dtype="int64")
+    lat0 = np.full(n, np.nan)
+    qi = r0.index.to_numpy("int64")
+    reach0[qi] = r0["reach_node_idx"].to_numpy("int64")
+    lat0[qi] = r0["lateral_dist_m"].to_numpy("float64")
+    have = reach0 >= 0
+
+    # per-reach arrays are positionally reach_node_idx-ordered (dd index is contiguous
+    # 0..n-1, asserted in downstream_datum; reach_node_idx is arange in the reach graph).
+    rn_sorted = reach_nodes.sort_values("reach_node_idx")
+    totda = rn_sorted["totdasqkm"].to_numpy("float64")
+    strah = rn_sorted["streamorde"].to_numpy("float64")
+
+    def _gather(vals: np.ndarray, fill):
+        out = np.full(n, fill, dtype="float64")
+        out[have] = vals[reach0[have]]
+        return out
+
+    reach0_strah = _gather(strah, np.nan)
+    datum_elev = _gather(dd["datum_elev_m"].to_numpy("float64"), np.nan)
+    datum_dist = _gather(dd["datum_dist_m"].to_numpy("float64"), np.nan)
+    datum_order = _gather(dd["datum_order"].to_numpy("float64"), np.nan)
+    datum_missing = _gather(dd["datum_missing"].to_numpy("float64"), 1.0)
+    datum_is_self = _gather(dd["datum_is_self"].to_numpy("float64"), 0.0)
+    basin_max_order = _gather(dd["basin_max_order"].to_numpy("float64"), np.nan)
+
+    # totdasqkm at the DATUM reach (not the attached reach) for the ms-edge drainage attr.
+    q_datum_reach = np.full(n, -1, dtype="int64")
+    q_datum_reach[have] = dd["datum_reach_idx"].to_numpy("int64")[reach0[have]]
+    has_datum = q_datum_reach >= 0
+    datum_da = np.full(n, np.nan)
+    datum_da[has_datum] = totda[q_datum_reach[has_datum]]
+
+    return {
+        "reach0": reach0,
+        "reach0_strah": reach0_strah,
+        "lat0": lat0,
+        "datum_reach_idx": q_datum_reach,
+        "datum_elev": datum_elev,
+        "datum_dist": datum_dist,
+        "datum_order": datum_order,
+        "datum_missing": datum_missing,
+        "datum_is_self": datum_is_self,
+        "basin_max_order": basin_max_order,
+        "datum_da": datum_da,
+    }
+
+
+def wet_propagation_reach_features(
+    reach_nodes: pd.DataFrame,
+    channel_edges: pd.DataFrame,
+    wet: np.ndarray,
+) -> pd.DataFrame:
+    """Propagate a per-reach wet flag along the FAC channel network (item 5).
+
+    Given a boolean ``wet`` mask over reaches (rep-point on GSW occurrence >= threshold,
+    sampled in ``main`` where geom coords live), returns a DataFrame indexed by
+    ``reach_node_idx`` with the WET_PROP_REACH_FEATURE_COLS:
+
+      * ``wet_reach``               the flag itself (float 0/1).
+      * ``log1p_net_dist_wet_m``    UNDIRECTED along-network distance to the nearest wet
+        reach: one multi-source Dijkstra with a weight-0 super-source over every wet reach
+        on the length-weighted undirected channel graph (same construction as
+        ``build_conus_fac_reach_graph.network_distance_to_mainstem``). NaN in a component
+        with no wet reach.
+      * ``log1p_ds_dist_wet_m``     DOWNSTREAM-only distance to the nearest wet reach: the
+        Phase-0b ``downstream_datum`` walk with ``stop_mask=wet`` (one shared primitive,
+        two stop conditions). NaN where no downstream wet reach.
+      * ``upstream_wet_fraction``   length-weighted wet channel length upstream (inclusive)
+        / total upstream channel length, via a topological accumulation over the single
+        max-drainage down-pointer (a DAG; cycle-guarded). In [0, 1].
+      * ``no_wet_in_component``     0/1 indicator that the reach's undirected channel
+        component holds zero wet reaches -- the authoritative NaN flag for the two
+        distances (NEVER silently imputed, per CLAUDE.md; the trainer additionally
+        median-imputes + flags at standardization).
+
+    Distances are log1p-transformed; the fraction and flags are raw.
+    """
+    rn = reach_nodes.sort_values("reach_node_idx").reset_index(drop=True)
+    n = len(rn)
+    if not (rn["reach_node_idx"].to_numpy("int64") == np.arange(n)).all():
+        raise SystemExit(
+            "wet_propagation_reach_features: reach_node_idx must be contiguous 0..n-1"
+        )
+    wet = np.asarray(wet, dtype=bool)
+    if len(wet) != n:
+        raise SystemExit("wet_propagation_reach_features: wet mask length != n reaches")
+    seg_len = np.expm1(rn["log1p_length_m"].to_numpy("float64"))
+    seg_len = np.where(np.isfinite(seg_len) & (seg_len > 0.0), seg_len, 0.0)
+
+    down = channel_edges[channel_edges["direction"] == 1]
+    s = down["src_reach_idx"].to_numpy("int64")
+    d = down["dst_reach_idx"].to_numpy("int64")
+
+    # --- undirected net-distance to nearest wet reach (super-source Dijkstra) ---------
+    w = seg_len[s]
+    w = np.where(np.isfinite(w) & (w > 0.0), w, 1.0)  # edge weight = src reach length
+    wet_idx = np.where(wet)[0]
+    if len(wet_idx) == 0:
+        net_dist = np.full(n, np.nan)
+    else:
+        super_idx = n
+        rows = np.concatenate([s, wet_idx])
+        cols = np.concatenate([d, np.full(len(wet_idx), super_idx)])
+        data = np.concatenate([w, np.zeros(len(wet_idx))])
+        g = csr_matrix((data, (rows, cols)), shape=(n + 1, n + 1))
+        net_dist = dijkstra(g, directed=False, indices=super_idx)[:n]
+        net_dist[~np.isfinite(net_dist)] = np.nan
+
+    # --- no-wet-component indicator (authoritative NaN flag for the distances) --------
+    adj = csr_matrix((np.ones(len(s)), (s, d)), shape=(n, n))
+    ncomp, comp = connected_components(adj, directed=False)
+    comp_has_wet = np.zeros(ncomp, dtype=bool)
+    np.logical_or.at(comp_has_wet, comp, wet)
+    no_wet_in_component = ~comp_has_wet[comp]
+
+    # --- downstream-only distance to nearest wet reach (shared 0b walk primitive) -----
+    dd = downstream_datum(rn, channel_edges, stop_mask=wet)
+    ds_dist = dd["datum_dist_m"].to_numpy("float64")
+
+    # --- upstream wet fraction: topological accumulation over the down-pointer forest --
+    # Single max-drainage downstream pointer per reach (same braid resolution as the walk).
+    n_braids = int(len(s) - pd.unique(s).size)
+    totda = rn["totdasqkm"].to_numpy("float64")
+    order = np.lexsort((totda[d], s))
+    down_ptr = np.full(n, -1, dtype="int64")
+    down_ptr[s[order]] = d[order]
+    indeg = np.zeros(n, dtype="int64")
+    has_down = down_ptr >= 0
+    np.add.at(indeg, down_ptr[has_down], 1)  # #direct upstream neighbours per reach
+    acc_wet = seg_len * wet.astype("float64")  # inclusive of the reach itself
+    acc_tot = seg_len.copy()
+    remaining = indeg.copy()
+    stack = list(np.where(indeg == 0)[0])  # headwaters first (Kahn topological order)
+    processed = 0
+    while stack:
+        u = stack.pop()
+        processed += 1
+        p = down_ptr[u]
+        if p >= 0:
+            acc_wet[p] += acc_wet[u]
+            acc_tot[p] += acc_tot[u]
+            remaining[p] -= 1
+            if remaining[p] == 0:
+                stack.append(p)
+    if processed != n:
+        raise RuntimeError(
+            "upstream_wet_fraction: cycle in the down-pointer graph "
+            f"({processed}/{n} reaches ordered)"
+        )
+    upstream_wet_fraction = np.where(acc_tot > 0.0, acc_wet / acc_tot, np.nan)
+
+    for order_lab in sorted(rn["streamorde"].dropna().unique()):
+        m = rn["streamorde"].to_numpy("float64") == order_lab
+        log.info(
+            "  wet fraction @ Strahler %g: %.3f (%d reaches)",
+            order_lab,
+            float(wet[m].mean()) if m.any() else 0.0,
+            int(m.sum()),
+        )
+    log.info(
+        "wet-propagation: %d/%d wet reaches (%.2f%%), %d channel components, "
+        "no-wet-component reaches %d (%.2f%%), braids-resolved %d; net_dist NaN %.2f%%, "
+        "ds_dist NaN %.2f%%",
+        int(wet.sum()),
+        n,
+        100.0 * wet.mean(),
+        ncomp,
+        int(no_wet_in_component.sum()),
+        100.0 * no_wet_in_component.mean(),
+        n_braids,
+        100.0 * np.isnan(net_dist).mean(),
+        100.0 * np.isnan(ds_dist).mean(),
+    )
+    return pd.DataFrame(
+        {
+            "wet_reach": wet.astype("float64"),
+            "log1p_net_dist_wet_m": np.log1p(net_dist),
+            "log1p_ds_dist_wet_m": np.log1p(ds_dist),
+            "upstream_wet_fraction": upstream_wet_fraction,
+            "no_wet_in_component": no_wet_in_component.astype("float64"),
+        },
+        index=pd.Index(np.arange(n, dtype="int64"), name="reach_node_idx"),
+    )
 
 
 def sample_relief_etrm(
@@ -943,6 +1322,45 @@ def main() -> None:
         "All target-blind + translation-invariant (relative elevation / dimensionless).",
     )
     ap.add_argument(
+        "--ds-datum-features",
+        action="store_true",
+        help="(wte_residual only) add the regional-HAND-along-flowpath query features "
+        "(item 1): from each well's rank-0 attached FAC reach, walk DOWN the channel "
+        "network to the basin's mainstem discharge datum (top-(mainstem_order_band+1) "
+        "Strahler band, the SAME definition as net_dist_mainstem / R) and emit the "
+        "elevation drop (ds_datum_drop_m = the long-wavelength regional HAND), the "
+        "along-network distance, the order-jump, and a walk-dead-ended flag. This is the "
+        "flagged Tier-1 missing quantity: fac_rem_dtw_m is the LOCAL fine-grid HAND and "
+        "net_dist_mainstem_m is a distance with no elevation. Relative-elevation + "
+        "topology only -> target-blind + translation-invariant (RGA-safe, leak-free). "
+        "See notes/GNN_TOPOLOGY_PLAN.md item 1.",
+    )
+    ap.add_argument(
+        "--mainstem-read",
+        action="store_true",
+        help="(item 2) emit mainstem_edges.parquet: exactly one query->downstream-datum "
+        "read edge per well whose datum exists, letting the query attend to the DATUM "
+        "reach's LEARNED state (seed evidence, drainage, 2-hop channel context) -- fixes "
+        "the med-7/p90-28-hop receptive-field gap without deepening the channel stack or "
+        "touching component fragmentation. Shares the --ds-datum-features walk (enable "
+        "both in the A/B). Recommend pairing with --ds-datum-features so ds_datum_missing "
+        "lets the head tell zero-context from real context. All edge attrs relative / "
+        "dimensionless / topological -> leak-free. See notes/GNN_TOPOLOGY_PLAN.md item 2.",
+    )
+    ap.add_argument(
+        "--wet-propagation-features",
+        action="store_true",
+        help="(item 5) propagate a per-reach GSW wet flag along the FAC channel network "
+        "and write an AUGMENTED (materialized, not symlinked) reach_nodes.parquet with "
+        "network-metric surface-water features: log1p_net_dist_wet_m (undirected dist to "
+        "nearest wet reach), log1p_ds_dist_wet_m (downstream-only, the 0b walk with a wet "
+        "stop_mask), upstream_wet_fraction, and a no_wet_in_component NaN flag. REACH-side "
+        "+ NETWORK-metric (distinct from the rejected query-side + Euclidean evidence "
+        "bank): dist-to-water != dist-to-drainage. Reuses --gsw-wet-threshold; the trainer "
+        "reads reach cols from the manifest -> no trainer change. See "
+        "notes/GNN_TOPOLOGY_PLAN.md item 5.",
+    )
+    ap.add_argument(
         "--octant-lateral",
         action="store_true",
         help="build lateral edges by azimuthal sector instead of plain k-NN: the "
@@ -988,6 +1406,11 @@ def main() -> None:
             "--terrain-multiscale-features is wired into the wte_residual query bank only; "
             f"got target={args.target}"
         )
+    if args.ds_datum_features and args.target != TARGET_WTE_RESIDUAL:
+        raise SystemExit(
+            "--ds-datum-features is wired into the wte_residual query bank only; "
+            f"got target={args.target}"
+        )
     missing_terr = (
         [p for p in TERRAIN_MULTISCALE_RASTERS.values() if not Path(p).exists()]
         if args.terrain_multiscale_features
@@ -1000,6 +1423,7 @@ def main() -> None:
         )
 
     reach_nodes = pd.read_parquet(gdir / "reach_nodes.parquet")
+    reach_manifest = json.loads((gdir / "reach_graph_manifest.json").read_text())
     comid_to_idx = dict(
         zip(
             reach_nodes["comid"].to_numpy("int64"),
@@ -1510,9 +1934,206 @@ def main() -> None:
             float(np.nanmedian(wells["fac_rem_dtw_m"])),
         )
 
+    # --- regional-HAND-along-flowpath features (item 1) + mainstem-read edges (item 2)
+    # Both share ONE downstream-datum walk (per-reach), projected onto each well via its
+    # rank-0 attached reach. Order band mirrors net_dist_mainstem / R so the feature, the
+    # read edge, and the prior share a single mainstem definition. Computed AFTER lateral
+    # edges so the rank-0 attachment is available.
+    ds_datum_block = None
+    mainstem_read_block = None
+    channel_edges = None
+    if args.ds_datum_features or args.mainstem_read or args.wet_propagation_features:
+        channel_edges = pd.read_parquet(gdir / "channel_edges.parquet")
+    if args.ds_datum_features or args.mainstem_read:
+        order_band = int(reach_manifest.get("mainstem_order_band", 1))
+        dd = downstream_datum(reach_nodes, channel_edges, order_band=order_band)
+        proj = project_datum_to_queries(dd, lat, reach_nodes, well_surf_m)
+        down = channel_edges[channel_edges["direction"] == 1]
+        n_braids = int(len(down) - down["src_reach_idx"].nunique())
+
+    if args.ds_datum_features:
+        wells["ds_datum_drop_m"] = well_surf_m - proj["datum_elev"]
+        wells["log1p_ds_datum_dist_m"] = np.log1p(proj["lat0"] + proj["datum_dist"])
+        wells["ds_datum_order_rel"] = proj["datum_order"] - proj["reach0_strah"]
+        wells["ds_datum_missing"] = proj["datum_missing"]
+        query_feature_cols = query_feature_cols + DS_DATUM_FEATURE_COLS
+        drop = wells["ds_datum_drop_m"].to_numpy("float64")
+        dist_m = np.expm1(wells["log1p_ds_datum_dist_m"].to_numpy("float64"))
+        miss_frac = float(np.mean(proj["datum_missing"]))
+        log.info(
+            "ds-datum-features ON (order_band=%d): drop med/p90 %.1f/%.1f m, dist "
+            "med/p90 %.0f/%.0f m, missing %.3f, braids-resolved %d",
+            order_band,
+            float(np.nanmedian(drop)),
+            float(np.nanpercentile(drop, 90)),
+            float(np.nanmedian(dist_m)),
+            float(np.nanpercentile(dist_m, 90)),
+            miss_frac,
+            n_braids,
+        )
+        if miss_frac > 0.02:
+            log.warning(
+                "ds-datum missing fraction %.3f > 2%% -- net_dist_mainstem was 1.00 on "
+                "attached reaches; investigate the walk before trusting the feature",
+                miss_frac,
+            )
+        ds_datum_block = {
+            "order_band": order_band,
+            "missing_fraction": miss_frac,
+            "n_braids_resolved": n_braids,
+            "feature_cols": DS_DATUM_FEATURE_COLS,
+            "leakage_note": (
+                "ds_datum_* are relative-elevation + channel-topology only (well "
+                "land-surface minus the downstream mainstem-datum reach elevation, "
+                "along-network distance, order jump). No absolute elevation / head / "
+                "target -> translation-invariant + leak-free (RGA-safe)."
+            ),
+        }
+
+    if args.mainstem_read:
+        # One query->datum read edge per well whose downstream walk reached a datum.
+        has_datum = proj["datum_reach_idx"] >= 0
+        qidx = wells["query_node_idx"].to_numpy("int64")
+        me = pd.DataFrame(
+            {
+                "query_node_idx": qidx[has_datum],
+                "reach_node_idx": proj["datum_reach_idx"][has_datum],
+                "rel_elev_query_datum_m": (well_surf_m - proj["datum_elev"])[has_datum],
+                "log1p_ds_datum_dist_m": np.log1p(proj["lat0"] + proj["datum_dist"])[
+                    has_datum
+                ],
+                "datum_order_rel": (proj["datum_order"] - proj["basin_max_order"])[
+                    has_datum
+                ],
+                "datum_is_self": proj["datum_is_self"][has_datum],
+                "log1p_datum_da_km2": np.log1p(np.clip(proj["datum_da"], 0, None))[
+                    has_datum
+                ],
+            }
+        )
+        me[["query_node_idx", "reach_node_idx", *MS_EDGE_FEATURE_COLS]].to_parquet(
+            gdir / "mainstem_edges.parquet"
+        )
+        cov = float(has_datum.mean())
+        log.info(
+            "mainstem-read ON (order_band=%d): %d read edges, coverage %.3f "
+            "(one edge per well whose downstream walk reached a datum)",
+            order_band,
+            int(has_datum.sum()),
+            cov,
+        )
+        mainstem_read_block = {
+            "order_band": order_band,
+            "edge_count": int(has_datum.sum()),
+            "coverage_fraction": cov,
+            "ms_edge_feature_cols": MS_EDGE_FEATURE_COLS,
+            "leakage_note": (
+                "mainstem read edges carry relative-elevation + topological attrs only "
+                "(query-vs-datum rel-elev, along-network distance, order/self flags, "
+                "datum drainage). No absolute elevation / head / target -> leak-free. "
+                "The edge lets the query attend to the datum reach's LEARNED state."
+            ),
+        }
+
+    # --- network-propagated wet/dry evidence (item 5) --------------------------------
+    # REACH-side + NETWORK-metric surface-water evidence: sample a per-reach GSW wet flag
+    # at the flowline rep-points, propagate it along the FAC channel graph, and write an
+    # AUGMENTED (materialized) reach_nodes.parquet. The trainer reads reach cols from the
+    # manifest, so extending reach_feature_cols is the only wiring needed.
+    reach_feature_cols_out = list(reach_manifest["reach_feature_cols"])
+    wet_propagation_block = None
+    if args.wet_propagation_features:
+        from pyproj import Transformer  # local: heavy import only when item 5 is built
+
+        n_reach = len(reach_nodes)
+        rn_idx = reach_nodes["reach_node_idx"].to_numpy("int64")
+        rcx = np.full(n_reach, np.nan)
+        rcy = np.full(n_reach, np.nan)
+        gidx = geom["reach_node_idx"].to_numpy("int64")
+        rcx[gidx] = geom["cx"].to_numpy(
+            "float64"
+        )  # rep-points are reach_node_idx-keyed
+        rcy[gidx] = geom["cy"].to_numpy("float64")
+        finite = np.isfinite(rcx) & np.isfinite(rcy)
+        occ = np.full(n_reach, np.nan)
+        if finite.any():
+            lon, lat_deg = Transformer.from_crs(5070, 4326, always_xy=True).transform(
+                rcx[finite], rcy[finite]
+            )
+            occ[finite] = _sample_gsw_occurrence(lon, lat_deg)
+        wet = np.isfinite(occ) & (occ >= args.gsw_wet_threshold)
+        log.info(
+            "wet-propagation: %d/%d reaches lack a rep-point (no GSW sample -> not wet)",
+            int((~finite).sum()),
+            n_reach,
+        )
+        # helper is reach_node_idx-indexed (0..n-1); align back to reach_nodes' row order.
+        wetfeat = wet_propagation_reach_features(reach_nodes, channel_edges, wet)
+        for c in WET_PROP_REACH_FEATURE_COLS:
+            reach_nodes[c] = wetfeat[c].reindex(rn_idx).to_numpy()
+        reach_feature_cols_out = reach_feature_cols_out + WET_PROP_REACH_FEATURE_COLS
+
+        # §5.2 gate projection: rank-0 attached-reach value onto each query (net-dist adds
+        # the well's own lateral distance; fraction is a straight gather). Carried for the
+        # tabular gate ONLY -- NOT added to query_feature_cols (the item is reach-side).
+        r0 = (
+            lat[lat["rank"] == 0]
+            .drop_duplicates("query_node_idx")
+            .set_index("query_node_idx")
+        )
+        nq = len(wells)
+        reach0 = np.full(nq, -1, dtype="int64")
+        lat0 = np.full(nq, np.nan)
+        qi = r0.index.to_numpy("int64")
+        reach0[qi] = r0["reach_node_idx"].to_numpy("int64")
+        lat0[qi] = r0["lateral_dist_m"].to_numpy("float64")
+        have = reach0 >= 0
+        net_raw = np.expm1(wetfeat["log1p_net_dist_wet_m"].to_numpy("float64"))
+        upfrac = wetfeat["upstream_wet_fraction"].to_numpy("float64")
+        q_net = np.full(nq, np.nan)
+        q_upfrac = np.full(nq, np.nan)
+        q_net[have] = lat0[have] + net_raw[reach0[have]]
+        q_upfrac[have] = upfrac[reach0[have]]
+        wells["q_log1p_net_dist_wet_m"] = np.log1p(q_net)
+        wells["q_upstream_wet_fraction"] = q_upfrac
+
+        # Materialize the augmented reach_nodes. The bundle's reach_nodes.parquet may be a
+        # SYMLINK to the shared statewide reach graph -- unlink FIRST so we replace the
+        # link with a bundle-local file instead of clobbering shared data through it.
+        rn_path = gdir / "reach_nodes.parquet"
+        if rn_path.is_symlink():
+            log.info(
+                "materializing augmented reach_nodes (was a symlink -> %s)",
+                rn_path.readlink(),
+            )
+            rn_path.unlink()
+        reach_nodes.to_parquet(rn_path)
+        wet_propagation_block = {
+            "gsw_wet_threshold_pct": args.gsw_wet_threshold,
+            "gsw_occurrence_dir": str(GSW_OCC_DIR),
+            "wet_reach_fraction": float(wet.mean()),
+            "no_wet_component_fraction": float(
+                reach_nodes["no_wet_in_component"].mean()
+            ),
+            "reaches_without_reppoint": int((~finite).sum()),
+            "reach_feature_cols_added": WET_PROP_REACH_FEATURE_COLS,
+            "query_gate_cols": WET_PROP_QUERY_GATE_COLS,
+            "reach_nodes_materialized": True,
+            "leakage_note": (
+                "REACH-side + NETWORK-metric surface-water evidence (vs the rejected "
+                "query-side + Euclidean evidence bank): a per-reach GSW wet flag "
+                "propagated along the FAC channel graph. All features are distances/"
+                "fractions/flags of an OBSERVABLE surface-water layer (target-blind, no "
+                "head/elevation) -> leak-free. The two q_* columns are the rank-0 "
+                "projection for the tabular gate only (not model features)."
+            ),
+        }
+
     # Carry the surface datum + observed WTE in both modes (cheap, enables cross-
     # mode diagnostics + the WTE identity check); mode-specific target/priors added.
     extra_keep = [SURFACE_ELEV_COL, OBS_WTE_COL, "well_class", "confinement_class"]
+    if args.wet_propagation_features:
+        extra_keep += WET_PROP_QUERY_GATE_COLS
     if args.target == TARGET_WTE:
         extra_keep += [REGIONAL_WTE_COL, DEEP_REGIONAL_WTE_COL, HAND_WTE_COL]
         if FAC_REM_WTE_COL in wells.columns:
@@ -1861,7 +2482,18 @@ def main() -> None:
             0, "Query features = hand_m + cross-fit regional IDW prior (+ deep/RELIEF)."
         )
 
-    reach_manifest = json.loads((gdir / "reach_graph_manifest.json").read_text())
+    if args.wet_propagation_features:
+        leakage_notes.append(
+            "Network-propagated wet evidence (--wet-propagation-features, item 5): a "
+            "per-reach GSW wet flag (occ>=%g%%) propagated along the FAC channel graph "
+            "into reach_feature_cols (undirected + downstream net-distance to wet, "
+            "upstream wet fraction, no-wet-component flag). REACH-side + NETWORK-metric "
+            "(distinct from the rejected query-side + Euclidean evidence bank). "
+            "Target-blind observable surface-water layer -> leak-free. reach_nodes.parquet "
+            "is MATERIALIZED (augmented copy, symlink replaced)."
+            % args.gsw_wet_threshold
+        )
+
     manifest = {
         "stage": "full_bundle",
         "crs": "EPSG:5070",
@@ -1901,7 +2533,7 @@ def main() -> None:
         "cv_block_km": args.cv_block_km if args.cv_scheme != "huc4" else None,
         "huc12_polys": args.huc12_polys if args.cv_scheme == "huc12" else None,
         "require_fac": bool(args.require_fac),
-        "reach_feature_cols": reach_manifest["reach_feature_cols"],
+        "reach_feature_cols": reach_feature_cols_out,
         "reach_structural_nan_cols": reach_manifest["reach_structural_nan_cols"],
         "channel_edge_feature_cols": reach_manifest["channel_edge_feature_cols"],
         "query_feature_cols": query_feature_cols,
@@ -1912,6 +2544,9 @@ def main() -> None:
         if args.relief_etrm_features
         else [],
         "evidence_features": EVIDENCE_FEATURE_COLS if args.evidence_features else [],
+        "ds_datum": ds_datum_block,
+        "mainstem_read": mainstem_read_block,
+        "wet_propagation": wet_propagation_block,
         "evidence_params": {
             "ndvi_jja": NDVI_JJA,
             "ndvi_djf": NDVI_DJF,
