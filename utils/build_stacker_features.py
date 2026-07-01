@@ -80,6 +80,14 @@ ETRM_DIR = "/nas/etrm/conus/recharge_250m"
 ETRM_RECHARGE = f"{ETRM_DIR}/conus_mean_recharge_2020-2024_albers1km.tif"
 ETRM_ETA = f"{ETRM_DIR}/conus_mean_eta_2020-2024_albers1km.tif"
 ETRM_RUNOFF = f"{ETRM_DIR}/conus_mean_runoff_2020-2024_albers1km.tif"
+# Geology terms (the WTR ingredients the model lacked). Raw, target-blind, 100 m 5070.
+# perm_logk is GLHYMPS log10(intrinsic permeability k[m^2]) * 100 (NOT log10(m/day) --
+# see notes/WTR_FINDING.md); /100 -> log10(k m^2). With recharge + dist_to_stream +
+# hand already present, this completes the Toth R/K & water-table-ratio inputs so the
+# model can form the regime interaction itself (no explicit WTR product needed).
+GEOLOGY_DIR = "/nas/handily/covariates/geology"
+PERM_LOGK = f"{GEOLOGY_DIR}/permeability_logk_x100.tif"
+SED_THICKNESS = f"{GEOLOGY_DIR}/sediment_thickness_basinfill_m.tif"
 
 
 def sample_coarse(path: str, x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -218,6 +226,8 @@ COVARIATES = (
     "etrm_recharge_mm",
     "etrm_eta_mm",
     "etrm_runoff_mm",
+    "perm_logk_m2",
+    "sediment_thickness_m",
 )
 
 
@@ -234,6 +244,8 @@ def add_covariates(
     etrm_recharge: str = ETRM_RECHARGE,
     etrm_eta: str = ETRM_ETA,
     etrm_runoff: str = ETRM_RUNOFF,
+    perm_logk: str = PERM_LOGK,
+    sed_thickness: str = SED_THICKNESS,
 ) -> pd.DataFrame:
     """Sample the regime discriminators that separate artifact-deep from real-deep.
 
@@ -272,6 +284,10 @@ def add_covariates(
     df["etrm_recharge_mm"] = sample_coarse(etrm_recharge, x, y)
     df["etrm_eta_mm"] = sample_coarse(etrm_eta, x, y)
     df["etrm_runoff_mm"] = sample_coarse(etrm_runoff, x, y)
+    # Geology (100 m 5070). perm raw is log10(k m^2)*100 -> /100 = log10(k m^2);
+    # nodata already -> NaN by sample_coarse, so the divide never touches a sentinel.
+    df["perm_logk_m2"] = sample_coarse(perm_logk, x, y) / 100.0
+    df["sediment_thickness_m"] = sample_coarse(sed_thickness, x, y)
     for c in COVARIATES:
         n = int(df[c].notna().sum())
         log.info(
