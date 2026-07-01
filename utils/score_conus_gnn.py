@@ -584,6 +584,15 @@ def main() -> None:
             res["obs_wte_m"] = df["obs_wte_m"].to_numpy("float64")
         if "z_surf_well_m" in df.columns:
             res["z_surf_m"] = df["z_surf_well_m"].to_numpy("float64")
+        # Head residual over the regional base R (= what the GNN targets/predicts):
+        # wte_resid_obs = obs_wte - R is the residual field the model must learn; the
+        # predicted counterpart wte_resid_hat = wte_hat - R is what it produced. Carry R
+        # too so both residuals are interpretable against the base surface in QGIS.
+        if "regional_wte_idw_oof_m" in df.columns:
+            r_wte = df["regional_wte_idw_oof_m"].to_numpy("float64")
+            res["regional_wte_m"] = r_wte
+            res["wte_resid_obs_m"] = df["obs_wte_m"].to_numpy("float64") - r_wte
+            res["wte_resid_hat_m"] = df["gnn_wte_hat_m"].to_numpy("float64") - r_wte
     gres = gpd.GeoDataFrame(
         res, geometry=gpd.points_from_xy(df["x5070"], df["y5070"]), crs=5070
     )
