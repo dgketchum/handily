@@ -2219,6 +2219,33 @@ def main(argv: list[str] | None = None) -> None:
             **args.head_solve_kwargs,
         )
         heads.to_file(args.out_dir / "fac_channel_heads.fgb", driver="FlatGeobuf")
+
+        # fac_normals_streams.fgb was written above with the raw WBT-sampled
+        # Strahler labels. sample_stream_order tags each line from 3 vertices
+        # snapped to the order raster; where those miss the stream cell the
+        # label drops to 0 / a lower order, so order appears to fall
+        # downstream even though the underlying raster is monotonic. Rewrite
+        # the file with the head solve's topology-recomputed order
+        # (compute_strahler_from_topology), which is strictly non-decreasing
+        # downstream. Its internal convention is headwaters=0; shift to the
+        # standard headwaters=1 for the exported layer and keep the raw label
+        # as strahler_raw for comparison.
+        order_by_sid = dict(
+            zip(heads["stream_id"].astype(int), heads["strahler"].astype(int))
+        )
+        raw_by_sid = dict(
+            zip(heads["stream_id"].astype(int), heads["strahler_raw"].astype(int))
+        )
+        missing = set(streams["stream_id"].astype(int)) - set(order_by_sid)
+        if missing:
+            raise RuntimeError(
+                f"{len(missing)} streams missing from the head-solve topology; "
+                "cannot assign recomputed Strahler order"
+            )
+        streams["strahler_raw"] = [raw_by_sid[int(s)] for s in streams["stream_id"]]
+        streams["strahler"] = [order_by_sid[int(s)] + 1 for s in streams["stream_id"]]
+        streams.to_file(args.out_dir / "fac_normals_streams.fgb", driver="FlatGeobuf")
+
         strips_depth = _attach_fac_strip_head_depth_offset(strips, heads)
         dt = perf_counter() - t0
         depth = heads["head_depth_m"]
