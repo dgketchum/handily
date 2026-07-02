@@ -20,8 +20,10 @@ Predictors compared:
                  so NWIS wells are split out of the headline)
   * hand_cal  -- leak-free per-fold isotonic HAND->DTW calibration (does the graph
                  add anything over calibrating raw HAND directly?)
-  * ma        -- OPTIONAL per-state Ma WTD rasters (MT/NM/TX only; the canonical
-                 benchmark where it exists -- the arid regime HAND priors fail in)
+  * ma        -- per-state Ma WTD rasters auto-discovered from /nas/gwx/wtd_states
+                 (the canonical benchmark -- the arid regime HAND priors fail in);
+                 a regional coverage hole over the modeled footprint is a hard error
+                 (see assert_ma_covers_footprint), not a silent 0%
 
 Headline = non-NWIS wells; a separate NWIS panel exposes the benchmark's
 leakage-inflated skill. Also writes conus_residuals.fgb for QGIS.
@@ -51,11 +53,18 @@ HEAD_SPACE_MODES = ("wte", "wte_residual")
 
 DEPTH_BANDS = [(0, 2), (2, 5), (5, 10), (10, 30), (30, np.inf)]
 SHALLOW_THRESHOLDS = [2.0, 5.0, 10.0]
-DEFAULT_MA = [
-    "Ma_MT=/nas/gwx/wtd_states/wtd_montana.tif",
-    "Ma_NM=/nas/gwx/wtd_states/wtd_new_mexico.tif",
-    "Ma_TX=/nas/gwx/wtd_states/wtd_texas.tif",
-]
+MA_DIR = Path("/nas/gwx/wtd_states")
+
+
+def discover_ma_specs(ma_dir: Path = MA_DIR) -> list[str]:
+    """All per-state Ma WTD rasters present on disk, as LABEL=path specs.
+
+    Globs ``wtd_<state>.tif`` so any synced state is scored automatically; a
+    footprint over an un-synced state then trips assert_ma_covers_footprint rather
+    than silently reading 0% Ma there (the bug that hid NV before wtd_nevada.tif was
+    wired). All CONUS states are available to sync to ``ma_dir``.
+    """
+    return [f"Ma_{p.stem[len('wtd_') :]}={p}" for p in sorted(ma_dir.glob("wtd_*.tif"))]
 
 
 def core_metrics(pred: np.ndarray, obs: np.ndarray) -> dict:
@@ -260,6 +269,44 @@ def sample_ma(df: pd.DataFrame, specs: list[str]) -> np.ndarray:
     return out
 
 
+def assert_ma_covers_footprint(
+    df: pd.DataFrame, min_wells: int = 50, min_cov: float = 0.5
+) -> None:
+    """Fail loudly when the Ma benchmark has a regional hole over the modeled area.
+
+    Ma is a per-state raster panel, so a missing state raster shows up as an entire
+    HUC2 with ~0% Ma coverage -- exactly how NV read 0% before wtd_nevada.tif was
+    wired. Scoring against a benchmark that is absent over part of the footprint
+    understates its error and quietly drops those wells from the comparison, so a
+    regional gap is a hard error, not a silent 0%. Scattered within-state nodata
+    (lakes) stays well above ``min_cov``; only well-populated HUC2s (>= ``min_wells``)
+    are gated so a handful of edge wells in a corner of the footprint can't trip it.
+    """
+    ma = np.isfinite(df["ma"].to_numpy("float64"))
+    log.info(
+        "Ma footprint coverage: %d/%d (%.1f%%)", int(ma.sum()), len(ma), 100 * ma.mean()
+    )
+    gaps = []
+    for h2, g in df.groupby("huc2"):
+        n = len(g)
+        if n < min_wells:
+            continue
+        cov = float(np.isfinite(g["ma"].to_numpy("float64")).mean())
+        log.info("  HUC2 %s Ma coverage: %.1f%% (n=%d)", h2, 100 * cov, n)
+        if cov < min_cov:
+            gaps.append((h2, n, cov))
+    if gaps:
+        detail = ", ".join(
+            f"HUC2 {h2}: {100 * cov:.0f}% (n={n})" for h2, n, cov in gaps
+        )
+        raise SystemExit(
+            f"Ma benchmark coverage gap over the modeled footprint -- {detail}. "
+            "The Ma comparison would silently omit these regions. Sync the missing "
+            f"per-state WTD raster(s) to {MA_DIR} (all CONUS states are available on "
+            "the other machine), or pass --no-ma to score without the Ma benchmark."
+        )
+
+
 def full_panel(
     df: pd.DataFrame, predcols: list[str], obscol: str, common: list[str]
 ) -> dict:
@@ -357,7 +404,8 @@ def main() -> None:
         "--ma",
         action="append",
         default=None,
-        help="LABEL=path per-state Ma raster (repeatable); default MT/NM/TX",
+        help="LABEL=path per-state Ma raster (repeatable); "
+        "default: all wtd_<state>.tif under /nas/gwx/wtd_states",
     )
     ap.add_argument("--no-ma", action="store_true", help="skip the Ma per-state panel")
     args = ap.parse_args()
@@ -445,9 +493,10 @@ def main() -> None:
             )
         predcols.append("fusion")
 
-    ma_specs = [] if args.no_ma else (args.ma if args.ma else DEFAULT_MA)
+    ma_specs = [] if args.no_ma else (args.ma if args.ma else discover_ma_specs())
     if ma_specs:
         df["ma"] = sample_ma(df, ma_specs)
+        assert_ma_covers_footprint(df)
         predcols.append("ma")
 
     # Aquifer-router gate diagnostics (present only when the trainer ran a learned
@@ -491,7 +540,7 @@ def main() -> None:
             ma_panel = full_panel(
                 ma_cov, predcols, "obs_dtw_m", ["gnn", "regional", "janssen", "ma"]
             )
-            log_panel("Ma-covered states (MT/NM/TX), non-NWIS", ma_panel, predcols)
+            log_panel("Ma-covered footprint, non-NWIS", ma_panel, predcols)
         else:
             log.info("Ma coverage < 50 non-NWIS wells; skipping Ma sub-panel")
 
