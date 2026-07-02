@@ -308,3 +308,189 @@ def test_wet_propagation_length_mismatch_raises():
     rn, ce = _toy_reach_graph()
     with pytest.raises(SystemExit):
         bc.wet_propagation_reach_features(rn, ce, np.zeros(3, bool))
+
+
+# ---------------------------------------------------------------------------
+# Phase 6A refactors: build_down_ptr (max-drainage braid resolution) +
+# accumulate_upstream (length-weighted upstream inclusive mean via Kahn).
+# ---------------------------------------------------------------------------
+def test_build_down_ptr_braid_takes_max_drainage_and_counts():
+    rn, ce = _toy_reach_graph()
+    down_ptr, n_braids = bc.build_down_ptr(rn, ce)
+    # reach 5 braids (5->6 totda 2 vs 5->1 totda 200): keep the max-drainage parent (1).
+    assert list(down_ptr) == [1, 2, -1, 4, 1, 1, 2, 8, -1]
+    assert n_braids == 1  # only reach 5 has >1 downstream edge
+
+
+def test_accumulate_upstream_confluence_headwater_and_nan_exclusion():
+    rn, ce = _toy_reach_graph()
+    down_ptr, _ = bc.build_down_ptr(rn, ce)
+    seg_len = np.expm1(rn["log1p_length_m"].to_numpy("float64"))
+    v = (np.arange(9, dtype="float64") + 1.0) * 10.0  # 10,20,...,90
+    up = bc.accumulate_upstream(v, seg_len, down_ptr)
+    # reach 1 inclusive upstream {0,1,3,4,5}: length-weighted mean.
+    assert up[1] == pytest.approx(123000.0 / 3800.0)
+    # reach 2 inclusive upstream {0,1,2,3,4,5,6}.
+    assert up[2] == pytest.approx(174000.0 / 5100.0)
+    assert up[4] == pytest.approx(45.0)  # {3,4}
+    assert up[0] == pytest.approx(10.0)  # headwater == own value
+    assert up[8] == pytest.approx(85.0)  # fragment {7,8}
+
+    # NaN local is excluded from BOTH numerator and denominator; an all-NaN upstream -> NaN.
+    v2 = v.copy()
+    v2[3] = np.nan
+    up2 = bc.accumulate_upstream(v2, seg_len, down_ptr)
+    assert up2[1] == pytest.approx(
+        103000.0 / 3300.0
+    )  # reach 3 dropped from {0,1,3,4,5}
+    assert up2[4] == pytest.approx(50.0)  # {3,4} with 3 dropped -> just reach 4
+    assert np.isnan(up2[3])  # sole member is NaN
+
+
+def test_accumulate_upstream_matches_wet_fraction():
+    # the length-weighted upstream mean of a 0/1 wet flag IS the wet channel-length fraction.
+    rn, ce = _toy_reach_graph()
+    down_ptr, _ = bc.build_down_ptr(rn, ce)
+    seg_len = np.expm1(rn["log1p_length_m"].to_numpy("float64"))
+    wet = np.zeros(9, "float64")
+    wet[3] = 1.0
+    frac = bc.accumulate_upstream(wet, seg_len, down_ptr)
+    wf = bc.wet_propagation_reach_features(rn, ce, wet.astype(bool))
+    np.testing.assert_allclose(frac, wf["upstream_wet_fraction"].to_numpy())
+
+
+def test_accumulate_upstream_2d_columns():
+    rn, ce = _toy_reach_graph()
+    down_ptr, _ = bc.build_down_ptr(rn, ce)
+    seg_len = np.expm1(rn["log1p_length_m"].to_numpy("float64"))
+    v = (np.arange(9, dtype="float64") + 1.0) * 10.0
+    stack = np.column_stack([v, 2.0 * v])
+    up = bc.accumulate_upstream(stack, seg_len, down_ptr)
+    assert up.shape == (9, 2)
+    np.testing.assert_allclose(up[:, 1], 2.0 * up[:, 0])  # linear in the value column
+
+
+def test_accumulate_upstream_cycle_guard():
+    # a 2-node down-pointer cycle (0<->1) has no headwater -> the Kahn guard must fire.
+    with pytest.raises(RuntimeError):
+        bc.accumulate_upstream(
+            np.array([1.0, 2.0]), np.array([1.0, 1.0]), np.array([1, 0], dtype="int64")
+        )
+
+
+# ---------------------------------------------------------------------------
+# upstream_head (6B up_head site): mirror of downstream_datum walking UP the
+# max-drainage PARENT pointer to a terminal channel head.
+# ---------------------------------------------------------------------------
+def test_upstream_head_max_drainage_parent_and_fragment():
+    rn, ce = _toy_reach_graph()
+    hd = bc.upstream_head(rn, ce)
+    # reach 1's parents are 0 (totda 100), 4 (10), 5 (8): the head walk must follow the
+    # MAX-drainage parent (0), so both reach 1 and reach 2 head at reach 0. reach 6's only
+    # parent is the headwater reach 5 (edge 5->6), so it heads at 5 -- reach 7 is a
+    # disconnected fragment (7->8) and never enters reach 6's upstream walk.
+    assert list(hd["head_reach_idx"].to_numpy()) == [0, 0, 0, 3, 3, 5, 5, 7, 7]
+    np.testing.assert_allclose(
+        hd["head_dist_m"].to_numpy(), [0, 1000, 2000, 0, 500, 0, 300, 0, 400]
+    )
+    assert list(hd["head_n_hops"].to_numpy()) == [0, 1, 2, 0, 1, 0, 1, 0, 1]
+    # head attrs come from the landed head reach.
+    assert hd["head_elev_m"].to_numpy()[2] == 100.0  # reach 0 elev
+    assert hd["head_da_km2"].to_numpy()[2] == 100.0  # reach 0 totda
+    assert hd["head_reach_idx"].to_numpy()[8] == 7  # fragment head
+
+
+def test_upstream_head_requires_contiguous_reach_idx():
+    rn, ce = _toy_reach_graph()
+    rn.loc[0, "reach_node_idx"] = 99
+    with pytest.raises(SystemExit):
+        bc.upstream_head(rn, ce)
+
+
+# ---------------------------------------------------------------------------
+# serving_wet_source (6B wet site): nearest wet reach node identity + net dist,
+# checked against a brute-force per-source Dijkstra on the undirected toy graph.
+# ---------------------------------------------------------------------------
+def _brute_wet(rn, ce, wet_idx):
+    """Per-node (min-distance, argmin-source) over the undirected length-weighted graph."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import dijkstra
+
+    n = len(rn)
+    seg = np.expm1(rn["log1p_length_m"].to_numpy("float64"))
+    down = ce[ce["direction"] == 1]
+    s = down["src_reach_idx"].to_numpy("int64")
+    d = down["dst_reach_idx"].to_numpy("int64")
+    g = csr_matrix((seg[s], (s, d)), shape=(n, n))
+    dists = np.vstack([dijkstra(g, directed=False, indices=int(w)) for w in wet_idx])
+    return dists  # (len(wet_idx), n)
+
+
+def test_serving_wet_source_single_matches_wet_propagation():
+    rn, ce = _toy_reach_graph()
+    wet = np.zeros(9, bool)
+    wet[2] = True
+    serving, net = bc.serving_wet_source(rn, ce, wet)
+    # only reach 2 is wet: every reach in its component serves reach 2 at the net distance.
+    assert list(serving) == [2, 2, 2, 2, 2, 2, 2, -1, -1]
+    wf = bc.wet_propagation_reach_features(rn, ce, wet)
+    np.testing.assert_allclose(net, np.expm1(wf["log1p_net_dist_wet_m"].to_numpy()))
+    assert np.isnan(net[7]) and np.isnan(net[8])  # dry fragment component
+
+
+def test_serving_wet_source_multi_picks_nearest():
+    rn, ce = _toy_reach_graph()
+    wet = np.zeros(9, bool)
+    wet[[3, 6]] = True
+    serving, net = bc.serving_wet_source(rn, ce, wet)
+    dists = _brute_wet(rn, ce, [3, 6])
+    expected = dists.min(axis=0)
+    for i in range(7):  # reaches in the wet component
+        assert net[i] == pytest.approx(expected[i])
+        # the served reach is a wet reach that achieves the min distance.
+        assert serving[i] in (3, 6)
+        served_row = 0 if serving[i] == 3 else 1
+        assert dists[served_row, i] == pytest.approx(net[i])
+    assert serving[7] == -1 and np.isnan(net[7])  # dry fragment
+
+
+def test_serving_wet_source_no_wet_all_missing():
+    rn, ce = _toy_reach_graph()
+    serving, net = bc.serving_wet_source(rn, ce, np.zeros(9, bool))
+    assert (serving == -1).all()
+    assert np.isnan(net).all()
+
+
+# ---------------------------------------------------------------------------
+# 6A.1 sample_reach_covariates: column assembly + arithmetic (perm /100 decode,
+# ndvi_amp = jja - djf, GSW occurrence pass-through). sample_coarse is stubbed so
+# the test is about the sampler's logic, not raster IO.
+# ---------------------------------------------------------------------------
+def test_sample_reach_covariates_arithmetic(monkeypatch):
+    vals = {
+        bc.TERRAIN_MULTISCALE_RASTERS["tpi_2km"]: 1.0,
+        bc.TERRAIN_MULTISCALE_RASTERS["tpi_10km"]: 2.0,
+        bc.TERRAIN_MULTISCALE_RASTERS["twi_2km"]: 3.0,
+        bc.ETRM_RECHARGE: 4.0,
+        bc.ETRM_ETA: 5.0,
+        bc.ETRM_RUNOFF: 6.0,
+        bc.GRIDMET_AI: 7.0,
+        bc.GRIDMET_P: 8.0,
+        bc.PERM_LOGK: 1500.0,  # log10(k)x100 -> /100 = 15.0
+        bc.SED_THICKNESS: 9.0,
+        bc.NDVI_JJA: 0.8,
+        bc.NDVI_DJF: 0.3,
+    }
+    monkeypatch.setattr(
+        bc, "sample_coarse", lambda path, x, y: np.full(len(x), vals[path], "float64")
+    )
+    rcx = np.array([0.0, 100.0])  # finite EPSG:5070 rep-points
+    rcy = np.array([0.0, 100.0])
+    occ = np.array([50.0, np.nan])  # pre-sampled GSW occurrence (shared)
+    cov = bc.sample_reach_covariates(rcx, rcy, occ)
+    assert set(cov) == set(bc.REACH_COVARIATE_FEATURE_COLS)
+    np.testing.assert_allclose(cov["r_perm_logk_m2"], [15.0, 15.0])  # /100 decode
+    np.testing.assert_allclose(cov["r_ndvi_amp"], [0.5, 0.5])  # jja - djf
+    np.testing.assert_allclose(cov["r_ndvi_jja"], [0.8, 0.8])
+    np.testing.assert_allclose(cov["r_aridity_index"], [7.0, 7.0])  # gridMET (lon/lat)
+    np.testing.assert_array_equal(cov["r_gsw_occ"], occ)  # GSW pass-through (incl NaN)

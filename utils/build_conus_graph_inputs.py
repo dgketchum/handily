@@ -246,6 +246,24 @@ MS_EDGE_FEATURE_COLS = [
     "datum_is_self",  # attached reach is already a datum (0/1)
     "log1p_datum_da_km2",  # log1p(totdasqkm at the datum reach)
 ]
+# --portfolio-read (Phase 6B): per-query typed read edges DIRECT to <=4 heterogeneous
+# reference reaches (supersedes the single-purpose mainstem read). All four site types are
+# REACHES (no new node types); a missing site is simply an absent edge the trainer's
+# segment-softmax renormalizes over (the structural fix for the wet-prop missingness killer).
+PORTFOLIO_SITE_TYPES = ["ds_datum", "up_head", "wet", "ho_any"]
+PORTFOLIO_EDGE_FEATURE_COLS = [
+    "rel_elev_query_site_m",  # well land-surface - site reach elevation (load-bearing)
+    "log1p_site_dist_m",  # network sites: rank0-lateral + along-network; ho_any: Euclidean
+    "dist_is_network",  # 1 for ds_datum/up_head/wet, 0 for ho_any (Euclidean)
+    "site_order_rel",  # site streamorde - query attached-reach basin_max_order
+    "log1p_site_da_km2",  # log1p(totdasqkm at the site reach)
+    "type_ds_datum",  # one-hot site-type indicators (mutually exclusive per edge)
+    "type_up_head",
+    "type_wet",
+    "type_ho_any",
+]
+# indicator query features -- distinguish a genuinely-absent site (no edge) from a zero read.
+PORTFOLIO_MISSING_COLS = [f"portfolio_missing_{t}" for t in PORTFOLIO_SITE_TYPES]
 # --wet-propagation-features (item 5): REACH-SIDE, NETWORK-METRIC surface-water evidence
 # (distinct from the rejected query-side + Euclidean evidence bank). A per-reach GSW wet
 # flag is propagated along the FAC channel graph so every reach -- and through the convs
@@ -263,6 +281,38 @@ WET_PROP_REACH_FEATURE_COLS = [
 # §5.2 gate: the rank-0 query projection of two reach-side features, carried on the query
 # node (NOT model features) so the Phase-0a GBM gate can probe them tabularly.
 WET_PROP_QUERY_GATE_COLS = ["q_log1p_net_dist_wet_m", "q_upstream_wet_fraction"]
+# --reach-covariate-features (Phase 6A.1): a target-blind covariate bank sampled at each
+# reach's flowline rep-point (cx/cy, EPSG:5070), giving the channel node LOCAL terrain/flux/
+# geology/greenness/surface-water context. haf_* are EXCLUDED (height-above-local-floor is
+# ~0 AT a reach by construction). Materialized into reach_nodes; the trainer reads reach cols
+# from the manifest -> zero trainer change. The r_ prefix avoids query-col collisions.
+REACH_COVARIATE_FEATURE_COLS = [
+    "r_tpi_2km",  # terrace-vs-valley position at the floor (2 km)
+    "r_tpi_10km",  # regional valley size/confinement (10 km)
+    "r_twi_2km",  # moisture convergence at the reach
+    "r_etrm_recharge_mm",  # local water-balance flux regime
+    "r_etrm_eta_mm",
+    "r_etrm_runoff_mm",
+    "r_aridity_index",  # gridMET climate (4326 -> lon/lat)
+    "r_precip_mm",
+    "r_perm_logk_m2",  # GLHYMPS log10(k m^2) (/100 decode) + Pelletier sediment
+    "r_sediment_thickness_m",
+    "r_ndvi_jja",  # phreatophyte greenness ON the channel
+    "r_ndvi_amp",  # jja - djf amplitude
+    "r_gsw_occ",  # continuous GSW occurrence (not just the wet flag)
+]
+# --upstream-accumulation-features (Phase 6A.2): length-weighted upstream-catchment means of
+# the 6A.1 locals (upstream recharge is the physical driver of the table AT the reach) + the
+# ONE surviving Phase-5 column upstream_wet_fraction (always finite: 0.0 on dry catchments).
+# The Phase-5 NaN-distance columns are DELIBERATELY excluded (adjudicated missingness killer;
+# nearest-wet distance returns as the missingness-robust wet READ EDGE in 6B). Requires
+# --reach-covariate-features (upstream means accumulate the r_* locals).
+UPSTREAM_ACCUM_FEATURE_COLS = [
+    "upstream_recharge_mm",
+    "upstream_precip_mm",
+    "upstream_ndvi_jja",
+    "upstream_wet_fraction",
+]
 
 
 def load_wells_hand(path: str) -> pd.DataFrame:
@@ -595,6 +645,81 @@ def build_octant_lateral_edges(
     return out
 
 
+def build_down_ptr(rn: pd.DataFrame, ce: pd.DataFrame) -> tuple[np.ndarray, int]:
+    """Single max-drainage downstream pointer per reach (braid/diffluence resolution).
+
+    A reach with >1 downstream edge (a braid/diffluence -- expected rare) keeps the edge
+    whose dst has the largest ``totdasqkm`` (the mainstem branch). Returns
+    ``(down_ptr, n_braids)`` where ``down_ptr`` is length ``len(rn)`` int64 (-1 at a
+    component outlet). ``rn`` must be reach_node_idx-sorted 0..n-1 (the reach-graph +
+    trainer invariant); ``ce`` is ``channel_edges`` (``direction == 1`` rows are src->dst
+    downstream). Shared by ``downstream_datum`` and the upstream accumulation.
+    """
+    n = len(rn)
+    totda = rn["totdasqkm"].to_numpy("float64")
+    down = ce[ce["direction"] == 1]
+    s = down["src_reach_idx"].to_numpy("int64")
+    d = down["dst_reach_idx"].to_numpy("int64")
+    n_braids = int(len(s) - pd.unique(s).size)
+    order = np.lexsort((totda[d], s))  # ascending dst-drainage within each src
+    down_ptr = np.full(n, -1, dtype="int64")
+    down_ptr[s[order]] = d[order]  # last write per src == the max-drainage dst
+    return down_ptr, n_braids
+
+
+def accumulate_upstream(
+    values: np.ndarray,
+    seg_len: np.ndarray,
+    down_ptr: np.ndarray,
+) -> np.ndarray:
+    """Length-weighted upstream (inclusive) mean of each value column over the
+    down-pointer forest, via a Kahn topological accumulation (headwaters first).
+
+    ``values`` is (n,) or (n, k) per-reach local values (may contain NaN); ``seg_len`` is
+    the (n,) per-reach channel length used as the weight; ``down_ptr`` the single
+    max-drainage downstream pointer from :func:`build_down_ptr`. NaN locals are excluded
+    from BOTH the weighted sum and the weight sum (nan-skipping weighted mean); a reach
+    whose entire upstream catchment is NaN for a column yields NaN there. Cycle-guarded
+    (the down-pointer forest is a DAG). Returns an array shaped like ``values``.
+    """
+    n = len(down_ptr)
+    v = np.asarray(values, dtype="float64")
+    single = v.ndim == 1
+    if single:
+        v = v[:, None]
+    finite = np.isfinite(v)
+    w = np.where(np.isfinite(seg_len) & (seg_len > 0.0), seg_len, 0.0).astype("float64")
+    acc_num = np.where(finite, v * w[:, None], 0.0)  # sum of w*value over finite locals
+    acc_den = np.where(finite, w[:, None], 0.0)  # sum of w over finite locals
+    indeg = np.zeros(n, dtype="int64")
+    has_down = down_ptr >= 0
+    np.add.at(indeg, down_ptr[has_down], 1)  # #direct upstream neighbours per reach
+    remaining = indeg.copy()
+    stack = list(np.where(indeg == 0)[0])  # headwaters first (Kahn topological order)
+    processed = 0
+    while stack:
+        u = stack.pop()
+        processed += 1
+        p = down_ptr[u]
+        if p >= 0:
+            acc_num[p] += acc_num[u]
+            acc_den[p] += acc_den[u]
+            remaining[p] -= 1
+            if remaining[p] == 0:
+                stack.append(p)
+    if processed != n:
+        raise RuntimeError(
+            "accumulate_upstream: cycle in the down-pointer graph "
+            f"({processed}/{n} reaches ordered)"
+        )
+    out = np.full_like(acc_num, np.nan)
+    pos = (
+        acc_den > 0.0
+    )  # reaches with >=1 finite upstream local (else no weight -> NaN)
+    np.divide(acc_num, acc_den, out=out, where=pos)
+    return out[:, 0] if single else out
+
+
 def downstream_datum(
     rn: pd.DataFrame,
     ce: pd.DataFrame,
@@ -642,18 +767,11 @@ def downstream_datum(
     strah = rn["streamorde"].to_numpy("float64")
     basin = rn["basin"].to_numpy()
     elev = rn["reach_elev_m"].to_numpy("float64")
-    totda = rn["totdasqkm"].to_numpy("float64")
     seg_len = np.expm1(rn["log1p_length_m"].to_numpy("float64"))  # per-reach length (m)
     seg_len = np.where(np.isfinite(seg_len) & (seg_len > 0.0), seg_len, 0.0)
 
     # single downstream pointer per reach; on braids keep the max-drainage branch.
-    down = ce[ce["direction"] == 1]
-    s = down["src_reach_idx"].to_numpy("int64")
-    d = down["dst_reach_idx"].to_numpy("int64")
-    n_braids = int(len(s) - pd.unique(s).size)
-    order = np.lexsort((totda[d], s))  # ascending dst-drainage within each src
-    down_ptr = np.full(n, -1, dtype="int64")
-    down_ptr[s[order]] = d[order]  # last write per src == the max-drainage dst
+    down_ptr, n_braids = build_down_ptr(rn, ce)
 
     basin_max = np.full(n, np.nan)
     for b in np.unique(basin):
@@ -868,37 +986,13 @@ def wet_propagation_reach_features(
     dd = downstream_datum(rn, channel_edges, stop_mask=wet)
     ds_dist = dd["datum_dist_m"].to_numpy("float64")
 
-    # --- upstream wet fraction: topological accumulation over the down-pointer forest --
-    # Single max-drainage downstream pointer per reach (same braid resolution as the walk).
-    n_braids = int(len(s) - pd.unique(s).size)
-    totda = rn["totdasqkm"].to_numpy("float64")
-    order = np.lexsort((totda[d], s))
-    down_ptr = np.full(n, -1, dtype="int64")
-    down_ptr[s[order]] = d[order]
-    indeg = np.zeros(n, dtype="int64")
-    has_down = down_ptr >= 0
-    np.add.at(indeg, down_ptr[has_down], 1)  # #direct upstream neighbours per reach
-    acc_wet = seg_len * wet.astype("float64")  # inclusive of the reach itself
-    acc_tot = seg_len.copy()
-    remaining = indeg.copy()
-    stack = list(np.where(indeg == 0)[0])  # headwaters first (Kahn topological order)
-    processed = 0
-    while stack:
-        u = stack.pop()
-        processed += 1
-        p = down_ptr[u]
-        if p >= 0:
-            acc_wet[p] += acc_wet[u]
-            acc_tot[p] += acc_tot[u]
-            remaining[p] -= 1
-            if remaining[p] == 0:
-                stack.append(p)
-    if processed != n:
-        raise RuntimeError(
-            "upstream_wet_fraction: cycle in the down-pointer graph "
-            f"({processed}/{n} reaches ordered)"
-        )
-    upstream_wet_fraction = np.where(acc_tot > 0.0, acc_wet / acc_tot, np.nan)
+    # --- upstream wet fraction: length-weighted accumulation over the down-pointer forest
+    # (a DAG; braid resolution + cycle guard live in the shared helpers). The length-
+    # weighted upstream mean of the 0/1 wet flag IS the wet channel-length fraction.
+    down_ptr, n_braids = build_down_ptr(rn, channel_edges)
+    upstream_wet_fraction = accumulate_upstream(
+        wet.astype("float64"), seg_len, down_ptr
+    )
 
     for order_lab in sorted(rn["streamorde"].dropna().unique()):
         m = rn["streamorde"].to_numpy("float64") == order_lab
@@ -932,6 +1026,134 @@ def wet_propagation_reach_features(
         },
         index=pd.Index(np.arange(n, dtype="int64"), name="reach_node_idx"),
     )
+
+
+def upstream_head(rn: pd.DataFrame, ce: pd.DataFrame) -> pd.DataFrame:
+    """Per-reach farthest-upstream channel head along the max-drainage UP-pointer.
+
+    The 6B ``up_head`` reference site (the recharge-boundary end of the attached flowpath):
+    a MIRROR of :func:`downstream_datum` walking UP instead of down. Build a single
+    up-pointer per reach via the mirrored lexsort ``np.lexsort((totda[s], d))`` (last-write-
+    wins == the max-``totdasqkm`` PARENT per dst -- the mainstem-upstream branch), then step
+    each reach up that pointer until ``up_ptr == -1`` (a channel head with no parent). Every
+    reach reaches a head (itself if already terminal), so there is no missing flag.
+
+    ``rn`` must be reach_node_idx-contiguous 0..n-1; ``ce`` is ``channel_edges``. Returns a
+    DataFrame indexed by ``reach_node_idx`` with head_reach_idx / head_dist_m / head_elev_m /
+    head_order / head_da_km2 / head_n_hops.
+    """
+    rn = rn.sort_values("reach_node_idx").reset_index(drop=True)
+    n = len(rn)
+    if not (rn["reach_node_idx"].to_numpy("int64") == np.arange(n)).all():
+        raise SystemExit("upstream_head: reach_node_idx must be contiguous 0..n-1")
+    totda = rn["totdasqkm"].to_numpy("float64")
+    strah = rn["streamorde"].to_numpy("float64")
+    elev = rn["reach_elev_m"].to_numpy("float64")
+    seg_len = np.expm1(rn["log1p_length_m"].to_numpy("float64"))
+    seg_len = np.where(np.isfinite(seg_len) & (seg_len > 0.0), seg_len, 0.0)
+
+    down = ce[ce["direction"] == 1]
+    s = down["src_reach_idx"].to_numpy("int64")
+    d = down["dst_reach_idx"].to_numpy("int64")
+    up_ptr = np.full(n, -1, dtype="int64")
+    order = np.lexsort((totda[s], d))  # ascending src-drainage within each dst
+    up_ptr[d[order]] = s[order]  # last write per dst == the max-drainage parent
+
+    head_idx = np.arange(n, dtype="int64")  # a reach with up_ptr==-1 is its own head
+    head_dist = np.zeros(n, dtype="float64")
+    head_hops = np.zeros(n, dtype="int64")
+    cur = np.arange(n, dtype="int64")
+    active = up_ptr[cur] >= 0
+    guard = 0
+    while active.any():
+        guard += 1
+        if guard > 5000:
+            raise RuntimeError(
+                "upstream_head did not converge in 5000 steps (cycle in up-pointer graph?)"
+            )
+        head_dist[active] += seg_len[cur[active]]  # length of the reach being left
+        head_hops[active] += 1
+        cur[active] = up_ptr[cur[active]]  # step up (all active have up_ptr >= 0)
+        head_idx[active] = cur[active]
+        active = active & (
+            up_ptr[cur] >= 0
+        )  # continue while the new reach has a parent
+    log.info(
+        "upstream_head: hops med/p90 %.0f/%.0f, dist med/p90 %.0f/%.0f m, %d self-heads",
+        float(np.median(head_hops)),
+        float(np.percentile(head_hops, 90)),
+        float(np.median(head_dist)),
+        float(np.percentile(head_dist, 90)),
+        int((head_hops == 0).sum()),
+    )
+    return pd.DataFrame(
+        {
+            "head_reach_idx": head_idx,
+            "head_dist_m": head_dist,
+            "head_elev_m": elev[head_idx],
+            "head_order": strah[head_idx],
+            "head_da_km2": totda[head_idx],
+            "head_n_hops": head_hops,
+        },
+        index=pd.Index(np.arange(n, dtype="int64"), name="reach_node_idx"),
+    )
+
+
+def serving_wet_source(
+    rn: pd.DataFrame, ce: pd.DataFrame, wet: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-reach nearest wet reach along the UNDIRECTED length-weighted channel network,
+    plus the along-network distance to it (the 6B ``wet`` reference site).
+
+    Mirrors the super-source Dijkstra of :func:`wet_propagation_reach_features` (which
+    returns only the DISTANCE) but resolves the SOURCE identity of each shortest path via
+    ``return_predecessors``: walk predecessors toward the weight-0 super-source, resolving
+    nodes in ascending-distance order (a node's predecessor is always closer to the source,
+    hence already resolved). This lets a query READ the wet reach node's learned state, not
+    just its distance -- the missingness-robust return of item-5's physics as an edge.
+
+    Returns ``(serving, net_dist)``, both reach_node_idx-indexed 0..n-1: ``serving`` is the
+    wet reach idx ending each shortest path (-1 in a component with no wet reach -- NEVER
+    imputed); ``net_dist`` the along-network distance (NaN where serving == -1).
+    """
+    rn = rn.sort_values("reach_node_idx").reset_index(drop=True)
+    n = len(rn)
+    if not (rn["reach_node_idx"].to_numpy("int64") == np.arange(n)).all():
+        raise SystemExit("serving_wet_source: reach_node_idx must be contiguous 0..n-1")
+    wet = np.asarray(wet, dtype=bool)
+    if len(wet) != n:
+        raise SystemExit("serving_wet_source: wet mask length != n reaches")
+    seg_len = np.expm1(rn["log1p_length_m"].to_numpy("float64"))
+    seg_len = np.where(np.isfinite(seg_len) & (seg_len > 0.0), seg_len, 0.0)
+    down = ce[ce["direction"] == 1]
+    s = down["src_reach_idx"].to_numpy("int64")
+    d = down["dst_reach_idx"].to_numpy("int64")
+    w = seg_len[s]
+    w = np.where(np.isfinite(w) & (w > 0.0), w, 1.0)  # edge weight = src reach length
+    wet_idx = np.where(wet)[0]
+    serving = np.full(n, -1, dtype="int64")
+    net_dist = np.full(n, np.nan)
+    if len(wet_idx) == 0:
+        return serving, net_dist
+    super_idx = n
+    rows = np.concatenate([s, wet_idx])
+    cols = np.concatenate([d, np.full(len(wet_idx), super_idx)])
+    data = np.concatenate([w, np.zeros(len(wet_idx))])
+    g = csr_matrix((data, (rows, cols)), shape=(n + 1, n + 1))
+    dist, pred = dijkstra(
+        g, directed=False, indices=super_idx, return_predecessors=True
+    )
+    # Resolve the serving wet reach per node. A wet reach's predecessor IS the super-source
+    # (0-weight edge); a non-wet reach inherits its predecessor's source. Ascending distance
+    # guarantees the predecessor (strictly closer to super, internal weights > 0) is resolved.
+    for i in np.argsort(dist[:n]):
+        di = dist[i]
+        if not np.isfinite(di):
+            continue  # unreachable: no wet reach in this component -> stays -1 / NaN
+        p = pred[i]
+        serving[i] = i if p == super_idx else serving[p]
+        net_dist[i] = di
+    return serving, net_dist
 
 
 def sample_relief_etrm(
@@ -1031,6 +1253,79 @@ def _sample_gsw_occurrence(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
                 vals[vals == ds.nodata] = np.nan
             out[ins] = vals
     return out
+
+
+def reach_reppoint_coords(
+    reach_nodes: pd.DataFrame, geom: pd.DataFrame
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rep-point (cx, cy) EPSG:5070 per reach, reach_node_idx-indexed (0..n-1); NaN where a
+    reach has no flowline rep-point in ``geom``. Rep-points are reach_node_idx-keyed in
+    ``geom`` (``cx``/``cy``); the scatter yields a reach_node_idx-indexed array regardless
+    of ``reach_nodes`` row order (the reach graph guarantees contiguous 0..n-1)."""
+    n = len(reach_nodes)
+    rcx = np.full(n, np.nan)
+    rcy = np.full(n, np.nan)
+    gidx = geom["reach_node_idx"].to_numpy("int64")
+    rcx[gidx] = geom["cx"].to_numpy("float64")
+    rcy[gidx] = geom["cy"].to_numpy("float64")
+    return rcx, rcy
+
+
+def sample_reach_gsw_occ(rcx: np.ndarray, rcy: np.ndarray) -> np.ndarray:
+    """JRC GSW occurrence (0-100) at reach rep-points (EPSG:5070 in, reach_node_idx-indexed).
+
+    Shared by 6A.1 (r_gsw_occ), 6A.2 (the wet mask for upstream_wet_fraction), and 6B (the
+    wet reference site) so the GSW tiles are sampled once. NaN where a reach lacks a
+    rep-point or the point falls outside every cached 10-deg GSW tile.
+    """
+    from pyproj import (
+        Transformer,
+    )  # local: heavy import only when a GSW consumer is built
+
+    occ = np.full(len(rcx), np.nan)
+    finite = np.isfinite(rcx) & np.isfinite(rcy)
+    if finite.any():
+        lon, lat_deg = Transformer.from_crs(5070, 4326, always_xy=True).transform(
+            rcx[finite], rcy[finite]
+        )
+        occ[finite] = _sample_gsw_occurrence(lon, lat_deg)
+    return occ
+
+
+def sample_reach_covariates(
+    rcx: np.ndarray, rcy: np.ndarray, occ: np.ndarray
+) -> dict[str, np.ndarray]:
+    """The 6A.1 REACH_COVARIATE_FEATURE_COLS at reach rep-points (EPSG:5070, reach_node_idx-
+    indexed). ``occ`` is the pre-sampled GSW occurrence (shared with the wet mask, so the
+    GSW tiles are read once). All rasters are target-blind; gridMET is EPSG:4326 (transform
+    to lon/lat) and perm decodes /100 exactly as the query side (B: sample_relief_etrm)."""
+    from pyproj import Transformer
+
+    lon = np.full(len(rcx), np.nan)
+    lat_deg = np.full(len(rcx), np.nan)
+    finite = np.isfinite(rcx) & np.isfinite(rcy)
+    if finite.any():
+        lo, la = Transformer.from_crs(5070, 4326, always_xy=True).transform(
+            rcx[finite], rcy[finite]
+        )
+        lon[finite], lat_deg[finite] = lo, la
+    jja = sample_coarse(NDVI_JJA, rcx, rcy)
+    djf = sample_coarse(NDVI_DJF, rcx, rcy)
+    return {
+        "r_tpi_2km": sample_coarse(TERRAIN_MULTISCALE_RASTERS["tpi_2km"], rcx, rcy),
+        "r_tpi_10km": sample_coarse(TERRAIN_MULTISCALE_RASTERS["tpi_10km"], rcx, rcy),
+        "r_twi_2km": sample_coarse(TERRAIN_MULTISCALE_RASTERS["twi_2km"], rcx, rcy),
+        "r_etrm_recharge_mm": sample_coarse(ETRM_RECHARGE, rcx, rcy),
+        "r_etrm_eta_mm": sample_coarse(ETRM_ETA, rcx, rcy),
+        "r_etrm_runoff_mm": sample_coarse(ETRM_RUNOFF, rcx, rcy),
+        "r_aridity_index": sample_coarse(GRIDMET_AI, lon, lat_deg),
+        "r_precip_mm": sample_coarse(GRIDMET_P, lon, lat_deg),
+        "r_perm_logk_m2": sample_coarse(PERM_LOGK, rcx, rcy) / 100.0,
+        "r_sediment_thickness_m": sample_coarse(SED_THICKNESS, rcx, rcy),
+        "r_ndvi_jja": jja,
+        "r_ndvi_amp": jja - djf,
+        "r_gsw_occ": occ,
+    }
 
 
 def dist_to_wet_reach(
@@ -1384,6 +1679,40 @@ def main() -> None:
         default=8,
         help="number of azimuthal sectors for --octant-lateral (8 = octants)",
     )
+    ap.add_argument(
+        "--reach-covariate-features",
+        action="store_true",
+        help="(Phase 6A.1) sample a target-blind covariate bank (TPI/TWI, ETRM flux, "
+        "gridMET climate, GLHYMPS perm + sediment, MODIS NDVI, GSW occurrence) at each "
+        "reach's flowline rep-point and MATERIALIZE the augmented reach_nodes.parquet. "
+        "haf_* excluded (~0 at a reach by construction). Any column >2%% NaN is DROPPED "
+        "with a warning (only raster nodata at a rep-point is tolerated). The trainer reads "
+        "reach cols from the manifest -> zero trainer change. See notes/GNN_PHASE6_PLAN.md "
+        "6A.1.",
+    )
+    ap.add_argument(
+        "--upstream-accumulation-features",
+        action="store_true",
+        help="(Phase 6A.2, requires --reach-covariate-features) add length-weighted "
+        "upstream-catchment means of the 6A.1 locals (upstream_recharge_mm/precip_mm/"
+        "ndvi_jja -- recharge upstream is the physical driver of the table AT the reach) + "
+        "upstream_wet_fraction (the ONE always-finite Phase-5 survivor; the NaN-distance "
+        "columns are excluded). Kahn accumulation over the max-drainage down-pointer. See "
+        "notes/GNN_PHASE6_PLAN.md 6A.2.",
+    )
+    ap.add_argument(
+        "--portfolio-read",
+        action="store_true",
+        help="(Phase 6B) build per-query typed read edges DIRECT to up to 4 heterogeneous "
+        "reference reaches -- ds_datum (first downstream mainstem-band reach), up_head "
+        "(farthest-upstream reach on the attached flowpath), wet (nearest downstream "
+        "GSW-wet reach), and ho_any (nearest high-order reach by Euclidean distance, the "
+        "NV closed-basin fallback where downstream never reaches a datum). A missing site "
+        "is simply an ABSENT edge the trainer's segment-softmax renormalizes over (the "
+        "structural fix for the wet-propagation missingness killer). Writes "
+        "portfolio_edges.parquet + per-type portfolio_missing_* query flags; requires "
+        "channel_edges + reach rep-points. See notes/GNN_PHASE6_PLAN.md 6B.",
+    )
     args = ap.parse_args()
     gdir = Path(args.graph_dir)
     if args.evidence_features and args.target != TARGET_WTE_RESIDUAL:
@@ -1411,14 +1740,36 @@ def main() -> None:
             "--ds-datum-features is wired into the wte_residual query bank only; "
             f"got target={args.target}"
         )
+    if args.reach_covariate_features and args.target != TARGET_WTE_RESIDUAL:
+        raise SystemExit(
+            "--reach-covariate-features is wired into the wte_residual bundle only; "
+            f"got target={args.target}"
+        )
+    if args.upstream_accumulation_features and not args.reach_covariate_features:
+        raise SystemExit(
+            "--upstream-accumulation-features requires --reach-covariate-features "
+            "(the upstream means accumulate the 6A.1 local r_* covariates)"
+        )
+    if args.portfolio_read and args.target != TARGET_WTE_RESIDUAL:
+        raise SystemExit(
+            "--portfolio-read is wired into the wte_residual bundle only; "
+            f"got target={args.target}"
+        )
+    reach_cov_rasters = ["tpi_2km", "tpi_10km", "twi_2km"]
     missing_terr = (
         [p for p in TERRAIN_MULTISCALE_RASTERS.values() if not Path(p).exists()]
         if args.terrain_multiscale_features
+        else [
+            TERRAIN_MULTISCALE_RASTERS[c]
+            for c in reach_cov_rasters
+            if not Path(TERRAIN_MULTISCALE_RASTERS[c]).exists()
+        ]
+        if args.reach_covariate_features
         else []
     )
     if missing_terr:
         raise SystemExit(
-            "--terrain-multiscale-features: missing terrain rasters "
+            "missing terrain rasters "
             f"(build with build_terrain_covariates.py --only haf,twi_multiscale,wbt): {missing_terr}"
         )
 
@@ -1942,9 +2293,15 @@ def main() -> None:
     ds_datum_block = None
     mainstem_read_block = None
     channel_edges = None
-    if args.ds_datum_features or args.mainstem_read or args.wet_propagation_features:
+    if (
+        args.ds_datum_features
+        or args.mainstem_read
+        or args.wet_propagation_features
+        or args.upstream_accumulation_features
+        or args.portfolio_read
+    ):
         channel_edges = pd.read_parquet(gdir / "channel_edges.parquet")
-    if args.ds_datum_features or args.mainstem_read:
+    if args.ds_datum_features or args.mainstem_read or args.portfolio_read:
         order_band = int(reach_manifest.get("mainstem_order_band", 1))
         dd = downstream_datum(reach_nodes, channel_edges, order_band=order_band)
         proj = project_datum_to_queries(dd, lat, reach_nodes, well_surf_m)
@@ -2035,43 +2392,39 @@ def main() -> None:
             ),
         }
 
-    # --- network-propagated wet/dry evidence (item 5) --------------------------------
-    # REACH-side + NETWORK-metric surface-water evidence: sample a per-reach GSW wet flag
-    # at the flowline rep-points, propagate it along the FAC channel graph, and write an
-    # AUGMENTED (materialized) reach_nodes.parquet. The trainer reads reach cols from the
-    # manifest, so extending reach_feature_cols is the only wiring needed.
+    # --- reach-side augmentation (materialized reach_nodes) --------------------------
+    # Shared rep-point coords + GSW occurrence (sampled ONCE for item-5 wet-prop, 6A.1
+    # covariates, 6A.2 upstream wet fraction, and the 6B wet reference site). Any block that
+    # mutates reach_nodes flips reach_augmented so the augmented parquet is materialized once.
     reach_feature_cols_out = list(reach_manifest["reach_feature_cols"])
+    reach_augmented = False
+    rn_idx = reach_nodes["reach_node_idx"].to_numpy("int64")
+    rcx = rcy = reach_occ = None
+    n_no_rep = 0
+    if (
+        args.wet_propagation_features
+        or args.reach_covariate_features
+        or args.portfolio_read
+    ):
+        rcx, rcy = reach_reppoint_coords(reach_nodes, geom)  # reach_node_idx-indexed
+        reach_occ = sample_reach_gsw_occ(rcx, rcy)  # 0-100, reach_node_idx-indexed
+        n_no_rep = int((~(np.isfinite(rcx) & np.isfinite(rcy))).sum())
+        log.info(
+            "reach rep-points: %d/%d reaches lack a rep-point (raster samples -> NaN there)",
+            n_no_rep,
+            len(reach_nodes),
+        )
+
+    # item 5 (frozen; NO-GO, kept for reproducibility) -------------------------------------
     wet_propagation_block = None
     if args.wet_propagation_features:
-        from pyproj import Transformer  # local: heavy import only when item 5 is built
-
-        n_reach = len(reach_nodes)
-        rn_idx = reach_nodes["reach_node_idx"].to_numpy("int64")
-        rcx = np.full(n_reach, np.nan)
-        rcy = np.full(n_reach, np.nan)
-        gidx = geom["reach_node_idx"].to_numpy("int64")
-        rcx[gidx] = geom["cx"].to_numpy(
-            "float64"
-        )  # rep-points are reach_node_idx-keyed
-        rcy[gidx] = geom["cy"].to_numpy("float64")
-        finite = np.isfinite(rcx) & np.isfinite(rcy)
-        occ = np.full(n_reach, np.nan)
-        if finite.any():
-            lon, lat_deg = Transformer.from_crs(5070, 4326, always_xy=True).transform(
-                rcx[finite], rcy[finite]
-            )
-            occ[finite] = _sample_gsw_occurrence(lon, lat_deg)
-        wet = np.isfinite(occ) & (occ >= args.gsw_wet_threshold)
-        log.info(
-            "wet-propagation: %d/%d reaches lack a rep-point (no GSW sample -> not wet)",
-            int((~finite).sum()),
-            n_reach,
-        )
+        wet = np.isfinite(reach_occ) & (reach_occ >= args.gsw_wet_threshold)
         # helper is reach_node_idx-indexed (0..n-1); align back to reach_nodes' row order.
         wetfeat = wet_propagation_reach_features(reach_nodes, channel_edges, wet)
         for c in WET_PROP_REACH_FEATURE_COLS:
             reach_nodes[c] = wetfeat[c].reindex(rn_idx).to_numpy()
         reach_feature_cols_out = reach_feature_cols_out + WET_PROP_REACH_FEATURE_COLS
+        reach_augmented = True
 
         # §5.2 gate projection: rank-0 attached-reach value onto each query (net-dist adds
         # the well's own lateral distance; fraction is a straight gather). Carried for the
@@ -2096,18 +2449,6 @@ def main() -> None:
         q_upfrac[have] = upfrac[reach0[have]]
         wells["q_log1p_net_dist_wet_m"] = np.log1p(q_net)
         wells["q_upstream_wet_fraction"] = q_upfrac
-
-        # Materialize the augmented reach_nodes. The bundle's reach_nodes.parquet may be a
-        # SYMLINK to the shared statewide reach graph -- unlink FIRST so we replace the
-        # link with a bundle-local file instead of clobbering shared data through it.
-        rn_path = gdir / "reach_nodes.parquet"
-        if rn_path.is_symlink():
-            log.info(
-                "materializing augmented reach_nodes (was a symlink -> %s)",
-                rn_path.readlink(),
-            )
-            rn_path.unlink()
-        reach_nodes.to_parquet(rn_path)
         wet_propagation_block = {
             "gsw_wet_threshold_pct": args.gsw_wet_threshold,
             "gsw_occurrence_dir": str(GSW_OCC_DIR),
@@ -2115,7 +2456,7 @@ def main() -> None:
             "no_wet_component_fraction": float(
                 reach_nodes["no_wet_in_component"].mean()
             ),
-            "reaches_without_reppoint": int((~finite).sum()),
+            "reaches_without_reppoint": n_no_rep,
             "reach_feature_cols_added": WET_PROP_REACH_FEATURE_COLS,
             "query_gate_cols": WET_PROP_QUERY_GATE_COLS,
             "reach_nodes_materialized": True,
@@ -2126,6 +2467,288 @@ def main() -> None:
                 "fractions/flags of an OBSERVABLE surface-water layer (target-blind, no "
                 "head/elevation) -> leak-free. The two q_* columns are the rank-0 "
                 "projection for the tabular gate only (not model features)."
+            ),
+        }
+
+    # Phase 6A.1: covariate bank at reach rep-points --------------------------------------
+    reach_covariates_block = None
+    reach_cov = None  # raw covariate arrays (reach_node_idx-indexed), reused by 6A.2
+    if args.reach_covariate_features:
+        reach_cov = sample_reach_covariates(rcx, rcy, reach_occ)
+        nan_frac = {c: float(np.isnan(v).mean()) for c, v in reach_cov.items()}
+        log.info(
+            "6A.1 reach-covariate NaN fractions: %s",
+            " ".join(f"{c}={f:.3f}" for c, f in nan_frac.items()),
+        )
+        # Finiteness rule (the Phase-5 lesson): only raster nodata at a rep-point is
+        # tolerated; a column >2% NaN is DROPPED, never shipped as a Phase-5-style hole.
+        dropped = [c for c, f in nan_frac.items() if f > 0.02]
+        for c in dropped:
+            log.warning(
+                "6A.1: dropping reach covariate %s (%.3f NaN > 2%%)", c, nan_frac[c]
+            )
+        kept_cols = [c for c in REACH_COVARIATE_FEATURE_COLS if c not in dropped]
+        for c in kept_cols:
+            reach_nodes[c] = reach_cov[c][
+                rn_idx
+            ]  # reach_node_idx -> reach_nodes row order
+        reach_feature_cols_out = reach_feature_cols_out + kept_cols
+        reach_augmented = True
+        reach_covariates_block = {
+            "cols": kept_cols,
+            "dropped_cols": dropped,
+            "nan_fraction_by_col": nan_frac,
+            "samplers": "sample_coarse (5070 rasters) + gridMET 4326 transform + GSW tiles",
+            "reaches_without_reppoint": n_no_rep,
+            "leakage_note": (
+                "all rep-point covariate rasters are target-blind (terrain position, ETRM "
+                "flux, gridMET climate, GLHYMPS perm + Pelletier sediment, MODIS NDVI, GSW "
+                "occurrence). No head/elevation/target -> leak-free (mirrors the query bank)."
+            ),
+        }
+
+    # Phase 6A.2: length-weighted upstream-catchment means of the 6A.1 locals -------------
+    upstream_accum_block = None
+    if args.upstream_accumulation_features:
+        rn_sorted = reach_nodes.sort_values(
+            "reach_node_idx"
+        )  # reach_node_idx order (0..n-1)
+        down_ptr, _ = build_down_ptr(rn_sorted, channel_edges)
+        seg_len = np.expm1(rn_sorted["log1p_length_m"].to_numpy("float64"))
+        seg_len = np.where(np.isfinite(seg_len) & (seg_len > 0.0), seg_len, 0.0)
+        wet_local = (
+            np.isfinite(reach_occ) & (reach_occ >= args.gsw_wet_threshold)
+        ).astype("float64")
+        # accumulate the raw 6A.1 locals (nan-skipping); recharge upstream drives the table.
+        local_stack = np.column_stack(
+            [
+                reach_cov["r_etrm_recharge_mm"],
+                reach_cov["r_precip_mm"],
+                reach_cov["r_ndvi_jja"],
+                wet_local,
+            ]
+        )
+        up = accumulate_upstream(
+            local_stack, seg_len, down_ptr
+        )  # (n, 4) reach_node_idx-idx
+        up_cols = dict(zip(UPSTREAM_ACCUM_FEATURE_COLS, up.T))
+        nan_frac_up = {c: float(np.isnan(v).mean()) for c, v in up_cols.items()}
+        log.info(
+            "6A.2 upstream-accum NaN fractions: %s",
+            " ".join(f"{c}={f:.3f}" for c, f in nan_frac_up.items()),
+        )
+        dropped_up = [c for c, f in nan_frac_up.items() if f > 0.02]
+        for c in dropped_up:
+            log.warning("6A.2: dropping %s (%.3f NaN > 2%%)", c, nan_frac_up[c])
+        kept_up = [c for c in UPSTREAM_ACCUM_FEATURE_COLS if c not in dropped_up]
+        for c in kept_up:
+            reach_nodes[c] = up_cols[c][rn_idx]
+        reach_feature_cols_out = reach_feature_cols_out + kept_up
+        reach_augmented = True
+        upstream_accum_block = {
+            "cols": kept_up,
+            "dropped_cols": dropped_up,
+            "nan_fraction_by_col": nan_frac_up,
+            "gsw_wet_threshold_pct": args.gsw_wet_threshold,
+            "note": (
+                "length-weighted upstream-catchment means (Kahn accumulation over the "
+                "max-drainage down-pointer, nan-skipping) of the 6A.1 recharge/precip/ndvi "
+                "locals + upstream_wet_fraction (always finite: 0.0 on dry catchments). "
+                "Phase-5 NaN-distance columns are excluded (adjudicated missingness killer)."
+            ),
+        }
+
+    # Centralized materialization: if any reach block (item-5 / 6A.1 / 6A.2) added columns,
+    # write the augmented reach_nodes ONCE. The bundle's reach_nodes.parquet may be a SYMLINK
+    # to the shared statewide reach graph -- unlink FIRST so we replace the link with a
+    # bundle-local file instead of clobbering shared data through it.
+    if reach_augmented:
+        reach_feature_cols_out = list(dict.fromkeys(reach_feature_cols_out))  # dedup
+        rn_path = gdir / "reach_nodes.parquet"
+        if rn_path.is_symlink():
+            log.info(
+                "materializing augmented reach_nodes (was a symlink -> %s)",
+                rn_path.readlink(),
+            )
+            rn_path.unlink()
+        reach_nodes.to_parquet(rn_path)
+
+    # Phase 6B: reference-site portfolio read -- per-query typed edges DIRECT to <=4 -------
+    # heterogeneous reference reaches (ds_datum / up_head / wet / ho_any). A missing site is
+    # an ABSENT edge the trainer's segment-softmax renormalizes over; per-type indicators tell
+    # the head an absent site from a zero read. dd/proj/order_band are from the gate above.
+    portfolio_read_block = None
+    if args.portfolio_read:
+        qidx = wells["query_node_idx"].to_numpy("int64")
+        have = (
+            proj["reach0"] >= 0
+        )  # every well has a rank-0 lateral attachment in practice
+        reach0 = np.where(
+            have, proj["reach0"], 0
+        )  # safe index; always masked by `have`
+        lat0 = proj["lat0"]
+        basin_max_q = proj["basin_max_order"]
+        rn_sorted = reach_nodes.sort_values("reach_node_idx")
+        r_elev_arr = rn_sorted["reach_elev_m"].to_numpy("float64")
+        r_strah_arr = rn_sorted["streamorde"].to_numpy("float64")
+        r_totda_arr = rn_sorted["totdasqkm"].to_numpy("float64")
+
+        # ds_datum: reuse the rank-0 projection (present where the downstream walk landed).
+        ds_present = proj["datum_reach_idx"] >= 0
+        ds_site = np.where(ds_present, proj["datum_reach_idx"], 0)
+        ds_elev = proj["datum_elev"]
+        ds_dist = lat0 + proj["datum_dist"]
+        ds_order = proj["datum_order"]
+        ds_da = proj["datum_da"]
+
+        # up_head: farthest-upstream head on the attached flowpath (always exists for reach0).
+        hd = upstream_head(reach_nodes, channel_edges)
+        head_reach_arr = hd["head_reach_idx"].to_numpy("int64")
+        up_present = have
+        up_site = head_reach_arr[reach0]
+        up_elev = hd["head_elev_m"].to_numpy("float64")[reach0]
+        up_dist = lat0 + hd["head_dist_m"].to_numpy("float64")[reach0]
+        up_order = hd["head_order"].to_numpy("float64")[reach0]
+        up_da = hd["head_da_km2"].to_numpy("float64")[reach0]
+
+        # wet: nearest wet reach along the network, resolved to its node identity (missingness-
+        # robust return of item-5's physics as an EDGE). reach_occ/rcx from the shared block.
+        wet_mask = np.isfinite(reach_occ) & (reach_occ >= args.gsw_wet_threshold)
+        serving, net_dist_wet = serving_wet_source(reach_nodes, channel_edges, wet_mask)
+        serv_q = np.where(have, serving[reach0], -1)
+        wet_present = have & (serv_q >= 0)
+        wet_site = np.where(serv_q >= 0, serv_q, 0)
+        wet_elev = r_elev_arr[wet_site]
+        wet_dist = lat0 + net_dist_wet[reach0]
+        wet_order = r_strah_arr[wet_site]
+        wet_da = r_totda_arr[wet_site]
+
+        # ho_any: nearest high-order reach by EUCLIDEAN distance in ANY direction (deliberately
+        # cross-basin -- the NV closed-basin fallback where downstream never reaches high order).
+        ho_ok = dd["datum_is_self"].to_numpy(bool) & np.isfinite(rcx) & np.isfinite(rcy)
+        ho_cand = np.where(ho_ok)[0]
+        if len(ho_cand) == 0:
+            raise SystemExit(
+                "portfolio-read: no high-order reach has a rep-point (ho_any empty)"
+            )
+        ho_tree = cKDTree(np.column_stack([rcx[ho_cand], rcy[ho_cand]]))
+        ho_dist, ho_pos = ho_tree.query(xy, k=1)
+        ho_site = ho_cand[ho_pos]
+        ho_present = np.isfinite(
+            ho_dist
+        )  # finite for every well with a rep-point candidate
+        ho_elev = r_elev_arr[ho_site]
+        ho_order = r_strah_arr[ho_site]
+        ho_da = r_totda_arr[ho_site]
+
+        def portfolio_rows(site_type, site, elev, dist, is_network, order, da, present):
+            oh = {t: float(t == site_type) for t in PORTFOLIO_SITE_TYPES}
+            m = present
+            return pd.DataFrame(
+                {
+                    "query_node_idx": qidx[m],
+                    "reach_node_idx": site[m].astype("int64"),
+                    "site_type": site_type,
+                    "rel_elev_query_site_m": (well_surf_m - elev)[m],
+                    "log1p_site_dist_m": np.log1p(np.clip(dist, 0, None))[m],
+                    "dist_is_network": np.full(int(m.sum()), float(is_network)),
+                    "site_order_rel": (order - basin_max_q)[m],
+                    "log1p_site_da_km2": np.log1p(np.clip(da, 0, None))[m],
+                    "type_ds_datum": oh["ds_datum"],
+                    "type_up_head": oh["up_head"],
+                    "type_wet": oh["wet"],
+                    "type_ho_any": oh["ho_any"],
+                }
+            )
+
+        pf = (
+            pd.concat(
+                [
+                    portfolio_rows(
+                        "ds_datum",
+                        ds_site,
+                        ds_elev,
+                        ds_dist,
+                        1,
+                        ds_order,
+                        ds_da,
+                        ds_present,
+                    ),
+                    portfolio_rows(
+                        "up_head",
+                        up_site,
+                        up_elev,
+                        up_dist,
+                        1,
+                        up_order,
+                        up_da,
+                        up_present,
+                    ),
+                    portfolio_rows(
+                        "wet",
+                        wet_site,
+                        wet_elev,
+                        wet_dist,
+                        1,
+                        wet_order,
+                        wet_da,
+                        wet_present,
+                    ),
+                    portfolio_rows(
+                        "ho_any",
+                        ho_site,
+                        ho_elev,
+                        ho_dist,
+                        0,
+                        ho_order,
+                        ho_da,
+                        ho_present,
+                    ),
+                ],
+                ignore_index=True,
+            )
+            .sort_values(["query_node_idx", "site_type"])
+            .reset_index(drop=True)
+        )
+        pf[
+            [
+                "query_node_idx",
+                "reach_node_idx",
+                "site_type",
+                *PORTFOLIO_EDGE_FEATURE_COLS,
+            ]
+        ].to_parquet(gdir / "portfolio_edges.parquet")
+
+        present_by_type = {
+            "ds_datum": ds_present,
+            "up_head": up_present,
+            "wet": wet_present,
+            "ho_any": ho_present,
+        }
+        for t in PORTFOLIO_SITE_TYPES:
+            wells[f"portfolio_missing_{t}"] = (~present_by_type[t]).astype("float64")
+        query_feature_cols = query_feature_cols + PORTFOLIO_MISSING_COLS
+        coverage = {t: float(present_by_type[t].mean()) for t in PORTFOLIO_SITE_TYPES}
+        log.info(
+            "portfolio-read ON (order_band=%d): %d edges; coverage %s",
+            order_band,
+            len(pf),
+            " ".join(f"{t}={coverage[t]:.3f}" for t in PORTFOLIO_SITE_TYPES),
+        )
+        portfolio_read_block = {
+            "site_types": PORTFOLIO_SITE_TYPES,
+            "edge_count": int(len(pf)),
+            "coverage_by_type": coverage,
+            "order_band": order_band,
+            "gsw_wet_threshold_pct": args.gsw_wet_threshold,
+            "feature_cols": PORTFOLIO_EDGE_FEATURE_COLS,
+            "missing_query_cols": PORTFOLIO_MISSING_COLS,
+            "leakage_note": (
+                "portfolio read edges carry relative-elevation + topological/observable "
+                "attrs only (query-vs-site rel-elev, network/Euclidean distance, order jump, "
+                "site drainage, type one-hots). No absolute elevation / head / target -> "
+                "leak-free. Each edge lets the query attend to the site reach's LEARNED "
+                "state; a missing site is an absent edge (softmax renormalizes)."
             ),
         }
 
@@ -2547,6 +3170,9 @@ def main() -> None:
         "ds_datum": ds_datum_block,
         "mainstem_read": mainstem_read_block,
         "wet_propagation": wet_propagation_block,
+        "reach_covariates": reach_covariates_block,
+        "upstream_accumulation": upstream_accum_block,
+        "portfolio_read": portfolio_read_block,
         "evidence_params": {
             "ndvi_jja": NDVI_JJA,
             "ndvi_djf": NDVI_DJF,
