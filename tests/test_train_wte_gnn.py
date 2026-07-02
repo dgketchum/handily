@@ -307,3 +307,190 @@ def test_mainstem_read_rejects_anchor_combo():
             f_anchor_reach=F_AQ_E,
             f_anchor_query=F_AQ_Q,
         )
+
+
+# ---------------------------------------------------------------------------
+# Portfolio-read conv (6B): segment-softmax attention over <=4 typed site edges
+# ---------------------------------------------------------------------------
+F_PF = 6
+
+
+def _pf_graph():
+    """_tiny_graph + a portfolio read: query 0 gets 3 site edges, query 1 gets 1, 2 none."""
+    g = _tiny_graph()
+    g["pf_ei"] = torch.tensor([[0, 1, 2, 3], [0, 0, 0, 1]])  # reach(src) -> query(dst)
+    g["pf_ea"] = torch.randn(4, F_PF)
+    return g
+
+
+def _pf_model(seed=0):
+    torch.manual_seed(seed)
+    return tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, f_pf=F_PF)
+
+
+def test_portfolio_conv_softmax_sums_to_one_per_query():
+    torch.manual_seed(0)
+    conv = tg.PortfolioReadConv(in_src=3, in_dst=2, edge_dim=1, out_dim=4)
+    x_src = torch.randn(5, 3)
+    x_dst = torch.randn(3, 2)
+    edge_index = torch.tensor(
+        [[0, 1, 2, 3], [0, 0, 0, 1]]
+    )  # q0: 3 edges, q1: 1, q2: none
+    edge_attr = torch.randn(4, 1)
+    out = conv(x_src, x_dst, edge_index, edge_attr)
+    assert out.shape == (3, 4)
+    assert torch.isfinite(out).all()
+    a = conv.last_attn.reshape(-1)
+    assert a.shape == (4,)
+    # per-query segment softmax: query 0's three edges sum to 1; query 1's single edge = 1.
+    assert torch.isclose(a[:3].sum(), torch.tensor(1.0), atol=1e-6)
+    assert torch.isclose(a[3], torch.tensor(1.0), atol=1e-6)
+    assert ((a > 0) & (a <= 1)).all()
+
+
+def test_portfolio_conv_zero_edge_query_is_finite():
+    torch.manual_seed(0)
+    conv = tg.PortfolioReadConv(3, 2, 1, 4)
+    x_src = torch.randn(5, 3)
+    x_dst = torch.randn(3, 2)
+    edge_index = torch.tensor([[0], [0]])  # only query 0 has a site edge
+    edge_attr = torch.randn(1, 1)
+    out = conv(x_src, x_dst, edge_index, edge_attr)
+    # query 2 (no edge) -> zero aggregate -> update on [x_dst, 0], still finite.
+    expect2 = conv.upd_mlp(torch.cat([x_dst[2], torch.zeros(4)]))
+    assert torch.allclose(out[2], expect2, atol=1e-6)
+
+
+def test_portfolio_conv_permutation_invariant():
+    torch.manual_seed(1)
+    conv = tg.PortfolioReadConv(3, 2, 2, 4).eval()
+    x_src = torch.randn(5, 3)
+    x_dst = torch.randn(3, 2)
+    edge_index = torch.tensor([[0, 1, 2, 3], [0, 0, 0, 1]])
+    edge_attr = torch.randn(4, 2)
+    with torch.no_grad():
+        out = conv(x_src, x_dst, edge_index, edge_attr)
+        perm = torch.tensor([2, 0, 3, 1])
+        out_p = conv(x_src, x_dst, edge_index[:, perm], edge_attr[perm])
+    assert torch.allclose(
+        out, out_p, atol=1e-6
+    )  # attention read is edge-order invariant
+
+
+def test_portfolio_read_forward_shape_and_zero_context():
+    g = _pf_graph()
+    m = _pf_model().eval()
+    assert m.has_pf
+    assert m.head[0].in_features == HIDDEN * 3  # [q, ctx_reach, ctx_pf]
+    with torch.no_grad():
+        out = m(g)
+    assert out.shape == (3,)
+    assert torch.isfinite(
+        out
+    ).all()  # query 2 has no portfolio edge -> zero ctx, finite
+
+
+def test_portfolio_read_none_is_baseline_state_dict():
+    base = tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1)
+    assert not base.has_pf
+    assert not hasattr(base, "pf_read")
+    assert base.head[0].in_features == HIDDEN * 2
+    assert not any(k.startswith("pf_read") for k in base.state_dict())
+
+
+def test_portfolio_read_uses_the_edge_context():
+    g = _pf_graph()
+    m = _pf_model().eval()
+    with torch.no_grad():
+        out_full = m(g)
+        g2 = dict(g)
+        g2["pf_ei"] = torch.empty(2, 0, dtype=torch.long)  # no portfolio edges at all
+        g2["pf_ea"] = torch.empty(0, F_PF)
+        out_none = m(g2)
+    assert not torch.allclose(out_full[:2], out_none[:2], atol=1e-5)
+
+
+def test_portfolio_read_rejects_ms_and_anchor():
+    with pytest.raises(ValueError):
+        tg.WTEGraphNet(
+            F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, f_pf=F_PF, f_ms=F_MS
+        )
+    with pytest.raises(ValueError):
+        tg.WTEGraphNet(
+            F_REACH,
+            F_QUERY,
+            F_CH,
+            F_LAT,
+            HIDDEN,
+            2,
+            0.1,
+            f_pf=F_PF,
+            f_anchor=F_AQ,
+            f_anchor_reach=F_AQ_E,
+            f_anchor_query=F_AQ_Q,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Query->reach write-back (6C): reversed lateral residual before the channel stack
+# ---------------------------------------------------------------------------
+def _wb_graph():
+    g = _tiny_graph()
+    g["lat_ei_reversed"] = g["lat_ei"].flip(0)  # query(src) -> reach(dst)
+    return g
+
+
+def test_writeback_off_adds_no_params():
+    base = tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1)
+    assert not base.writeback
+    assert not hasattr(base, "writeback_conv")
+    assert not any(k.startswith("writeback_conv") for k in base.state_dict())
+
+
+def test_writeback_zeroed_conv_matches_baseline():
+    # the 6C residual r = r + writeback(...): a zero-output writeback_conv reduces EXACTLY
+    # to the baseline, proving the query_enc reorder + residual are a no-op when nothing is
+    # written back (the reordered query_enc draws no RNG, so the stream trajectory is intact).
+    g = _wb_graph()
+    base = _base_model(seed=5).eval()
+    wb = tg.WTEGraphNet(
+        F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, writeback=True
+    ).eval()
+    wb.load_state_dict(base.state_dict(), strict=False)  # share the stream params
+    with torch.no_grad():
+        torch.nn.init.zeros_(wb.writeback_conv.upd_mlp[-1].weight)
+        torch.nn.init.zeros_(wb.writeback_conv.upd_mlp[-1].bias)
+        assert torch.allclose(base(g), wb(g), atol=1e-6)
+
+
+def test_writeback_on_changes_output_and_is_finite():
+    g = _wb_graph()
+    base = _base_model(seed=5).eval()
+    wb = tg.WTEGraphNet(
+        F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, writeback=True
+    ).eval()
+    wb.load_state_dict(base.state_dict(), strict=False)
+    with torch.no_grad():
+        out = wb(g)
+    assert out.shape == (3,) and torch.isfinite(out).all()
+    with torch.no_grad():
+        assert not torch.allclose(
+            base(g), out, atol=1e-5
+        )  # write-back moves the output
+
+
+def test_writeback_rejects_anchor_combo():
+    with pytest.raises(ValueError):
+        tg.WTEGraphNet(
+            F_REACH,
+            F_QUERY,
+            F_CH,
+            F_LAT,
+            HIDDEN,
+            2,
+            0.1,
+            writeback=True,
+            f_anchor=F_AQ,
+            f_anchor_reach=F_AQ_E,
+            f_anchor_query=F_AQ_Q,
+        )

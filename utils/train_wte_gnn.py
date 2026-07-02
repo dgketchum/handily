@@ -43,6 +43,7 @@ import pandas as pd
 import torch
 from torch import nn
 from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import softmax as pyg_softmax
 
 log = logging.getLogger("train_wte_gnn")
 
@@ -206,6 +207,80 @@ class EdgeGatedConv(MessagePassing):
         return g * m
 
 
+class PortfolioReadConv(MessagePassing):
+    """Segment-softmax ATTENTION read over a query's <=4 typed reference-site edges (6B).
+
+    Unlike ``EdgeGatedConv`` (independent sigmoid gates over HOMOGENEOUS lateral senders),
+    the portfolio senders are HETEROGENEOUS reference reaches (ds_datum / up_head / wet /
+    ho_any) COMPETING for one query's read budget -- exactly where softmax attention earns
+    its complexity: ``alpha = softmax(score([x_i, x_j, e_ij]), dst)`` normalizes over each
+    query's incoming edges, and the aggregate is ``sum_e alpha_e * msg([x_j, e_ij])`` (a
+    convex combination). A query with NO portfolio edge aggregates to zero (finite -- the
+    ``portfolio_missing_*`` query features carry the absence signal to the head). Same
+    ``flow="source_to_target"`` + ``upd_mlp`` shape as ``EdgeGatedConv``; captures
+    ``last_attn`` (per-edge alpha) exactly as ``EdgeGatedConv`` captures ``last_gate``.
+    """
+
+    def __init__(
+        self,
+        in_src: int,
+        in_dst: int,
+        edge_dim: int,
+        out_dim: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__(aggr="add", flow="source_to_target")
+        self.score_mlp = nn.Sequential(
+            nn.Linear(in_src + in_dst + edge_dim, out_dim),
+            nn.ReLU(),
+            nn.Linear(out_dim, 1),
+        )
+        self.msg_mlp = nn.Sequential(
+            nn.Linear(in_src + edge_dim, out_dim),
+            nn.ReLU(),
+            nn.Linear(out_dim, out_dim),
+        )
+        self.upd_mlp = nn.Sequential(
+            nn.Linear(in_dst + out_dim, out_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(out_dim, out_dim),
+        )
+        self.last_attn: torch.Tensor | None = None
+
+    def forward(
+        self,
+        x_src: torch.Tensor,
+        x_dst: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+    ) -> torch.Tensor:
+        agg = self.propagate(
+            edge_index,
+            x=(x_src, x_dst),
+            edge_attr=edge_attr,
+            size=(x_src.size(0), x_dst.size(0)),
+        )
+        return self.upd_mlp(torch.cat([x_dst, agg], dim=-1))
+
+    def message(
+        self,
+        x_j: torch.Tensor,
+        x_i: torch.Tensor,
+        edge_attr: torch.Tensor,
+        index: torch.Tensor,
+        ptr: torch.Tensor | None,
+        size_i: int | None,
+    ) -> torch.Tensor:
+        score = self.score_mlp(torch.cat([x_i, x_j, edge_attr], dim=-1))  # (E, 1)
+        alpha = pyg_softmax(
+            score, index, ptr, size_i
+        )  # segment softmax over dst (query)
+        self.last_attn = alpha.detach()
+        m = self.msg_mlp(torch.cat([x_j, edge_attr], dim=-1))
+        return alpha * m
+
+
 class WTEGraphNet(nn.Module):
     """Edge-gated relaxation over the flow network.
 
@@ -232,6 +307,8 @@ class WTEGraphNet(nn.Module):
         f_anchor_reach: int | None = None,
         f_anchor_query: int | None = None,
         f_ms: int | None = None,
+        f_pf: int | None = None,
+        writeback: bool = False,
         pinball: bool = False,
         fac_skip: bool = False,
         fac_gate: bool = False,
@@ -249,10 +326,23 @@ class WTEGraphNet(nn.Module):
             raise ValueError("fac_gate requires fac_skip")
         self.has_anchor = f_anchor is not None
         self.has_ms = f_ms is not None
+        self.has_pf = f_pf is not None
+        self.writeback = writeback
         if self.has_ms and self.has_anchor:
             # anchors are off in prod; keep the head bookkeeping ([q, ctx_reach, ctx_*])
             # single-branch so we never have to reconcile two hidden*3 read contexts.
             raise ValueError("mainstem-read (f_ms) is not supported with anchors")
+        # portfolio-read (6B) supersedes the single-purpose mainstem read and, like it,
+        # occupies the ONE extra hidden*3 read-context slot -- so it is mutually exclusive
+        # with BOTH mainstem-read and anchors (the head reconciles only one extra context).
+        if self.has_pf and (self.has_ms or self.has_anchor):
+            raise ValueError(
+                "portfolio-read (f_pf) is exclusive with mainstem-read + anchors"
+            )
+        if self.writeback and self.has_anchor:
+            # 6C is wired only into the non-anchor forward branch (the anchor branch already
+            # owns the pre-channel reach injection); combining them is unsupported.
+            raise ValueError("query-writeback (6C) is not supported with anchors")
         self.pinball = pinball
         self.fac_skip = fac_skip
         self.fac_gate = fac_gate
@@ -331,6 +421,25 @@ class WTEGraphNet(nn.Module):
             # gap. Queries with no ms edge get a zero context (mean-agg default).
             self.ms_read = EdgeGatedConv(hidden, hidden, f_ms, hidden, dropout=dropout)
             head_in = hidden * 3  # [q, ctx_reach, ctx_ms]
+        if self.has_pf:
+            # portfolio-read (6B): one segment-softmax attention conv over each query's <=4
+            # typed reference-site edges (ds_datum / up_head / wet / ho_any) on the POST-
+            # channel-stack reach states, so the query attends to whichever heterogeneous
+            # reference reach's LEARNED state matters -- a missing site is simply absent from
+            # the softmax. Supersedes ms_read (superset of its ds_datum edge + 3 more sites).
+            self.pf_read = PortfolioReadConv(
+                hidden, hidden, f_pf, hidden, dropout=dropout
+            )
+            head_in = hidden * 3  # [q, ctx_reach, ctx_pf]
+        if self.writeback:
+            # query->reach write-back (6C): one bipartite gated conv (query as src, reach as
+            # dst) applied as a residual BEFORE the channel stack, so well context mixes 2
+            # hops outward along the channels and returns via the lateral/portfolio reads
+            # (mirrors the anchor BC pre-channel injection). Off => the reordered query_enc
+            # is a pure no-op (identical compute graph to baseline).
+            self.writeback_conv = EdgeGatedConv(
+                hidden, hidden, f_lat, hidden, dropout=dropout
+            )
         if self.fac_skip:
             # raw-FAC bypass: the standardized FAC target-estimate + its presence flag
             # ride straight to the head (un-smoothed), and the output is anchored on
@@ -469,15 +578,28 @@ class WTEGraphNet(nn.Module):
             ctx_anchor = self.anchor_to_query(a, q, g["aq_ei"], g["aq_ea"])
             h = torch.cat([q, ctx_reach, ctx_anchor], dim=-1)
         else:
+            # 6C: query_enc runs BEFORE the channel loop so well context can be written back
+            # onto reaches as a residual (mirrors the anchor BC pre-channel injection). When
+            # writeback is off this reorder is a pure no-op (query_enc reads only query_x),
+            # so the compute graph is byte-identical to baseline.
+            q = self.query_enc(g["query_x"])
+            if self.writeback:
+                # reversed lateral edges (query src -> reach dst); residual, so reaches with
+                # no incident well are unchanged. Context then mixes 2 hops out via channels.
+                r = r + self.writeback_conv(q, r, g["lat_ei_reversed"], g["lat_ea"])
             for layer in self.channel:
                 # residual channel update (direction-conditioned when enabled)
                 r = r + layer(r, r, g["ch_ei"], g["ch_ea"], dir_sign=ch_dir)
-            q = self.query_enc(g["query_x"])
             ctx_reach = self.lateral(r, q, g["lat_ei"], g["lat_ea"], dir_sign=lat_dir)
             if self.has_ms:
                 # read the datum reach's post-channel-stack state; no ms edge -> zeros.
                 ctx_ms = self.ms_read(r, q, g["ms_ei"], g["ms_ea"])
                 h = torch.cat([q, ctx_reach, ctx_ms], dim=-1)
+            elif self.has_pf:
+                # attention-read whichever of the <=4 typed reference sites matters, over
+                # the post-channel-stack reach states; no portfolio edge -> zero context.
+                ctx_pf = self.pf_read(r, q, g["pf_ei"], g["pf_ea"])
+                h = torch.cat([q, ctx_reach, ctx_pf], dim=-1)
             else:
                 h = torch.cat([q, ctx_reach], dim=-1)
         # FAC raw-skip / confidence-gate pieces (no-op when fac_skip is off).
