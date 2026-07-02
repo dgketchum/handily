@@ -450,6 +450,26 @@ def main() -> None:
         "reaches (+ their 2-hop channel context) are unioned into the prune set so they "
         "actually enter the GPU graph. See notes/GNN_TOPOLOGY_PLAN.md item 2.",
     )
+    p.add_argument(
+        "--portfolio-read",
+        action="store_true",
+        help="(Phase 6B) add the reference-site portfolio read: each well attends (segment-"
+        "softmax) over its <=4 typed reference reaches (ds_datum / up_head / wet / ho_any) in "
+        "ONE hop. Supersedes --mainstem-read (its ds_datum edge is one of the four) and is "
+        "MUTUALLY EXCLUSIVE with it and with anchors. Requires a bundle built with "
+        "build_conus_graph_inputs.py --portfolio-read (portfolio_edges.parquet). The site "
+        "reaches (+ their 2-hop channel context) are unioned into the prune set. Writes "
+        "gnn_portfolio_attention.parquet. See notes/GNN_PHASE6_PLAN.md 6B.",
+    )
+    p.add_argument(
+        "--query-writeback",
+        action="store_true",
+        help="(Phase 6C) add the query->reach write-back conv: well context is written onto "
+        "its lateral reaches (reversed lateral edges) as a residual BEFORE the channel stack, "
+        "so it mixes 2 hops outward and returns via the lateral/portfolio reads -- the "
+        "mechanism-matched lever for the coherent <500m patch bias (well<->well communication "
+        "through shared reaches). No rebuild (reuses lateral_edges). See notes/GNN_PHASE6_PLAN.md 6C.",
+    )
     # --- anti-compression pair loss (item 4): regularize the LOCAL WTE gradient -----
     p.add_argument(
         "--pair-loss-weight",
@@ -564,6 +584,26 @@ def main() -> None:
         me = pd.read_parquet(ms_path)
         ms_cols = man["mainstem_read"]["ms_edge_feature_cols"]
 
+    # --- portfolio-read edges (6B): <=4 typed reference reaches per query --------------
+    use_pf = args.portfolio_read
+    pf = None
+    pf_cols = None
+    if use_pf:
+        if use_ms:
+            raise SystemExit(
+                "--portfolio-read and --mainstem-read are mutually exclusive (the "
+                "portfolio ds_datum site is a superset of the mainstem read)"
+            )
+        pf_path = gdir / "portfolio_edges.parquet"
+        if not pf_path.exists() or not man.get("portfolio_read"):
+            raise SystemExit(
+                "--portfolio-read set but the bundle has no portfolio_edges.parquet / "
+                "portfolio_read manifest block -- rebuild the graph with "
+                "build_conus_graph_inputs.py --portfolio-read"
+            )
+        pf = pd.read_parquet(pf_path)
+        pf_cols = man["portfolio_read"]["feature_cols"]
+
     # --- prune reach graph to the n-hop neighborhood of attached reaches -------
     # The mainstem datum reaches (+ their own 2-hop channel context) are unioned in so
     # the read edge actually reaches a node in the pruned GPU graph -- this is what puts
@@ -572,6 +612,10 @@ def main() -> None:
     if use_ms:
         attached = np.unique(
             np.concatenate([attached, me["reach_node_idx"].to_numpy("int64")])
+        )
+    if use_pf:
+        attached = np.unique(
+            np.concatenate([attached, pf["reach_node_idx"].to_numpy("int64")])
         )
     kept, edge_keep = prune_reach_graph(len(rn), ce, attached, args.channel_layers)
     old2new = np.full(len(rn), -1, dtype="int64")
@@ -590,6 +634,13 @@ def main() -> None:
         log.info(
             "mainstem-read: %d datum read edges (unioned into the prune set)", len(me)
         )
+    if use_pf:
+        pf = pf.copy()
+        pf["reach_node_idx"] = old2new[pf["reach_node_idx"].to_numpy("int64")]
+        assert (pf["reach_node_idx"] >= 0).all(), "portfolio site reach pruned (bug)"
+        log.info(
+            "portfolio-read: %d site read edges (unioned into the prune set)", len(pf)
+        )
     log.info(
         "pruned reaches %d -> %d (%.1f%%); channel edges %d -> %d; lateral %d",
         len(old2new),
@@ -603,6 +654,16 @@ def main() -> None:
     # --- anchor BC: nodes + anchor->reach (pruned/remapped) + anchor->query ----
     anchor_block = man.get("anchors")
     use_anchors = bool(anchor_block) and not args.no_anchors
+    if use_pf and use_anchors:
+        raise SystemExit(
+            "--portfolio-read is mutually exclusive with anchors (the head reconciles one "
+            "extra read context); pass --no-anchors or use a bundle without anchors"
+        )
+    if args.query_writeback and use_anchors:
+        raise SystemExit(
+            "--query-writeback is wired only into the non-anchor forward branch; pass "
+            "--no-anchors or use a bundle without anchors"
+        )
     an = ar = aq = None
     anchor_cols = ar_cols = aq_cols = None
     anchor_head_m = None  # TARGET_WTE absolute-head BC (fold-standardized per fold)
@@ -701,6 +762,25 @@ def main() -> None:
             device=device,
         )
         graph_tensors |= {"ms_ei": ms_ei, "ms_ea": ms_ea}
+    # portfolio-read edges (6B): standardized exactly like lat_ea (train-blind edge attrs,
+    # median-impute + missingness flag); reach->query direction (site reach = src). The
+    # type one-hots are z-scored the same way datum_is_self already is -- harmless.
+    pf_ea = None
+    if use_pf:
+        pf_stats = fit_stats(pf, pf_cols, None)
+        pf_ea = torch.as_tensor(
+            apply_stats(pf, pf_stats), dtype=torch.float32, device=device
+        )
+        pf_ei = torch.as_tensor(
+            pf[["reach_node_idx", "query_node_idx"]].to_numpy().T,
+            dtype=torch.long,
+            device=device,
+        )
+        graph_tensors |= {"pf_ei": pf_ei, "pf_ea": pf_ea}
+    # query->reach write-back (6C): reversed lateral edges (query src -> reach dst), reusing
+    # lat_ea unchanged (same attrs, opposite direction). No new file / no prune change.
+    if args.query_writeback:
+        graph_tensors |= {"lat_ei_reversed": lat_ei.flip(0)}
     # Flow-direction sign per edge (row-aligned with ch_ea/lat_ea), from columns
     # already in the bundle: channel `direction` (+1 down / -1 reverse, never NaN) and
     # lateral sign(well_surf - reach_elev) (well-above-reach +1 / below -1). A rare
@@ -930,10 +1010,13 @@ def main() -> None:
 
     f_ch, f_lat = ch_ea.shape[1], lat_ea.shape[1]
     f_ms = ms_ea.shape[1] if use_ms else None  # width incl. missingness flags
+    f_pf = pf_ea.shape[1] if use_pf else None  # portfolio edge-attr width (6B)
     native_oof = np.full(len(qn), np.nan)
     gate_oof = np.full(len(qn), np.nan) if fac_gate else None
     learned_aquifer = use_aquifer and args.aquifer_route == "learned"
     aquifer_gate_oof = np.full(len(qn), np.nan) if learned_aquifer else None
+    # per-edge portfolio attention, collected on each fold's test rows (6B OOF dump).
+    pf_attn_rows: list[pd.DataFrame] = [] if use_pf else []
     fold_log: list[dict] = []
     huber_delta_std_by_fold: list[float] = []
 
@@ -970,6 +1053,8 @@ def main() -> None:
             f_anchor_reach=f_ar,
             f_anchor_query=f_aq,
             f_ms=f_ms,
+            f_pf=f_pf,
+            writeback=args.query_writeback,
             pinball=args.pinball,
             fac_skip=fac_skip,
             fac_gate=fac_gate,
@@ -1093,6 +1178,8 @@ def main() -> None:
             f_anchor_reach=f_ar,
             f_anchor_query=f_aq,
             f_ms=f_ms,
+            f_pf=f_pf,
+            writeback=args.query_writeback,
             pinball=args.pinball,
             fac_skip=fac_skip,
             fac_gate=fac_gate,
@@ -1124,6 +1211,22 @@ def main() -> None:
             # per-query sigmoid gate from the final full-batch forward (all queries).
             aquifer_gate_oof[test] = (
                 model.last_aquifer_gate.cpu().numpy().reshape(-1)[test]
+            )
+        if use_pf and model.pf_read.last_attn is not None:
+            # per-EDGE attention from the final full-batch forward, row-aligned with pf; keep
+            # only this fold's TEST-query edges for the OOF diagnostic (which site is read?).
+            attn = model.pf_read.last_attn.cpu().numpy().reshape(-1)
+            q_of_edge = pf["query_node_idx"].to_numpy("int64")
+            in_test = test[q_of_edge]
+            pf_attn_rows.append(
+                pd.DataFrame(
+                    {
+                        "query_node_idx": q_of_edge[in_test],
+                        "site_type": pf["site_type"].to_numpy()[in_test],
+                        "attn": attn[in_test],
+                        "fold": int(f),
+                    }
+                )
             )
         del model, query_x, y_std, feat
         if device.startswith("cuda"):
@@ -1240,6 +1343,19 @@ def main() -> None:
         }
     pd.DataFrame(out_cols).to_parquet(out_dir / "gnn_oof_predictions.parquet")
 
+    if use_pf and pf_attn_rows:
+        # OOF per-edge portfolio attention (which reference site each test well reads).
+        attn_df = pd.concat(pf_attn_rows, ignore_index=True)
+        attn_df.to_parquet(out_dir / "gnn_portfolio_attention.parquet")
+        by_type = attn_df.groupby("site_type")["attn"].mean().to_dict()
+        log.info(
+            "portfolio attention (OOF mean by site): %s",
+            " ".join(
+                f"{t}={by_type.get(t, float('nan')):.3f}"
+                for t in man["portfolio_read"]["site_types"]
+            ),
+        )
+
     run = {
         "graph_dir": str(gdir),
         "device": device,
@@ -1329,6 +1445,17 @@ def main() -> None:
             "ms_edge_feature_cols": ms_cols if use_ms else None,
             "f_ms": int(f_ms) if use_ms else None,
         },
+        "portfolio_read": {
+            "enabled": bool(use_pf),
+            "n_edges": int(len(pf)) if use_pf else None,
+            "site_types": man["portfolio_read"]["site_types"] if use_pf else None,
+            "coverage_by_type": man["portfolio_read"]["coverage_by_type"]
+            if use_pf
+            else None,
+            "pf_edge_feature_cols": pf_cols if use_pf else None,
+            "f_pf": int(f_pf) if use_pf else None,
+        },
+        "query_writeback": {"enabled": bool(args.query_writeback)},
         "target_mode": target_mode,
         "native_prediction_col": man.get(
             "native_prediction_col",
