@@ -495,6 +495,18 @@ def main() -> None:
         else:
             log.info("Ma coverage < 50 non-NWIS wells; skipping Ma sub-panel")
 
+    # NV closed-basin sub-panel (HUC2=16): the regime where "downstream" never reaches a
+    # high-order datum (Phase-6 ho_any hypothesis). huc2 is zero-filled to 2 digits above,
+    # so the literal is "16". Same >=50-well guard + all-predictor compare as the Ma panel.
+    nv_panel = None
+    if "huc2" in non_nwis.columns:
+        nv = non_nwis[non_nwis["huc2"] == "16"].reset_index(drop=True)
+        if len(nv) >= 50:
+            nv_panel = full_panel(nv, predcols, "obs_dtw_m", common)
+            log_panel("NV closed basins (HUC2=16), non-NWIS", nv_panel, predcols)
+        else:
+            log.info("NV (HUC2=16) < 50 non-NWIS wells; skipping NV sub-panel")
+
     # Non-headline head-space diagnostics (WTE mode only): same metrics, but in
     # WTE units against obs_wte_m. By the identity above the GNN MAD equals its DTW
     # MAD; the value is comparing the head priors to each other in their own space.
@@ -521,6 +533,7 @@ def main() -> None:
         "headline_non_nwis": headline,
         "nwis_panel": nwis_panel,
         "ma_covered_panel": ma_panel,
+        "nv_closed_basin_panel": nv_panel,
         "wte_identity_check": wte_identity,
         "wte_core_metrics": wte_core,
         "diagnostics": {
