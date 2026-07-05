@@ -494,3 +494,167 @@ def test_writeback_rejects_anchor_combo():
             f_anchor_reach=F_AQ_E,
             f_anchor_query=F_AQ_Q,
         )
+
+
+# --- fac-lambda convex blend + heteroscedastic sigma head (levers A / E) ---------
+def _fac_tensors(pres=(1.0, 1.0, 0.0)):
+    torch.manual_seed(11)
+    p = torch.tensor(pres)
+    return {
+        "fac_base": torch.randn(3) * p,  # absent FAC is zeroed (as _fac_feat does)
+        "fac_present": p,
+        "fac_pred_dtw": torch.randn(3) * p,
+    }
+
+
+def _lambda_model(seed=0):
+    torch.manual_seed(seed)
+    return tg.WTEGraphNet(
+        F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, fac_lambda=True
+    )
+
+
+def test_fac_lambda_convex_blend_limits():
+    g = {**_tiny_graph(), **_fac_tensors()}
+    base = _base_model(seed=0).eval()
+    m = _lambda_model(seed=0).eval()
+    # lambda modules are constructed LAST -> shared modules identical at same seed.
+    with torch.no_grad():
+        # lam -> 1 everywhere FAC present: pred == fac_base there.
+        torch.nn.init.zeros_(m.fac_lambda_mlp[-1].weight)
+        torch.nn.init.constant_(m.fac_lambda_mlp[-1].bias, 50.0)
+        hi = m(g)
+        assert torch.allclose(hi[:2], g["fac_base"][:2], atol=1e-4)
+        # lam -> 0: pure GNN head == baseline output exactly.
+        torch.nn.init.constant_(m.fac_lambda_mlp[-1].bias, -50.0)
+        lo = m(g)
+        assert torch.allclose(lo, base(g), atol=1e-5)
+        # absent FAC (query 2) is pure GNN regardless of the gate bias.
+        torch.nn.init.constant_(m.fac_lambda_mlp[-1].bias, 50.0)
+        assert torch.allclose(m(g)[2], base(g)[2], atol=1e-5)
+        lam = m.last_fac_lambda.squeeze(-1)
+        assert lam[2] == 0.0 and (lam[:2] > 0.99).all()
+
+
+def test_fac_lambda_off_is_baseline_state_dict():
+    base = _base_model(seed=0)
+    assert set(_base_model(seed=1).state_dict()) == set(base.state_dict())
+    lam = _lambda_model(seed=0)
+    extra = set(lam.state_dict()) - set(base.state_dict())
+    assert extra and all(k.startswith("fac_lambda_mlp") for k in extra)
+
+
+def test_fac_lambda_rejects_skip_gate_pinball():
+    with pytest.raises(ValueError):
+        tg.WTEGraphNet(
+            F_REACH,
+            F_QUERY,
+            F_CH,
+            F_LAT,
+            HIDDEN,
+            2,
+            0.1,
+            fac_lambda=True,
+            fac_skip=True,
+        )
+    with pytest.raises(ValueError):
+        tg.WTEGraphNet(
+            F_REACH,
+            F_QUERY,
+            F_CH,
+            F_LAT,
+            HIDDEN,
+            2,
+            0.1,
+            fac_lambda=True,
+            pinball=True,
+        )
+
+
+def test_sigma_head_log_b_clamped_and_backprops():
+    torch.manual_seed(0)
+    m = tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, sigma=True)
+    g = _tiny_graph()
+    out = m(g)
+    lb = m.sigma_log_b
+    assert lb.shape == (3,) and torch.isfinite(lb).all()
+    assert (lb >= -4.0).all() and (lb <= 4.0).all()
+    # Laplace NLL backprops through BOTH heads.
+    y = torch.zeros(3)
+    nll = (torch.abs(out - y) * torch.exp(-lb) + lb).mean()
+    nll.backward()
+    assert m.sigma_head[0].weight.grad is not None
+    assert torch.isfinite(m.sigma_head[0].weight.grad).all()
+    assert m.head[0].weight.grad is not None
+
+
+def test_sigma_rejects_pinball():
+    with pytest.raises(ValueError):
+        tg.WTEGraphNet(
+            F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, sigma=True, pinball=True
+        )
+
+
+# --- 3-way prior gate: fac anchor / deep-regional anchor / free head --------------
+def _deep_tensors(pres=(1.0, 0.0, 1.0)):
+    torch.manual_seed(13)
+    p = torch.tensor(pres)
+    return {
+        "deep_base": torch.randn(3) * p,  # absent deep is zeroed (as _fac_feat does)
+        "deep_present": p,
+        "deep_pred_dtw": torch.randn(3) * p,
+    }
+
+
+def _gate_model(seed=0):
+    torch.manual_seed(seed)
+    return tg.WTEGraphNet(
+        F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, prior_gate=True
+    )
+
+
+def test_prior_gate_expert_limits_and_masking():
+    # fac present on queries 0,1; deep present on queries 0,2.
+    g = {**_tiny_graph(), **_fac_tensors(), **_deep_tensors()}
+    base = _base_model(seed=0).eval()
+    m = _gate_model(seed=0).eval()
+    # gate modules are constructed LAST -> shared modules identical at same seed.
+    with torch.no_grad():
+        torch.nn.init.zeros_(m.prior_gate_mlp[-1].weight)
+        bias = m.prior_gate_mlp[-1].bias
+        # force FAC expert: pred == fac_base where FAC present; masked where absent.
+        bias.zero_()
+        bias[0] = 50.0
+        out = m(g)
+        assert torch.allclose(out[:2], g["fac_base"][:2], atol=1e-4)
+        w = m.last_prior_gate
+        assert torch.allclose(w.sum(dim=-1), torch.ones(3), atol=1e-5)
+        assert w[2, 0] == 0.0  # absent FAC masked out of the softmax
+        # force DEEP expert: pred == deep_base where deep present; masked where absent.
+        bias.zero_()
+        bias[1] = 50.0
+        out = m(g)
+        assert torch.allclose(out[[0, 2]], g["deep_base"][[0, 2]], atol=1e-4)
+        assert m.last_prior_gate[1, 1] == 0.0
+        # force the FREE HEAD: pred == baseline model output exactly, everywhere.
+        bias.zero_()
+        bias[2] = 50.0
+        assert torch.allclose(m(g), base(g), atol=1e-5)
+
+
+def test_prior_gate_off_is_baseline_state_dict():
+    base = _base_model(seed=0)
+    m = _gate_model(seed=0)
+    extra = set(m.state_dict()) - set(base.state_dict())
+    assert extra and all(k.startswith("prior_gate_mlp") for k in extra)
+    # shared modules bitwise-identical at the same seed (RNG-order preservation).
+    sd = m.state_dict()
+    assert all(torch.equal(v, sd[k]) for k, v in base.state_dict().items())
+
+
+def test_prior_gate_rejects_anchor_and_pinball_combos():
+    for kw in ({"fac_skip": True}, {"fac_lambda": True}, {"pinball": True}):
+        with pytest.raises(ValueError):
+            tg.WTEGraphNet(
+                F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, prior_gate=True, **kw
+            )

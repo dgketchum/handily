@@ -163,3 +163,56 @@ def test_pair_loss_smoke_finite_and_reduces_compression():
     # that matches nearby DIFFERENCES -> after the step the weighted predictions
     # carry more amplitude (less compressed) than the point loss alone.
     assert np.std(native_p) > np.std(native0)
+
+
+class _SigModel(torch.nn.Module):
+    """Linear point head + linear log-b head; exposes sigma_log_b like WTEGraphNet."""
+
+    def __init__(self):
+        super().__init__()
+        self.lin = torch.nn.Linear(1, 1)
+        self.sig = torch.nn.Linear(1, 1)
+        torch.nn.init.zeros_(self.lin.weight)
+        torch.nn.init.zeros_(self.lin.bias)
+        torch.nn.init.zeros_(self.sig.weight)
+        torch.nn.init.zeros_(self.sig.bias)
+        self.sigma_log_b = None
+
+    def forward(self, feat):
+        x = feat["query_x"]
+        self.sigma_log_b = torch.clamp(self.sig(x).squeeze(-1), -4.0, 4.0)
+        return self.lin(x).squeeze(-1)
+
+
+def test_sigma_head_nll_smoke_finite_and_trains():
+    n = 24
+    ycol = np.linspace(-3.0, 3.0, n)
+    feat = {"query_x": torch.as_tensor(ycol.reshape(-1, 1), dtype=torch.float32)}
+    y_std = torch.as_tensor(ycol, dtype=torch.float32)
+    va = np.zeros(n, bool)
+    va[[5, 18]] = True
+    args = _smoke_args()
+    args.sigma_head = True
+    args.epochs = 5
+    torch.manual_seed(0)
+    model = _SigModel()
+    native, best_mad, _ = tc.train_fold(
+        model,
+        feat,
+        y_std,
+        ~va,
+        va,
+        np.zeros(n),
+        ycol.copy(),
+        0.0,
+        1.0,
+        tc.TARGET_DTW_RESIDUAL,
+        0.85,
+        args,
+        "cpu",
+        None,
+    )
+    assert np.isfinite(native).all() and np.isfinite(best_mad)
+    # the NLL branch actually ran: both heads moved off their zero init.
+    assert model.lin.weight.abs().sum() > 0
+    assert model.sig.weight.abs().sum() > 0 or model.sig.bias.abs().sum() > 0

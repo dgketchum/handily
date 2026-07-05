@@ -35,6 +35,7 @@ from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_conus_graph_inputs import (  # noqa: E402
+    DEEP_REGIONAL_WTE_ANOM_COL,
     DEEP_REGIONAL_WTE_COL,
     FAC_REM_WTE_ANOM_COL,
     FAC_REM_WTE_COL,
@@ -146,25 +147,29 @@ def _fac_feat(
     fac_pred_dtw=None,
     pdtw_c: float = 0.0,
     pdtw_s: float = 1.0,
+    prefix: str = "fac",
 ) -> dict:
-    """FAC bypass tensors standardized into THIS fold's target space.
+    """Prior-anchor tensors standardized into THIS fold's target space.
 
-    The FAC anomaly is FAC's own estimate of the (head-space) target, so standardizing
-    it by the fold's (y_c, y_s) puts it on the same scale as the model's standardized
-    output -- the model then predicts ``fac_base + correction``. Absent FAC is set to 0
-    (the presence flag carries that info, so the skip contributes nothing there).
-    ``fac_pred_dtw`` (FAC's own predicted DTW = base - fac_raw) feeds the confidence
-    gate, standardized by its own train-fold (pdtw_c, pdtw_s)."""
+    The anchor anomaly is that prior's own estimate of the (head-space) target, so
+    standardizing it by the fold's (y_c, y_s) puts it on the same scale as the model's
+    standardized output -- the model then predicts ``fac_base + correction``. Absent
+    anchor is set to 0 (the presence flag carries that info, so the skip contributes
+    nothing there). ``fac_pred_dtw`` (the prior's own predicted DTW = base - raw) feeds
+    the confidence gate, standardized by its own train-fold (pdtw_c, pdtw_s).
+    ``prefix`` renames the keys for the deep expert ("deep_base", ...)."""
     base = np.where(fac_present, (fac_raw - y_c) / y_s, 0.0)
     out = {
-        "fac_base": torch.as_tensor(base, dtype=torch.float32, device=device),
-        "fac_present": torch.as_tensor(
+        f"{prefix}_base": torch.as_tensor(base, dtype=torch.float32, device=device),
+        f"{prefix}_present": torch.as_tensor(
             fac_present.astype("float32"), dtype=torch.float32, device=device
         ),
     }
     if fac_pred_dtw is not None:
         gsig = np.where(fac_present, (fac_pred_dtw - pdtw_c) / pdtw_s, 0.0)
-        out["fac_pred_dtw"] = torch.as_tensor(gsig, dtype=torch.float32, device=device)
+        out[f"{prefix}_pred_dtw"] = torch.as_tensor(
+            gsig, dtype=torch.float32, device=device
+        )
     return out
 
 
@@ -273,6 +278,14 @@ def train_fold(
                 pin[tr_t], y_std[tr_t], eff_tau, w_tr
             )
             pred_point = primary
+        elif getattr(args, "sigma_head", False):
+            # heteroscedastic Laplace NLL: |err|/b + log b with per-well b. The model
+            # spends variance-budget on wells it cannot fit (deep-regional), which
+            # implicitly downweights them -- and the OOF b is the selective-call score.
+            lb = model.sigma_log_b[tr_t]
+            nll = torch.abs(out[tr_t] - y_std[tr_t]) * torch.exp(-lb) + lb
+            loss = (nll * w_tr).sum() / w_tr.sum() if weighted else nll.mean()
+            pred_point = out
         else:
             hl = huber(out[tr_t], y_std[tr_t])
             loss = (hl * w_tr).sum() / w_tr.sum() if weighted else hl
@@ -430,6 +443,44 @@ def main() -> None:
         "by the more numerous deep wells in the Huber average",
     )
     p.add_argument("--shallow-thresh-m", type=float, default=5.0)
+    p.add_argument(
+        "--depth-weight-scale",
+        type=float,
+        default=0.0,
+        help="continuous depth-aware loss weight w = s/(s + obs_dtw), mean-normalized "
+        "(0 = off; exclusive with --shallow-weight). Smooth alternative to the "
+        "step weight: a 2m well gets ~4x the weight of a 30m well at s=5",
+    )
+    p.add_argument(
+        "--fac-lambda",
+        action="store_true",
+        help="learned CONVEX blend head: pred = lam*FAC_anchor + (1-lam)*GNN_head, "
+        "lam = sigmoid(mlp(query context, anchor, FAC's own DTW)) masked to 0 where "
+        "FAC is absent. Unlike --fac-skip/--fac-gate (ADDITIVE anchor the head can "
+        "double-count), convexity forces an interpretable per-well mixing weight -- "
+        "the OOF lam column is a shallow terrain-coupled-zone map. Head-space "
+        "targets only; exclusive with --fac-skip/--fac-gate/--pinball",
+    )
+    p.add_argument(
+        "--sigma-head",
+        action="store_true",
+        help="heteroscedastic Laplace scale head: loss becomes the Laplace NLL "
+        "|err|/b + log b (per-well b), and OOF gnn_sigma_m enables selective "
+        "shallow calls (trust predictions only where sigma is small). "
+        "Exclusive with --pinball",
+    )
+    p.add_argument(
+        "--prior-gate",
+        action="store_true",
+        help="learned 3-way softmax mixture over priors: pred = w_fac*FAC_anchor + "
+        "w_deep*deep_regional_anchor + w_head*GNN_head. The gate sees the query "
+        "context, both anchor values, each prior's own predicted DTW and their "
+        "DISAGREEMENT (the regime signal no single covariate carries); absent priors "
+        "are masked out of the softmax. OOF gate_w_fac/gate_w_deep/gate_w_head form "
+        "a three-regime map (terrain-coupled / deep-regional / free-head). "
+        "Head-space targets only; exclusive with --fac-skip/--fac-gate/--fac-lambda/"
+        "--pinball; composes with --sigma-head and the depth weights",
+    )
     p.add_argument(
         "--directional-edges",
         action="store_true",
@@ -960,42 +1011,105 @@ def main() -> None:
                 f"{int((~np.isfinite(arr)).sum())} non-finite {nm} in query nodes"
             )
 
-    # --- FAC raw-skip: FAC's own (head-space) target-estimate as the output anchor ---
+    # --- FAC raw-skip / lambda blend / prior gate: (head-space) anchor tensors ------
     fac_skip = args.fac_skip
     fac_gate = args.fac_gate
+    fac_lambda = args.fac_lambda
+    prior_gate = args.prior_gate
     fac_raw = fac_present = fac_pred_dtw = None
+    deep_raw = deep_present = deep_pred_dtw = deep_anchor_col = None
     if fac_gate and not fac_skip:
         raise SystemExit("--fac-gate requires --fac-skip")
-    if fac_skip:
+    if fac_lambda and (fac_skip or fac_gate):
+        raise SystemExit("--fac-lambda is exclusive with --fac-skip/--fac-gate")
+    if prior_gate and (fac_skip or fac_gate or fac_lambda):
+        raise SystemExit(
+            "--prior-gate is exclusive with --fac-skip/--fac-gate/--fac-lambda"
+        )
+    if (fac_lambda or prior_gate) and args.pinball:
+        raise SystemExit("--fac-lambda/--prior-gate are exclusive with --pinball")
+    if args.sigma_head and args.pinball:
+        raise SystemExit("--sigma-head is exclusive with --pinball")
+    use_fac_anchor = fac_skip or fac_lambda or prior_gate
+    if use_fac_anchor:
+        flag = (
+            "--fac-skip"
+            if fac_skip
+            else ("--fac-lambda" if fac_lambda else "--prior-gate")
+        )
         if target_mode == TARGET_WTE_RESIDUAL:
             fac_base_col = FAC_REM_WTE_ANOM_COL  # (z_surf - fac_rem_dtw) - R
         elif target_mode == TARGET_WTE:
             fac_base_col = FAC_REM_WTE_COL  # fac_rem water-surface ELEVATION
         else:
             raise SystemExit(
-                "--fac-skip requires a head-space target (wte / wte_residual); "
+                f"{flag} requires a head-space target (wte / wte_residual); "
                 f"got {target_mode}"
             )
         if fac_base_col not in qn.columns:
-            raise SystemExit(f"--fac-skip: column {fac_base_col!r} not in query nodes")
+            raise SystemExit(f"{flag}: column {fac_base_col!r} not in query nodes")
         fac_raw = qn[fac_base_col].to_numpy("float64")
         fac_present = np.isfinite(fac_raw)
         log.info(
-            "fac-skip ON: anchor col %s, %d/%d wells carry FAC (%.1f%%)%s",
+            "%s ON: anchor col %s, %d/%d wells carry FAC (%.1f%%)%s",
+            flag,
             fac_base_col,
             int(fac_present.sum()),
             len(qn),
             100.0 * fac_present.mean(),
             " | gate ON" if fac_gate else "",
         )
-        if fac_gate:
+        if fac_gate or fac_lambda or prior_gate:
             # FAC's own predicted DTW; in head-space base - fac_raw == fac_rem_dtw.
-            # The gate keys on this to release the anchor when FAC predicts deep.
+            # The gate/lambda keys on this to release the anchor where FAC predicts
+            # deep (the saturation regime).
             fac_pred_dtw = np.where(fac_present, base - fac_raw, np.nan)
+    if prior_gate:
+        # Deep expert: crossfit regional-deep well IDW, the only prior that wins the
+        # 30+m band. Same head-space convention as the FAC anchor.
+        deep_anchor_col = (
+            DEEP_REGIONAL_WTE_ANOM_COL
+            if target_mode == TARGET_WTE_RESIDUAL
+            else DEEP_REGIONAL_WTE_COL
+        )
+        if deep_anchor_col not in qn.columns:
+            raise SystemExit(
+                f"--prior-gate: column {deep_anchor_col!r} not in query nodes"
+            )
+        deep_raw = qn[deep_anchor_col].to_numpy("float64")
+        deep_present = np.isfinite(deep_raw)
+        deep_pred_dtw = np.where(deep_present, base - deep_raw, np.nan)
+        log.info(
+            "--prior-gate deep expert: anchor col %s, %d/%d wells carry deep (%.1f%%)",
+            deep_anchor_col,
+            int(deep_present.sum()),
+            len(qn),
+            100.0 * deep_present.mean(),
+        )
 
     # --- depth-aware loss weighting: upweight the shallow band (FAC's gold) ---------
     sample_w_t = None
-    if args.shallow_weight != 1.0:
+    if args.depth_weight_scale > 0.0 and args.shallow_weight != 1.0:
+        raise SystemExit("--depth-weight-scale is exclusive with --shallow-weight")
+    if args.depth_weight_scale > 0.0:
+        s = args.depth_weight_scale
+        sample_w = (s / (s + np.maximum(obs_dtw, 0.0))).astype("float32")
+        sample_w /= sample_w.mean()
+        sample_w_t = torch.as_tensor(sample_w, dtype=torch.float32, device=device)
+        log.info(
+            "continuous depth-aware loss: w = %.1f/(%.1f + obs_dtw), mean-normalized "
+            "(w at 0m=%.2f, 5m=%.2f, 30m=%.2f)",
+            s,
+            s,
+            float(sample_w.max()),
+            float(np.median(sample_w[np.abs(obs_dtw - 5.0) < 1.0]))
+            if (np.abs(obs_dtw - 5.0) < 1.0).any()
+            else float("nan"),
+            float(np.median(sample_w[obs_dtw > 30.0]))
+            if (obs_dtw > 30.0).any()
+            else float("nan"),
+        )
+    elif args.shallow_weight != 1.0:
         sample_w = np.where(
             obs_dtw < args.shallow_thresh_m, args.shallow_weight, 1.0
         ).astype("float32")
@@ -1013,6 +1127,9 @@ def main() -> None:
     f_pf = pf_ea.shape[1] if use_pf else None  # portfolio edge-attr width (6B)
     native_oof = np.full(len(qn), np.nan)
     gate_oof = np.full(len(qn), np.nan) if fac_gate else None
+    lambda_oof = np.full(len(qn), np.nan) if fac_lambda else None
+    sigma_oof = np.full(len(qn), np.nan) if args.sigma_head else None
+    prior_gate_oof = np.full((len(qn), 3), np.nan) if prior_gate else None
     learned_aquifer = use_aquifer and args.aquifer_route == "learned"
     aquifer_gate_oof = np.full(len(qn), np.nan) if learned_aquifer else None
     # per-edge portfolio attention, collected on each fold's test rows (6B OOF dump).
@@ -1058,6 +1175,9 @@ def main() -> None:
             pinball=args.pinball,
             fac_skip=fac_skip,
             fac_gate=fac_gate,
+            fac_lambda=fac_lambda,
+            sigma=args.sigma_head,
+            prior_gate=prior_gate,
             directional_edges=args.directional_edges,
             **aquifer_kwargs,
         ).to(device)
@@ -1066,8 +1186,8 @@ def main() -> None:
         probe_feat = {**graph_tensors, "query_x": probe_x}
         yc0 = float(np.median(target))
         ys0 = float(1.4826 * np.median(np.abs(target - yc0)) or 1.0)
-        if fac_skip:
-            if fac_gate:
+        if use_fac_anchor:
+            if fac_pred_dtw is not None:
                 pc0 = float(np.nanmedian(fac_pred_dtw))
                 ps0 = float(1.4826 * np.nanmedian(np.abs(fac_pred_dtw - pc0)) or 1.0)
                 probe_feat |= _fac_feat(
@@ -1075,6 +1195,20 @@ def main() -> None:
                 )
             else:
                 probe_feat |= _fac_feat(fac_raw, fac_present, yc0, ys0, device)
+        if prior_gate:
+            dc0 = float(np.nanmedian(deep_pred_dtw))
+            ds0 = float(1.4826 * np.nanmedian(np.abs(deep_pred_dtw - dc0)) or 1.0)
+            probe_feat |= _fac_feat(
+                deep_raw,
+                deep_present,
+                yc0,
+                ys0,
+                device,
+                deep_pred_dtw,
+                dc0,
+                ds0,
+                prefix="deep",
+            )
         if has_anchor_bc:
             bc0 = (
                 anchor_head_m
@@ -1146,8 +1280,8 @@ def main() -> None:
             (target - y_c) / y_s, dtype=torch.float32, device=device
         )
         feat = {**graph_tensors, "query_x": query_x}
-        if fac_skip:
-            if fac_gate:
+        if use_fac_anchor:
+            if fac_pred_dtw is not None:
                 trp = tr & fac_present
                 pc = float(np.median(fac_pred_dtw[trp]))
                 ps = float(1.4826 * np.median(np.abs(fac_pred_dtw[trp] - pc)) or 1.0)
@@ -1156,6 +1290,21 @@ def main() -> None:
                 )
             else:
                 feat |= _fac_feat(fac_raw, fac_present, y_c, y_s, device)
+        if prior_gate:
+            trd = tr & deep_present
+            dc = float(np.median(deep_pred_dtw[trd]))
+            ds = float(1.4826 * np.median(np.abs(deep_pred_dtw[trd] - dc)) or 1.0)
+            feat |= _fac_feat(
+                deep_raw,
+                deep_present,
+                y_c,
+                y_s,
+                device,
+                deep_pred_dtw,
+                dc,
+                ds,
+                prefix="deep",
+            )
         # WTE Dirichlet BC value, standardized in THIS fold's target space (so the
         # injected head sits on the same scale as the standardized model output).
         if has_anchor_bc:
@@ -1183,6 +1332,9 @@ def main() -> None:
             pinball=args.pinball,
             fac_skip=fac_skip,
             fac_gate=fac_gate,
+            fac_lambda=fac_lambda,
+            sigma=args.sigma_head,
+            prior_gate=prior_gate,
             directional_edges=args.directional_edges,
             **aquifer_kwargs,
         ).to(device)
@@ -1207,6 +1359,17 @@ def main() -> None:
         if fac_gate and model.last_fac_gate is not None:
             # last_fac_gate is from train_fold's final full-batch forward (all queries).
             gate_oof[test] = model.last_fac_gate.cpu().numpy().reshape(-1)[test]
+        if fac_lambda and model.last_fac_lambda is not None:
+            # per-well convex mixing weight from the final full-batch forward.
+            lambda_oof[test] = model.last_fac_lambda.cpu().numpy().reshape(-1)[test]
+        if args.sigma_head and model.sigma_log_b is not None:
+            # Laplace scale b in METERS (de-standardized by this fold's y_s).
+            sigma_oof[test] = (
+                np.exp(model.sigma_log_b.detach().cpu().numpy().reshape(-1)[test]) * y_s
+            )
+        if prior_gate and model.last_prior_gate is not None:
+            # per-well softmax weights (fac/deep/head) from the final full-batch forward.
+            prior_gate_oof[test] = model.last_prior_gate.cpu().numpy()[test]
         if learned_aquifer and model.last_aquifer_gate is not None:
             # per-query sigmoid gate from the final full-batch forward (all queries).
             aquifer_gate_oof[test] = (
@@ -1270,6 +1433,45 @@ def main() -> None:
         )
         log.info("fac-gate mean OOF gate by obs-depth: %s", msg)
 
+    if fac_lambda:
+        # Mechanism read: lambda should sit HIGH shallow (FAC's regime) and RELEASE
+        # deep. The OOF lambda column is the shallow terrain-coupled-zone map.
+        bands = [(0, 2), (2, 5), (5, 10), (10, 30), (30, np.inf)]
+        msg = "; ".join(
+            f"{lo}-{hi if hi != np.inf else '+'}m "
+            f"lam={np.nanmean(lambda_oof[m]):.2f}(n={int(m.sum())})"
+            for lo, hi in bands
+            if (m := (obs_dtw >= lo) & (obs_dtw < hi) & fac_present).any()
+        )
+        log.info("fac-lambda mean OOF blend by obs-depth: %s", msg)
+
+    if args.sigma_head:
+        # Mechanism read: sigma should GROW with depth (the unlearnable deep-regional
+        # regime) -- that ordering is what makes selective shallow calls possible.
+        bands = [(0, 2), (2, 5), (5, 10), (10, 30), (30, np.inf)]
+        msg = "; ".join(
+            f"{lo}-{hi if hi != np.inf else '+'}m "
+            f"sig={np.nanmedian(sigma_oof[m]):.2f}m(n={int(m.sum())})"
+            for lo, hi in bands
+            if (m := (obs_dtw >= lo) & (obs_dtw < hi)).any()
+        )
+        log.info("sigma-head median OOF sigma by obs-depth: %s", msg)
+
+    if prior_gate:
+        # Mechanism read: w_fac should dominate shallow (FAC's regime) and w_deep
+        # should RISE with depth toward the deep-IDW expert (the only prior that wins
+        # 30+m). A flat w_head~1 everywhere means the gate never engaged.
+        bands = [(0, 2), (2, 5), (5, 10), (10, 30), (30, np.inf)]
+        msg = "; ".join(
+            f"{lo}-{hi if hi != np.inf else '+'}m "
+            f"fac={np.nanmean(prior_gate_oof[m, 0]):.2f}/"
+            f"deep={np.nanmean(prior_gate_oof[m, 1]):.2f}/"
+            f"head={np.nanmean(prior_gate_oof[m, 2]):.2f}(n={int(m.sum())})"
+            for lo, hi in bands
+            if (m := (obs_dtw >= lo) & (obs_dtw < hi)).any()
+        )
+        log.info("prior-gate mean OOF weights (fac/deep/head) by obs-depth: %s", msg)
+
     if learned_aquifer:
         # The aquifer correction should OPEN (gate->1) where the regional substrate
         # carries signal; log the OOF gate by observed-depth band as the first read on
@@ -1303,6 +1505,15 @@ def main() -> None:
     }
     if fac_gate:
         out_cols["fac_gate_c"] = gate_oof  # learned anchor confidence (diagnostic)
+    if fac_lambda:
+        out_cols["fac_lambda"] = lambda_oof  # convex FAC blend weight (zone map)
+    if args.sigma_head:
+        out_cols["gnn_sigma_m"] = sigma_oof  # per-well Laplace scale (meters)
+    if prior_gate:
+        # three-regime map deliverable: which expert carries each well OOF.
+        out_cols["gate_w_fac"] = prior_gate_oof[:, 0]
+        out_cols["gate_w_deep"] = prior_gate_oof[:, 1]
+        out_cols["gate_w_head"] = prior_gate_oof[:, 2]
     if learned_aquifer:
         out_cols["aquifer_gate"] = aquifer_gate_oof  # per-query aquifer-branch gate
     identity_max = None
@@ -1403,6 +1614,32 @@ def main() -> None:
             "wells_with_fac": int(fac_present.sum()) if fac_skip else None,
             "confidence_gate": bool(fac_gate),
         },
+        "fac_lambda": {
+            "enabled": bool(fac_lambda),
+            "anchor_col": fac_base_col if fac_lambda else None,
+            "wells_with_fac": int(fac_present.sum()) if fac_lambda else None,
+            "mean_oof_lambda": float(np.nanmean(lambda_oof)) if fac_lambda else None,
+        },
+        "sigma_head": {
+            "enabled": bool(args.sigma_head),
+            "median_oof_sigma_m": float(np.nanmedian(sigma_oof))
+            if args.sigma_head
+            else None,
+        },
+        "prior_gate": {
+            "enabled": bool(prior_gate),
+            "fac_anchor_col": fac_base_col if prior_gate else None,
+            "deep_anchor_col": deep_anchor_col if prior_gate else None,
+            "wells_with_fac": int(fac_present.sum()) if prior_gate else None,
+            "wells_with_deep": int(deep_present.sum()) if prior_gate else None,
+            "mean_oof_w": {
+                "fac": float(np.nanmean(prior_gate_oof[:, 0])),
+                "deep": float(np.nanmean(prior_gate_oof[:, 1])),
+                "head": float(np.nanmean(prior_gate_oof[:, 2])),
+            }
+            if prior_gate
+            else None,
+        },
         "aquifer": {
             "enabled": bool(use_aquifer),
             "available_in_bundle": bool(aquifer_block and aquifer_block.get("enabled")),
@@ -1430,6 +1667,9 @@ def main() -> None:
             "shallow_weight": args.shallow_weight,
             "shallow_thresh_m": args.shallow_thresh_m
             if args.shallow_weight != 1.0
+            else None,
+            "depth_weight_scale": args.depth_weight_scale
+            if args.depth_weight_scale > 0.0
             else None,
         },
         "directional_edges": bool(args.directional_edges),

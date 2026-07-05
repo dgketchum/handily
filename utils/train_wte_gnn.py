@@ -312,6 +312,9 @@ class WTEGraphNet(nn.Module):
         pinball: bool = False,
         fac_skip: bool = False,
         fac_gate: bool = False,
+        fac_lambda: bool = False,
+        sigma: bool = False,
+        prior_gate: bool = False,
         directional_edges: bool = False,
         f_aquifer: int | None = None,
         f_aquifer_edge: int | None = None,
@@ -324,6 +327,22 @@ class WTEGraphNet(nn.Module):
         super().__init__()
         if fac_gate and not fac_skip:
             raise ValueError("fac_gate requires fac_skip")
+        if fac_lambda and (fac_skip or fac_gate):
+            # the convex blend REPLACES the additive anchor; running both would let
+            # FAC enter the output twice and make lambda uninterpretable.
+            raise ValueError("fac_lambda is exclusive with fac_skip/fac_gate")
+        if fac_lambda and pinball:
+            raise ValueError("fac_lambda with the pinball head is not supported")
+        if sigma and pinball:
+            raise ValueError("sigma head with the pinball head is not supported")
+        if prior_gate and (fac_skip or fac_gate or fac_lambda):
+            # the K-way mixture REPLACES the 2-way blend / additive anchor; combining
+            # them would let FAC enter the output twice.
+            raise ValueError(
+                "prior_gate is exclusive with fac_skip/fac_gate/fac_lambda"
+            )
+        if prior_gate and pinball:
+            raise ValueError("prior_gate with the pinball head is not supported")
         self.has_anchor = f_anchor is not None
         self.has_ms = f_ms is not None
         self.has_pf = f_pf is not None
@@ -346,8 +365,17 @@ class WTEGraphNet(nn.Module):
         self.pinball = pinball
         self.fac_skip = fac_skip
         self.fac_gate = fac_gate
+        self.fac_lambda = fac_lambda
+        self.sigma = sigma
+        self.prior_gate = prior_gate
         self.directional_edges = directional_edges
         self.last_fac_gate: torch.Tensor | None = None
+        self.last_fac_lambda: torch.Tensor | None = None
+        self.last_prior_gate: torch.Tensor | None = None
+        # heteroscedastic log-scale (Laplace b) from the LAST forward; kept WITH grad
+        # so the trainer's NLL can backprop through it (unlike the detached last_* QA
+        # captures above).
+        self.sigma_log_b: torch.Tensor | None = None
         # Regional-aquifer substrate (Phase 1): an OPTIONAL gated residual correction
         # branch over the proven stream/FAC-residual head, never a wider head. "off"
         # / "fixed_stream" make it an EXACT no-op (the branch is short-circuited so no
@@ -520,6 +548,52 @@ class WTEGraphNet(nn.Module):
                 # an exact no-op over the stream head, then earns its correction.
                 nn.init.zeros_(self.aquifer_delta_head[-1].weight)
                 nn.init.zeros_(self.aquifer_delta_head[-1].bias)
+        # --- lambda blend / sigma head / prior gate: constructed LAST (after every
+        # baseline module) so a run with the flag off draws identical RNG to baseline.
+        if self.fac_lambda:
+            # convex blend: pred = lam * fac_anchor + (1 - lam) * head(h). Unlike
+            # fac_skip's ADDITIVE anchor (head can double-count FAC), convexity forces
+            # an interpretable per-well mixing weight -- lambda IS the shallow
+            # terrain-coupled-zone map. The mlp sees the query context + the anchor
+            # value + FAC's own predicted DTW (the release key), like fac_gate.
+            self.fac_lambda_mlp = nn.Sequential(
+                nn.Linear(head_in + 3, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, 1),
+            )
+            # start FIRMLY on FAC (lam~0.95): epoch-0 behavior is the proven sharp
+            # shallow anchor; releasing to the GNN side is opt-in with evidence.
+            nn.init.constant_(self.fac_lambda_mlp[-1].bias, 3.0)
+        if self.sigma:
+            # heteroscedastic Laplace scale head over the SAME input as the point
+            # head; log_b clamped in forward. Enables selective shallow calls
+            # (use predictions only where sigma is small).
+            self.sigma_head = nn.Sequential(
+                nn.Linear(head_in, hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, 1),
+            )
+        if self.prior_gate:
+            # K=3 softmax mixture generalizing fac_lambda: pred = w_fac*FAC_anchor +
+            # w_deep*deep_regional_anchor + w_head*GNN_head. The gate sees the query
+            # context, both anchor values/presences, each prior's own predicted DTW
+            # and their DISAGREEMENT -- where a shallow terrain prior and a deep
+            # aquifer prior diverge is itself the regime signal no single covariate
+            # carries. Absent priors are masked out of the softmax (weight -> 0,
+            # remaining experts renormalize).
+            self.prior_gate_mlp = nn.Sequential(
+                nn.Linear(head_in + 7, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, 3),
+            )
+            # start mostly on the FREE HEAD (w_head ~ 0.79): epoch-0 behavior is near
+            # baseline, and handing off to an anchor is opt-in with evidence -- the
+            # 3-way analog of fac_lambda's anchored start, inverted because starting
+            # on FAC would poison the deep majority.
+            nn.init.zeros_(self.prior_gate_mlp[-1].bias)
+            with torch.no_grad():
+                self.prior_gate_mlp[-1].bias[2] = 2.0
 
     def _augment_for_skip(self, h: torch.Tensor, g: dict):
         """Append the FAC raw-skip / confidence-gate pieces to the head input.
@@ -604,7 +678,41 @@ class WTEGraphNet(nn.Module):
                 h = torch.cat([q, ctx_reach], dim=-1)
         # FAC raw-skip / confidence-gate pieces (no-op when fac_skip is off).
         h, skip = self._augment_for_skip(h, g)
-        primary = self.head(h).squeeze(-1) + skip
+        if self.sigma:
+            # clamp keeps b in [e^-4, e^4] std units: bounded NLL, no collapse to
+            # zero-variance on easy wells.
+            self.sigma_log_b = torch.clamp(self.sigma_head(h).squeeze(-1), -4.0, 4.0)
+        if self.fac_lambda:
+            fb = g["fac_base"].view(-1, 1)
+            pres = g["fac_present"].view(-1, 1)
+            fpd = g["fac_pred_dtw"].view(-1, 1)
+            lam = pres * torch.sigmoid(
+                self.fac_lambda_mlp(torch.cat([h, fb, pres, fpd], dim=-1))
+            )
+            self.last_fac_lambda = lam.detach()
+            # convex blend; absent FAC -> lam=0 -> pure GNN head (fb is 0 there).
+            primary = (lam * fb + (1.0 - lam) * self.head(h)).squeeze(-1)
+        elif self.prior_gate:
+            fb = g["fac_base"].view(-1, 1)
+            fpres = g["fac_present"].view(-1, 1)
+            fpd = g["fac_pred_dtw"].view(-1, 1)
+            db = g["deep_base"].view(-1, 1)
+            dpres = g["deep_present"].view(-1, 1)
+            dpd = g["deep_pred_dtw"].view(-1, 1)
+            # prior disagreement (std units), defined only where BOTH priors exist.
+            dis = (fpd - dpd) * fpres * dpres
+            logits = self.prior_gate_mlp(
+                torch.cat([h, fb, fpres, fpd, db, dpres, dpd, dis], dim=-1)
+            )
+            # mask absent experts out of the softmax; the head is always present.
+            mask = torch.cat([fpres, dpres, torch.ones_like(fpres)], dim=-1)
+            w = torch.softmax(logits + (1.0 - mask) * -1e9, dim=-1)
+            self.last_prior_gate = w.detach()
+            primary = (
+                w[:, 0:1] * fb + w[:, 1:2] * db + w[:, 2:3] * self.head(h)
+            ).squeeze(-1)
+        else:
+            primary = self.head(h).squeeze(-1) + skip
         # Regional-aquifer correction: gated additive delta over the stream primary.
         # "fixed_stream"/"off" short-circuit (no branch executed, no aquifer dropout
         # drawn) so the run is an EXACT no-op vs baseline; only "learned" contributes.
