@@ -125,6 +125,17 @@ EVIDENCE_FEATURE_COLS = [
     "dist_to_wet_reach_m",  # distance to nearest stream reach with GSW water evidence
     "log1p_dist_to_wet_reach_m",
 ]
+# IrrMapper irrigation frequency (behind --irrigation-features): % of 2015-2024 years
+# a 30 m pixel was classified irrigated. Mechanism: sustained irrigation recharges a
+# local shallow mound the terrain cannot see (flood-irrigated hay valleys), and the
+# GW-subsidy deliverable is scored exactly on these lands -- where the GNN is
+# currently ~2 m too deep. Target-blind (satellite land use, no observed WTE).
+IRRMAPPER_FREQ_RASTERS = {  # per-state EPSG:5070 uint8, nodata None (0 = never irrigated)
+    "MT": "/nas/irrmapper/tif_exports/conus_freq/irrmapper_freq_MT_2015_2024_30m_5070.tif",
+    "NM": "/nas/irrmapper/tif_exports/conus_freq/irrmapper_freq_NM_2015_2024_30m_5070.tif",
+    "NV": "/nas/irrmapper/tif_exports/conus_freq/irrmapper_freq_NV_2015_2024_30m_5070.tif",
+}
+IRRIGATION_FEATURE_COLS = ["irr_freq_pct"]
 # Well model features (leak-free). Everything else on the query node is carried
 # for scoring/diagnostics only.
 QUERY_FEATURE_COLS = ["hand_m", "regional_idw_dtw_oof_m"]
@@ -212,6 +223,18 @@ QUERY_DIAGNOSTIC_COLS = [
     "cv_fold",
     "cv_unit",
     "block_40km",
+]
+# GWX observation metadata carried on query nodes (diagnostics, NEVER features):
+# period-of-record, observation count, and construction depths. These feed the
+# observation-model / label-noise analyses and the contemporary-vs-pre-development
+# split downstream. Missing values stay NaN -- metadata, not model inputs.
+OBS_METADATA_COLS = [
+    "por_start",
+    "por_end",
+    "obs_count",
+    "well_depth",
+    "screen_bottom",
+    "head_above_screen",
 ]
 LATERAL_EDGE_FEATURE_COLS = [
     "lateral_dist_m",
@@ -1210,6 +1233,32 @@ def sample_gridmet(x: np.ndarray, y: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
+def sample_irrigation(x: np.ndarray, y: np.ndarray) -> dict[str, np.ndarray]:
+    """IrrMapper irrigation frequency (%% of 2015-2024 years irrigated) at 5070 coords.
+
+    Per-state rasters: first finite in-bounds value wins (state rasters do not
+    overlap except trivial border slivers). The rasters carry nodata=None, so every
+    in-bounds pixel is valid (0 = never irrigated). Wells outside ALL three state
+    rasters get 0.0 -- outside the mapped-states footprint "no mapped irrigation" is
+    the exact value, not an impute; the count is logged loudly.
+    """
+    out = np.full(np.shape(x), np.nan, dtype="float64")
+    for st, path in IRRMAPPER_FREQ_RASTERS.items():
+        m = ~np.isfinite(out)
+        if not m.any():
+            break
+        out[m] = sample_coarse(path, np.asarray(x)[m], np.asarray(y)[m])
+    n_outside = int((~np.isfinite(out)).sum())
+    if n_outside:
+        log.warning(
+            "irrigation features: %d wells outside every IrrMapper state raster "
+            "-> irr_freq_pct=0 (unmapped, not imputed)",
+            n_outside,
+        )
+        out[~np.isfinite(out)] = 0.0
+    return {"irr_freq_pct": out}
+
+
 def sample_evidence_ndvi(x: np.ndarray, y: np.ndarray) -> dict[str, np.ndarray]:
     """Summer NDVI + summer-minus-winter amplitude at well 5070 coords.
 
@@ -1445,6 +1494,24 @@ def join_stacker_features(
     return True, float(np.isfinite(vals).mean())
 
 
+def join_obs_metadata(wells: pd.DataFrame, path: str) -> dict[str, float]:
+    """Attach GWX observation metadata (OBS_METADATA_COLS) by canonical_id.
+
+    Reindex-maps (not a join) so the wells row order is untouched; wells absent
+    from the GWX index keep NaN. Returns per-column non-null coverage for the
+    manifest.
+    """
+    meta = pd.read_parquet(path, columns=["canonical_id", *OBS_METADATA_COLS])
+    meta = meta.drop_duplicates("canonical_id").set_index("canonical_id")
+    aligned = meta.reindex(wells["canonical_id"].to_numpy())
+    coverage: dict[str, float] = {}
+    for c in OBS_METADATA_COLS:
+        vals = aligned[c].to_numpy()
+        wells[c] = vals
+        coverage[c] = float(pd.notna(vals).mean())
+    return coverage
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -1495,6 +1562,27 @@ def main() -> None:
         "(the built basins). Aligns the training footprint with the wall-to-wall "
         "render domain so every well carries FAC and the model actually learns it; "
         "folds + the regional prior R + deep datum all become basin-local.",
+    )
+    ap.add_argument(
+        "--well-class",
+        nargs="+",
+        default=None,
+        help="keep only queries whose GWX well_class is in this set (e.g. "
+        "'monitoring' for the monitoring-wells-only lineage). Applied before "
+        "folds, so the cross-fit priors R / deep-IDW are built from these wells "
+        "only.",
+    )
+    ap.add_argument(
+        "--obs-metadata",
+        action="store_true",
+        help="carry GWX observation metadata (por_start/por_end, obs_count, "
+        "well_depth, screen_bottom, head_above_screen) onto query nodes as "
+        "diagnostics (never features)",
+    )
+    ap.add_argument(
+        "--gwx-wells",
+        default="/data/ssd2/gwx/products/current/wells.geoparquet",
+        help="GWX well index supplying --obs-metadata columns",
     )
     ap.add_argument("--folds", type=int, default=8)
     ap.add_argument(
@@ -1576,6 +1664,13 @@ def main() -> None:
         type=float,
         default=25.0,
         help="GSW occurrence %% for a reach to count as carrying water evidence",
+    )
+    ap.add_argument(
+        "--irrigation-features",
+        action="store_true",
+        help="add IrrMapper irrigation frequency (%% of 2015-2024 years irrigated, "
+        "per-state 30 m rasters) to the wte_residual query features -- the "
+        "irrigation-recharge mound signal terrain covariates cannot see",
     )
     ap.add_argument(
         "--wet-search-km",
@@ -1725,6 +1820,11 @@ def main() -> None:
             "--fac-rem-feature is wired into the wte_residual query bank only; "
             f"got target={args.target}"
         )
+    if args.irrigation_features and args.target != TARGET_WTE_RESIDUAL:
+        raise SystemExit(
+            "--irrigation-features is wired into the wte_residual query bank only; "
+            f"got target={args.target}"
+        )
     if args.ensemble_member_features and args.target != TARGET_WTE_RESIDUAL:
         raise SystemExit(
             "--ensemble-member-features is wired into the wte_residual query bank only; "
@@ -1798,6 +1898,20 @@ def main() -> None:
     wells["huc2"] = wells["huc8"].str[:2]
     wells["is_nwis"] = wells["source"].isin(NWIS)
     wells = wells.reset_index(drop=True)
+
+    # Query-population filter (e.g. monitoring-only lineage) BEFORE footprint,
+    # folds, and the cross-fit priors, so R / deep-IDW / CV blocks are all built
+    # from the population the model trains on.
+    if args.well_class:
+        n0 = len(wells)
+        wells = wells[wells["well_class"].isin(args.well_class)].reset_index(drop=True)
+        if wells.empty:
+            raise SystemExit(f"--well-class {args.well_class}: no wells match")
+        log.info("--well-class %s: %d/%d wells kept", args.well_class, len(wells), n0)
+    obs_meta_coverage = None
+    if args.obs_metadata:
+        obs_meta_coverage = join_obs_metadata(wells, args.gwx_wells)
+        log.info("obs metadata non-null coverage: %s", obs_meta_coverage)
 
     # Train-where-you-serve: restrict to wells inside FAC-REM raster coverage BEFORE
     # folds/priors, so the regional prior R, deep datum, and HUC12 folds are all
@@ -2164,6 +2278,15 @@ def main() -> None:
             for col, vals in sample_evidence_ndvi(xy[:, 0], xy[:, 1]).items():
                 wells[col] = vals
                 log.info("  %s: %.3f finite frac", col, float(np.isfinite(vals).mean()))
+        if args.irrigation_features:
+            for col, vals in sample_irrigation(xy[:, 0], xy[:, 1]).items():
+                wells[col] = vals
+                log.info(
+                    "  %s: %.3f finite frac, %.3f irrigated frac (>0)",
+                    col,
+                    float(np.isfinite(vals).mean()),
+                    float((vals > 0).mean()),
+                )
         target_col = WTE_RESIDUAL_TARGET_COL
         regional_prior_col = REGIONAL_WTE_COL  # carried; the DTW base is wte_resid_base
         query_feature_cols = (
@@ -2180,6 +2303,7 @@ def main() -> None:
                 if args.terrain_multiscale_features
                 else []
             )
+            + (IRRIGATION_FEATURE_COLS if args.irrigation_features else [])
         )
         log.info(
             "target=wte_residual  residual_base=%s  R=%s  R-MAD(DTW)=%.2f m  "
@@ -2755,6 +2879,8 @@ def main() -> None:
     # Carry the surface datum + observed WTE in both modes (cheap, enables cross-
     # mode diagnostics + the WTE identity check); mode-specific target/priors added.
     extra_keep = [SURFACE_ELEV_COL, OBS_WTE_COL, "well_class", "confinement_class"]
+    if args.obs_metadata:
+        extra_keep += OBS_METADATA_COLS
     if args.wet_propagation_features:
         extra_keep += WET_PROP_QUERY_GATE_COLS
     if args.target == TARGET_WTE:
@@ -3043,6 +3169,14 @@ def main() -> None:
                 "estimate is a feature; FAC enters only as the fac-skip anchor."
                 % (args.gsw_wet_threshold, args.wet_search_km)
             )
+        if args.irrigation_features:
+            leakage_notes.append(
+                "Irrigation features (--irrigation-features): IrrMapper irrigation "
+                "frequency (% of 2015-2024 years irrigated, per-state 30 m EPSG:5070 "
+                "rasters) at the well. Target-blind satellite land-use -- no observed "
+                "WTE enters. Unmapped (outside all state rasters) is set to 0 = 'no "
+                "mapped irrigation' (exact for the MT/NV/NM footprint), count logged."
+            )
         if args.fac_rem_feature:
             leakage_notes.append(
                 "FAC-REM direct feature (--fac-rem-feature): fac_rem_dtw_m (the FAC-REM "
@@ -3156,6 +3290,17 @@ def main() -> None:
         "cv_block_km": args.cv_block_km if args.cv_scheme != "huc4" else None,
         "huc12_polys": args.huc12_polys if args.cv_scheme == "huc12" else None,
         "require_fac": bool(args.require_fac),
+        "well_class_filter": args.well_class,
+        "obs_metadata": (
+            {
+                "cols": OBS_METADATA_COLS,
+                "source": args.gwx_wells,
+                "non_null_coverage": obs_meta_coverage,
+                "role": "diagnostics only -- never model features",
+            }
+            if args.obs_metadata
+            else None
+        ),
         "reach_feature_cols": reach_feature_cols_out,
         "reach_structural_nan_cols": reach_manifest["reach_structural_nan_cols"],
         "channel_edge_feature_cols": reach_manifest["channel_edge_feature_cols"],
@@ -3167,6 +3312,9 @@ def main() -> None:
         if args.relief_etrm_features
         else [],
         "evidence_features": EVIDENCE_FEATURE_COLS if args.evidence_features else [],
+        "irrigation_features": IRRIGATION_FEATURE_COLS
+        if args.irrigation_features
+        else [],
         "ds_datum": ds_datum_block,
         "mainstem_read": mainstem_read_block,
         "wet_propagation": wet_propagation_block,

@@ -494,3 +494,94 @@ def test_sample_reach_covariates_arithmetic(monkeypatch):
     np.testing.assert_allclose(cov["r_ndvi_jja"], [0.8, 0.8])
     np.testing.assert_allclose(cov["r_aridity_index"], [7.0, 7.0])  # gridMET (lon/lat)
     np.testing.assert_array_equal(cov["r_gsw_occ"], occ)  # GSW pass-through (incl NaN)
+
+
+def _write_freq_raster(path, origin_x, values):
+    """3x3 EPSG:5070 uint8 raster at 100 m res, top-left (origin_x, 300), nodata None."""
+    import rasterio
+    from rasterio.transform import from_origin
+
+    arr = np.asarray(values, dtype="uint8").reshape(3, 3)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=3,
+        width=3,
+        count=1,
+        dtype="uint8",
+        crs="EPSG:5070",
+        transform=from_origin(origin_x, 300.0, 100.0, 100.0),
+    ) as dst:
+        dst.write(arr, 1)
+
+
+def test_sample_irrigation_first_finite_wins_and_unmapped_zero(tmp_path, monkeypatch):
+    a = tmp_path / "a.tif"  # covers x in [0, 300)
+    b = tmp_path / "b.tif"  # covers x in [1000, 1300)
+    _write_freq_raster(a, 0.0, [[10] * 3, [20] * 3, [30] * 3])
+    _write_freq_raster(b, 1000.0, [[70] * 3, [80] * 3, [90] * 3])
+    monkeypatch.setattr(bc, "IRRMAPPER_FREQ_RASTERS", {"A": str(a), "B": str(b)})
+    x = np.array([50.0, 1150.0, 5000.0])  # in A / in B / outside both
+    y = np.array([250.0, 150.0, 250.0])
+    out = bc.sample_irrigation(x, y)["irr_freq_pct"]
+    assert out[0] == 10.0  # raster A top row
+    assert out[1] == 80.0  # raster B middle row (A out-of-bounds -> fell through)
+    assert out[2] == 0.0  # outside every raster -> unmapped = 0, never NaN
+    assert np.isfinite(out).all()
+
+
+def test_join_obs_metadata_row_order_missing_and_coverage(tmp_path):
+    gwx = pd.DataFrame(
+        {
+            "canonical_id": ["w1", "w2", "w2", "w3"],  # w2 duplicated in the index
+            "por_start": pd.to_datetime(
+                ["1990-01-01", "2005-06-15", "1980-01-01", None]
+            ),
+            "por_end": pd.to_datetime(["2020-01-01", "2024-06-15", "1990-01-01", None]),
+            "obs_count": [12, 340, 999, 1],
+            "well_depth": [30.0, np.nan, 5.0, 61.0],
+            "screen_bottom": [28.0, 55.0, 4.0, np.nan],
+            "head_above_screen": [10.0, np.nan, 1.0, 2.0],
+        }
+    )
+    path = tmp_path / "gwx.parquet"
+    gwx.to_parquet(path)
+
+    # wells order deliberately differs from the GWX index; 'w9' is absent from it.
+    wells = pd.DataFrame(
+        {"canonical_id": ["w3", "w9", "w1"], "mean_dtw": [1.0, 2.0, 3.0]}
+    )
+    cov = bc.join_obs_metadata(wells, str(path))
+
+    # row order preserved; values map by id; first duplicate row wins for w2 (unused here)
+    assert list(wells["canonical_id"]) == ["w3", "w9", "w1"]
+    assert wells.loc[2, "obs_count"] == 12  # w1
+    assert wells.loc[0, "well_depth"] == 61.0  # w3
+    assert pd.isna(wells.loc[1, "obs_count"])  # w9 absent -> NaN, no row drop
+    assert wells.loc[2, "por_start"] == pd.Timestamp("1990-01-01")
+    # coverage: w9 contributes a miss to every column; w3 has NaN por dates
+    assert cov["obs_count"] == pytest.approx(2 / 3)
+    assert cov["por_start"] == pytest.approx(1 / 3)
+    for c in bc.OBS_METADATA_COLS:
+        assert 0.0 <= cov[c] <= 1.0
+
+
+def test_join_obs_metadata_duplicate_id_keeps_first(tmp_path):
+    gwx = pd.DataFrame(
+        {
+            "canonical_id": ["w2", "w2"],
+            "por_start": pd.to_datetime(["2005-06-15", "1980-01-01"]),
+            "por_end": pd.to_datetime(["2024-06-15", "1990-01-01"]),
+            "obs_count": [340, 999],
+            "well_depth": [7.0, 5.0],
+            "screen_bottom": [55.0, 4.0],
+            "head_above_screen": [3.0, 1.0],
+        }
+    )
+    path = tmp_path / "gwx.parquet"
+    gwx.to_parquet(path)
+    wells = pd.DataFrame({"canonical_id": ["w2"]})
+    bc.join_obs_metadata(wells, str(path))
+    assert wells.loc[0, "obs_count"] == 340
+    assert wells.loc[0, "well_depth"] == 7.0
