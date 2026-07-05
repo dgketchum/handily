@@ -80,10 +80,13 @@ import planetary_computer as pc
 import rasterio
 import requests
 import rioxarray  # noqa: F401 - registers the .rio accessor
+from pyogrio import read_dataframe
 from pystac_client import Client
 from pystac_client.exceptions import APIError
+from rasterio import features as rio_features
 from rasterio.enums import Resampling
 from rasterio.errors import RasterioIOError
+from scipy import ndimage
 from shapely.geometry import box
 
 from handily import regional_fac
@@ -107,6 +110,10 @@ STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 # directly and never touches MPC -- removing the per-HUC8 live-MPC dependency for
 # this static dataset. MPC stays the fallback for any region not yet cached.
 GSW_CACHE_DIR = Path("/nas/hydrography/gsw/occurrence")
+# Canal-aware support inputs (--canal-support): NHD-HR canal/ditch flowlines
+# (ftype 336, MT/NV/NM consolidated to 5070) + MIrAD-2017 irrigated-land mask.
+CANALS_FGB = Path("/nas/hydrography/nhd/canals_mt_nv_nm_5070.fgb")
+IRR_MASK = Path("/nas/handily/covariates/anthropogenic/irrigation_2017.tif")
 
 REM_RASTER = "fac_head_depth_rem_10m.tif"  # depth product rem_fac writes
 WS_RASTER = "fac_rem_water_surface_10m.tif"  # strip-fill water SURFACE (elevation)
@@ -351,6 +358,95 @@ def build_support(
     return out_path
 
 
+def gate_canal_by_irrigation(
+    canal: np.ndarray, irr: np.ndarray, buffer_cells: int
+) -> np.ndarray:
+    """Canal cells within ``buffer_cells`` of irrigated land (bool arrays, same grid).
+
+    A conveyance canal crossing dry rangeland is often perched far above the water
+    table; requiring nearby active irrigation keeps only reaches where recharge
+    plausibly maintains a shallow table. No irrigation in the window -> no canal
+    support at all.
+    """
+    if not irr.any() or not canal.any():
+        return np.zeros_like(canal, dtype=bool)
+    dist = ndimage.distance_transform_edt(~irr)
+    return canal & (dist <= buffer_cells)
+
+
+def build_canal_support(
+    dem_path: Path,
+    gsw_path: Path,
+    out_path: Path,
+    canal_fgb: Path,
+    irr_mask: Path,
+    buffer_m: float,
+    force: bool,
+) -> Path:
+    """Irrigation-gated NHD canal/ditch lines OR'd into the GSW permanent support.
+
+    Rasterizes ftype-336 flowlines onto the DEM grid (all_touched) and keeps only
+    cells within ``buffer_m`` of MIrAD-irrigated land, so the wetted distribution /
+    drain network of active irrigated tracts hard-pins the REM water surface the
+    same way GSW permanent water does. Support is sampled along FAC reach
+    centerlines (rem_fac_topology.estimate_seed_strength), so only canal cells that
+    coincide with FAC reaches ever pin anything -- perched bench canals off the
+    drainage network are excluded by construction, and the irrigation gate drops
+    dry conveyance canals besides.
+    """
+    if out_path.exists() and not force:
+        log.info("canal support exists: %s", out_path)
+        return out_path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(dem_path) as ds:
+        transform, shape = ds.transform, (ds.height, ds.width)
+        dem_bounds = tuple(ds.bounds)
+    with rasterio.open(gsw_path) as ds:
+        gsw = ds.read(1)
+        profile = ds.profile
+
+    lines = read_dataframe(str(canal_fgb), bbox=dem_bounds, columns=["fcode"])
+    log.info("canal support: %d canal/ditch reaches in window", len(lines))
+    if len(lines):
+        canal = rio_features.rasterize(
+            ((geom, 1) for geom in lines.geometry),
+            out_shape=shape,
+            transform=transform,
+            fill=0,
+            all_touched=True,
+            dtype="uint8",
+        ).astype(bool)
+    else:
+        canal = np.zeros(shape, dtype=bool)
+
+    # MIrAD nodata (255) is unmapped/out-of-CONUS, not "unknown irrigation" -- wells
+    # sampled across MT/NV/NM hit only {0,1} -- so it gates as not-irrigated.
+    irr_da = _open(irr_mask).rio.clip_box(*dem_bounds)
+    irr_m = irr_da.rio.reproject_match(_open(dem_path), resampling=Resampling.nearest)
+    irr = np.nan_to_num(irr_m.values, nan=0.0) > 0
+
+    buffer_cells = int(round(buffer_m / abs(transform.a)))
+    gated = gate_canal_by_irrigation(canal, irr, buffer_cells)
+    combined = ((gsw > 0) | gated).astype("uint8")
+
+    profile.update(dtype="uint8", compress="deflate")
+    if min(shape) >= 256:  # GDAL clamps blocks to raster dims; <16-px blocks are invalid
+        profile.update(tiled=True)
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(combined, 1)
+    log.info(
+        "  canal px %d -> irrigation-gated %d (buffer %dm); gsw px %d; "
+        "combined support %d px -> %s",
+        int(canal.sum()),
+        int(gated.sum()),
+        int(buffer_m),
+        int((gsw > 0).sum()),
+        int(combined.sum()),
+        out_path,
+    )
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -432,7 +528,7 @@ def write_config(
 # ---------------------------------------------------------------------------
 
 
-def _force_clean_region(out_dir: Path) -> None:
+def _force_clean_region(out_dir: Path, name: str, recipe: str) -> None:
     """Wipe a region's derived outputs so a --force rebuild regenerates EVERY stage.
 
     ``build_regional_dem`` / ``compute_regional_fac`` skip-if-exists and take no force
@@ -441,11 +537,20 @@ def _force_clean_region(out_dir: Path) -> None:
     and support, which do take force, would rebuild -- on top of the old grid). Remove
     everything except a local ``dem_tiles/`` cache (single-region layout); the batch's
     shared tile cache lives in the out-root, outside out_dir, so it is never touched.
+
+    Multi-recipe safety: inside ``rem/`` only THIS recipe's product dir is removed --
+    a variant's --force must never destroy the baseline ``_scalable`` product (the
+    registry / GNN read it).
     """
     if not out_dir.is_dir():
         return
     for child in out_dir.iterdir():
         if child.name == "dem_tiles":  # preserve the expensive 3DEP download cache
+            continue
+        if child.is_dir() and child.name == "rem":
+            target = child / f"{name}_{recipe}"
+            if target.is_dir():
+                shutil.rmtree(target)
             continue
         if child.is_dir():
             shutil.rmtree(child)
@@ -473,7 +578,7 @@ def build_one_region(
     # halo / threshold / profile actually takes effect (the DEM + FAC stages
     # skip-if-exists and would otherwise reuse the old grid).
     if args.force:
-        _force_clean_region(out_dir)
+        _force_clean_region(out_dir, name, args.recipe)
 
     halo_m = args.halo_km * 1000.0
     halo = poly.buffer(halo_m)
@@ -511,7 +616,8 @@ def build_one_region(
     streams_path = out_dir / "streams_regional.fgb"
     fac_path = out_dir / "flow_accumulation.tif"
 
-    # 3-4. Seed + support
+    # 3-4. Seed + support. Evidence stays under evidence/scalable regardless of
+    # recipe -- seed + GSW derive only from the region, so variants reuse them.
     evidence = out_dir / "evidence" / "scalable"
     seed_path = build_seed(
         dem_path,
@@ -525,11 +631,22 @@ def build_one_region(
         args.occ_threshold,
         args.force,
     )
+    # 4b. Canal-aware recipes: irrigation-gated canals OR'd into the support.
+    if args.canal_support:
+        support_path = build_canal_support(
+            dem_path,
+            support_path,
+            evidence / f"{name}_support_canal_10m.tif",
+            Path(args.canal_fgb),
+            Path(args.irr_mask),
+            args.canal_irr_buffer_m,
+            args.force,
+        )
 
     # 5. Config
-    rem_out = out_dir / "rem" / f"{name}_scalable"
+    rem_out = out_dir / "rem" / f"{name}_{args.recipe}"
     cfg = write_config(
-        out_dir / f"{name}_scalable.toml",
+        out_dir / f"{name}_{args.recipe}.toml",
         Path(args.profile).resolve(),
         dem_path,
         streams_path,
@@ -547,7 +664,9 @@ def build_one_region(
 
     # 6. rem_fac (fresh subprocess so one failure is isolated)
     rem_out.mkdir(parents=True, exist_ok=True)
-    run_log = out_dir / "rem_fac.log"
+    run_log = out_dir / (
+        "rem_fac.log" if args.recipe == "scalable" else f"rem_fac_{args.recipe}.log"
+    )
     log.info("running rem_fac (log: %s) ...", run_log)
     with open(run_log, "w") as fh:
         proc = subprocess.run(
@@ -673,10 +792,13 @@ def run_batch(args) -> None:
 
     built = skipped = failed = 0
     failed_ids: list[str] = []
+    marker_name = (
+        DONE_MARKER if args.recipe == "scalable" else f"{DONE_MARKER}_{args.recipe}"
+    )
     for huc8, poly in targets:
         out_dir = out_root / huc8
-        marker = out_dir / DONE_MARKER
-        rem_path = out_dir / "rem" / f"{huc8}_scalable" / REM_RASTER
+        marker = out_dir / marker_name
+        rem_path = out_dir / "rem" / f"{huc8}_{args.recipe}" / REM_RASTER
         if not args.force and marker.exists() and rem_path.exists():
             log.info("[%s] done (marker + REM raster) -> skip", huc8)
             skipped += 1
@@ -735,7 +857,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--name", help="region label for output naming")
     p.add_argument(
         "--out-dir",
-        help="single-region working dir (default /data/ssd2/handily/scalable_fac_rem/<name>)",
+        help="single-region working dir (default /data/ssd2/handily/huc8/<name>)",
     )
 
     # Batch mode (statewide / HUC8-list). Either flag switches to batch.
@@ -747,7 +869,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--huc8-list", help="file with one HUC8 code per line")
     p.add_argument(
         "--out-root",
-        default="/data/ssd2/handily/scalable_fac_rem",
+        default="/data/ssd2/handily/huc8",
         help="batch root; each HUC8 -> <out-root>/<huc8>/, shared <out-root>/dem_tiles/",
     )
     p.add_argument(
@@ -803,6 +925,30 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--below-bed-offset-m", type=float, default=None)
     p.add_argument("--d-min-off-support-m", type=float, default=None)
 
+    # Canal-aware support (recipe variant; see build_canal_support)
+    p.add_argument(
+        "--recipe",
+        default="scalable",
+        help="product label: rem/<name>_<recipe>/, <name>_<recipe>.toml and the batch "
+        "marker are recipe-suffixed so variants coexist with the baseline "
+        "(fac_rem_registry discovers only *_scalable)",
+    )
+    p.add_argument(
+        "--canal-support",
+        action="store_true",
+        help="OR irrigation-gated NHD canal/ditch lines into the GSW support so the "
+        "wetted distribution/drain network of irrigated tracts hard-pins the REM "
+        "water surface (requires a non-default --recipe)",
+    )
+    p.add_argument("--canal-fgb", default=str(CANALS_FGB))
+    p.add_argument("--irr-mask", default=str(IRR_MASK))
+    p.add_argument(
+        "--canal-irr-buffer-m",
+        type=float,
+        default=300.0,
+        help="keep canal cells within this distance of irrigated (MIrAD) land",
+    )
+
     # Control
     p.add_argument(
         "--no-run", action="store_true", help="prep inputs + write config, skip rem_fac"
@@ -814,15 +960,19 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = p.parse_args(argv)
 
+    if args.canal_support and args.recipe == "scalable":
+        raise SystemExit(
+            "--canal-support would overwrite the baseline '_scalable' product naming "
+            "(registry/GNN read it); pass a variant --recipe, e.g. scalable_canal"
+        )
+
     if args.state or args.huc8_list:
         run_batch(args)
         return
 
     poly, name = resolve_region(args)
     out_dir = (
-        Path(args.out_dir)
-        if args.out_dir
-        else Path(f"/data/ssd2/handily/scalable_fac_rem/{name}")
+        Path(args.out_dir) if args.out_dir else Path(f"/data/ssd2/handily/huc8/{name}")
     )
     try:
         build_one_region(poly, name, out_dir, args)
