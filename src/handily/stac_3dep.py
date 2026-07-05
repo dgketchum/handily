@@ -745,7 +745,13 @@ def mosaic_from_stac(
             ds.close()
 
     srcs = [rasterio.open(p) for p in reprojected]
-    mosaic, mosaic_tr = rio_merge(srcs)
+    # 3DEP projects disagree on nodata (e.g. MT_BitterrootNF_2010 uses
+    # float32-min, MT_RavalliGraniteCusterPowder_2019 uses -999999). merge()
+    # takes output nodata from the first source, and float32-min trips its
+    # "cannot safely be represented" path, yielding an all-zero mosaic when
+    # such a tile sorts first. Force a uniform NaN output nodata; per-source
+    # masking still uses each tile's own declared nodata.
+    mosaic, mosaic_tr = rio_merge(srcs, nodata=float("nan"))
     crs = target_crs
     for ds in srcs:
         try:
