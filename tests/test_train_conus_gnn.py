@@ -216,3 +216,79 @@ def test_sigma_head_nll_smoke_finite_and_trains():
     # the NLL branch actually ran: both heads moved off their zero init.
     assert model.lin.weight.abs().sum() > 0
     assert model.sig.weight.abs().sum() > 0 or model.sig.bias.abs().sum() > 0
+
+
+def test_save_models_checkpoint_roundtrip(tmp_path):
+    """The --save-models persistence contract (GNN_INFERENCE_10M_PLAN Phase 0):
+    q_stats round-trips through apply_stats bitwise, _fac_feat replayed from the
+    persisted (y_c, y_s, pc, ps) reproduces the anchor tensors, and the state_dict
+    loads into a freshly (differently) initialized WTEGraphNet whose eval forward
+    is then identical."""
+    import pandas as pd
+
+    rng = np.random.RandomState(3)
+    qn = pd.DataFrame({"a": rng.randn(10), "b": rng.randn(10)})
+    qn.loc[3, "a"] = np.nan
+    tr = np.ones(10, bool)
+    tr[7:] = False
+    q_stats = tc.fit_stats(qn, ["a", "b"], tr)
+    x0 = tc.apply_stats(qn, q_stats)
+    fac_raw = rng.randn(10)
+    fac_present = np.isfinite(fac_raw)
+    fac_pred = rng.rand(10) * 10.0
+    y_c, y_s, pc, ps = 0.4, 2.0, 5.0, 3.0
+    feat0 = tc._fac_feat(fac_raw, fac_present, y_c, y_s, "cpu", fac_pred, pc, ps)
+
+    torch.manual_seed(0)
+    model = tc.WTEGraphNet(3, 2, 1, 1, 8, 2, 0.1, prior_gate=True)
+    torch.save(
+        {
+            "fold": 0,
+            "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            "y_c": y_c,
+            "y_s": y_s,
+            "q_stats": q_stats,
+            "fac_stats": {"pc": pc, "ps": ps},
+            "deep_stats": {"dc": 0.0, "ds": 1.0},
+            "mirror_stats": None,
+        },
+        tmp_path / "fold_0.pt",
+    )
+    # weights_only=False: the checkpoint deliberately carries the pandas-backed
+    # fit_stats dict (the standardization contract), not just tensors.
+    ck = torch.load(tmp_path / "fold_0.pt", weights_only=False)
+
+    assert np.array_equal(tc.apply_stats(qn, ck["q_stats"]), x0)
+    feat1 = tc._fac_feat(
+        fac_raw,
+        fac_present,
+        ck["y_c"],
+        ck["y_s"],
+        "cpu",
+        fac_pred,
+        ck["fac_stats"]["pc"],
+        ck["fac_stats"]["ps"],
+    )
+    assert set(feat1) == set(feat0)
+    assert all(torch.equal(feat0[k], feat1[k]) for k in feat0)
+
+    torch.manual_seed(99)  # different init: the load must fully overwrite it
+    m2 = tc.WTEGraphNet(3, 2, 1, 1, 8, 2, 0.1, prior_gate=True)
+    m2.load_state_dict(ck["state_dict"])
+    torch.manual_seed(7)
+    g = {
+        "reach_x": torch.randn(4, 3),
+        "query_x": torch.randn(3, 2),
+        "ch_ei": torch.tensor([[0, 1, 2], [1, 2, 3]]),
+        "ch_ea": torch.randn(3, 1),
+        "lat_ei": torch.tensor([[0, 1, 2], [0, 0, 1]]),
+        "lat_ea": torch.randn(3, 1),
+        "fac_base": torch.randn(3),
+        "fac_present": torch.ones(3),
+        "fac_pred_dtw": torch.randn(3),
+        "deep_base": torch.randn(3),
+        "deep_present": torch.ones(3),
+        "deep_pred_dtw": torch.randn(3),
+    }
+    with torch.no_grad():
+        assert torch.equal(model.eval()(g), m2.eval()(g))

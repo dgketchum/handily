@@ -658,3 +658,292 @@ def test_prior_gate_rejects_anchor_and_pinball_combos():
             tg.WTEGraphNet(
                 F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, prior_gate=True, **kw
             )
+
+
+# --- terrain-mirror expert (4-way gate: fac / deep / mirror / head) ---------------
+def _mirror_tensors():
+    torch.manual_seed(17)
+    return {
+        "mirror_base": torch.randn(3),  # base - d, standardized; always present
+        "mirror_pred_dtw": torch.zeros(3),  # constant d -> standardized 0
+    }
+
+
+def _mirror_gate_model(seed=0):
+    torch.manual_seed(seed)
+    return tg.WTEGraphNet(
+        F_REACH,
+        F_QUERY,
+        F_CH,
+        F_LAT,
+        HIDDEN,
+        2,
+        0.1,
+        prior_gate=True,
+        mirror_anchor=True,
+    )
+
+
+def test_mirror_gate_expert_limits_and_masking():
+    g = {**_tiny_graph(), **_fac_tensors(), **_deep_tensors(), **_mirror_tensors()}
+    base = _base_model(seed=0).eval()
+    m = _mirror_gate_model(seed=0).eval()
+    with torch.no_grad():
+        torch.nn.init.zeros_(m.prior_gate_mlp[-1].weight)
+        bias = m.prior_gate_mlp[-1].bias
+        # force the MIRROR expert: pred == mirror_base EVERYWHERE (always present).
+        bias.zero_()
+        bias[2] = 50.0
+        out = m(g)
+        assert torch.allclose(out, g["mirror_base"], atol=1e-4)
+        w = m.last_prior_gate
+        assert w.shape == (3, 4)
+        assert torch.allclose(w.sum(dim=-1), torch.ones(3), atol=1e-5)
+        # absent-prior masking still applies to fac/deep in the 4-way softmax.
+        bias.zero_()
+        bias[0] = 50.0
+        m(g)
+        assert m.last_prior_gate[2, 0] == 0.0  # absent FAC on query 2
+        # force the FREE HEAD (last expert): pred == baseline model output.
+        bias.zero_()
+        bias[3] = 50.0
+        assert torch.allclose(m(g), base(g), atol=1e-5)
+
+
+def test_mirror_gate_off_is_3way_and_requires_prior_gate():
+    # without mirror_anchor the gate stays 3-way (bias length 3).
+    assert _gate_model(seed=0).prior_gate_mlp[-1].bias.shape[0] == 3
+    assert _mirror_gate_model(seed=0).prior_gate_mlp[-1].bias.shape[0] == 4
+    with pytest.raises(ValueError):
+        tg.WTEGraphNet(
+            F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, mirror_anchor=True
+        )
+
+
+# --- last_head_out capture: the inference-render decomposition contract ------------
+# The 10 m renderer recomposes wte_hat = sum w_i * expert_i (GNN_INFERENCE_10M_PLAN);
+# these pin the identity against the live forward via the captured head output.
+def test_last_head_out_plain_model_equals_primary():
+    g = _tiny_graph()
+    m = _base_model(seed=0).eval()
+    with torch.no_grad():
+        out = m(g)
+    assert m.last_head_out is not None
+    assert not m.last_head_out.requires_grad  # detached QA capture
+    # no skip/gate -> the primary IS the head output.
+    assert torch.equal(out, m.last_head_out)
+
+
+def test_prior_gate_mixture_identity_via_last_head_out():
+    g = {**_tiny_graph(), **_fac_tensors(), **_deep_tensors()}
+    m = _gate_model(seed=0).eval()
+    with torch.no_grad():
+        out = m(g)
+    w = m.last_prior_gate
+    recomposed = (
+        w[:, 0] * g["fac_base"] + w[:, 1] * g["deep_base"] + w[:, 2] * m.last_head_out
+    )
+    assert torch.allclose(out, recomposed, atol=1e-6)
+
+
+def test_mirror_gate_mixture_identity_via_last_head_out():
+    g = {**_tiny_graph(), **_fac_tensors(), **_deep_tensors(), **_mirror_tensors()}
+    m = _mirror_gate_model(seed=0).eval()
+    with torch.no_grad():
+        out = m(g)
+    w = m.last_prior_gate
+    recomposed = (
+        w[:, 0] * g["fac_base"]
+        + w[:, 1] * g["deep_base"]
+        + w[:, 2] * g["mirror_base"]
+        + w[:, 3] * m.last_head_out
+    )
+    assert torch.allclose(out, recomposed, atol=1e-6)
+
+
+# --- Dupuit hang expert (gate expert: fac / deep / [mirror] / hang / head) ---------
+def _hang_tensors(pres=(1.0, 1.0, 0.0)):
+    torch.manual_seed(19)
+    p = torch.tensor(pres)
+    return {
+        "hang_base": torch.randn(3) * p,  # base - hang_dtw, standardized
+        "hang_present": p,
+        "hang_pred_dtw": torch.randn(3) * p,
+    }
+
+
+def _hang_gate_model(seed=0, mirror=False):
+    torch.manual_seed(seed)
+    return tg.WTEGraphNet(
+        F_REACH,
+        F_QUERY,
+        F_CH,
+        F_LAT,
+        HIDDEN,
+        2,
+        0.1,
+        prior_gate=True,
+        mirror_anchor=mirror,
+        hang_anchor=True,
+    )
+
+
+def test_hang_gate_expert_limits_and_masking():
+    g = {**_tiny_graph(), **_fac_tensors(), **_deep_tensors(), **_hang_tensors()}
+    base = _base_model(seed=0).eval()
+    m = _hang_gate_model(seed=0).eval()
+    with torch.no_grad():
+        torch.nn.init.zeros_(m.prior_gate_mlp[-1].weight)
+        bias = m.prior_gate_mlp[-1].bias
+        assert bias.shape[0] == 4  # fac, deep, hang, head
+        # force the HANG expert: pred == hang_base where present, masked on query 2.
+        bias.zero_()
+        bias[2] = 50.0
+        out = m(g)
+        assert torch.allclose(out[:2], g["hang_base"][:2], atol=1e-4)
+        w = m.last_prior_gate
+        assert torch.allclose(w.sum(dim=-1), torch.ones(3), atol=1e-5)
+        assert w[2, 2] == 0.0  # absent hang masked out of the softmax
+        # force the FREE HEAD (last expert): pred == baseline model output.
+        bias.zero_()
+        bias[3] = 50.0
+        assert torch.allclose(m(g), base(g), atol=1e-5)
+
+
+def test_hang_with_mirror_is_5way_and_mixture_identity():
+    g = {
+        **_tiny_graph(),
+        **_fac_tensors(),
+        **_deep_tensors(),
+        **_mirror_tensors(),
+        **_hang_tensors(),
+    }
+    m = _hang_gate_model(seed=0, mirror=True).eval()
+    assert m.prior_gate_mlp[-1].bias.shape[0] == 5
+    with torch.no_grad():
+        out = m(g)
+    w = m.last_prior_gate
+    recomposed = (
+        w[:, 0] * g["fac_base"]
+        + w[:, 1] * g["deep_base"]
+        + w[:, 2] * g["mirror_base"]
+        + w[:, 3] * g["hang_base"]
+        + w[:, 4] * m.last_head_out
+    )
+    assert torch.allclose(out, recomposed, atol=1e-6)
+
+
+def test_hang_anchor_requires_prior_gate():
+    with pytest.raises(ValueError):
+        tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, hang_anchor=True)
+
+
+# ---------------------------------------------------------------------------
+# Spatial-context read: additive attention slot over lattice ring cells
+# ---------------------------------------------------------------------------
+F_SC_N, F_SC_E = 5, 7
+
+
+def _sc_graph():
+    """_tiny_graph + a spatial-context read: q0 gets 3 cell edges, q1 gets 2, q2 none."""
+    g = _tiny_graph()
+    g["sc_x"] = torch.randn(6, F_SC_N)  # 6 shared lattice cells
+    g["sc_ei"] = torch.tensor(
+        [[0, 1, 2, 3, 4], [0, 0, 0, 1, 1]]
+    )  # cell(src) -> query(dst)
+    g["sc_ea"] = torch.randn(5, F_SC_E)
+    return g
+
+
+def _sc_model(seed=0, **kw):
+    torch.manual_seed(seed)
+    return tg.WTEGraphNet(
+        F_REACH,
+        F_QUERY,
+        F_CH,
+        F_LAT,
+        HIDDEN,
+        2,
+        0.1,
+        f_sc_node=F_SC_N,
+        f_sc_edge=F_SC_E,
+        **kw,
+    )
+
+
+def test_spatial_context_forward_shape_and_attention():
+    g = _sc_graph()
+    m = _sc_model().eval()
+    assert m.has_sc
+    assert m.head[0].in_features == HIDDEN * 3  # [q, ctx_reach] + ctx_sc
+    with torch.no_grad():
+        out = m(g)
+    assert out.shape == (3,)
+    assert torch.isfinite(out).all()  # query 2 has no sc edge -> zero ctx, finite
+    a = m.sc_read.last_attn.reshape(-1)
+    assert a.shape == (5,)
+    # segment softmax per query: q0's 3 edges and q1's 2 edges each sum to 1
+    assert torch.isclose(a[:3].sum(), torch.tensor(1.0), atol=1e-6)
+    assert torch.isclose(a[3:].sum(), torch.tensor(1.0), atol=1e-6)
+
+
+def test_spatial_context_composes_with_portfolio_read():
+    # the SC read is an ADDITIVE slot: it must stack on the exclusive pf slot,
+    # because the production arms keep their portfolio/gate configuration.
+    g = _sc_graph()
+    g["pf_ei"] = torch.tensor([[0, 1, 2, 3], [0, 0, 0, 1]])
+    g["pf_ea"] = torch.randn(4, F_PF)
+    torch.manual_seed(0)
+    m = tg.WTEGraphNet(
+        F_REACH,
+        F_QUERY,
+        F_CH,
+        F_LAT,
+        HIDDEN,
+        2,
+        0.1,
+        f_pf=F_PF,
+        f_sc_node=F_SC_N,
+        f_sc_edge=F_SC_E,
+    ).eval()
+    assert m.has_pf and m.has_sc
+    assert m.head[0].in_features == HIDDEN * 4  # [q, ctx_reach, ctx_pf, ctx_sc]
+    with torch.no_grad():
+        out = m(g)
+    assert out.shape == (3,) and torch.isfinite(out).all()
+
+
+def test_spatial_context_composes_with_prior_gate_mirror():
+    # constructor-level width check for the production arm shape (gate + mirror + sigma):
+    # head/gate/sigma all read head_in = hidden*3 ([q, ctx_reach, ctx_sc]).
+    m = _sc_model(prior_gate=True, mirror_anchor=True, sigma=True)
+    assert m.head[0].in_features == HIDDEN * 3
+    assert m.sigma_head[0].in_features == HIDDEN * 3
+    assert m.prior_gate_mlp[0].in_features == HIDDEN * 3 + 7 + 3
+    assert m.prior_gate_mlp[-1].bias.shape[0] == 4  # fac/deep/mirror/head
+
+
+def test_spatial_context_off_is_baseline_state_dict():
+    base = tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1)
+    assert not base.has_sc
+    assert not hasattr(base, "sc_read") and not hasattr(base, "sc_enc")
+    assert not any(k.startswith(("sc_read", "sc_enc")) for k in base.state_dict())
+
+
+def test_spatial_context_uses_the_edge_context():
+    g = _sc_graph()
+    m = _sc_model().eval()
+    with torch.no_grad():
+        out_full = m(g)
+        g2 = dict(g)
+        g2["sc_ei"] = torch.empty(2, 0, dtype=torch.long)  # no sc edges at all
+        g2["sc_ea"] = torch.empty(0, F_SC_E)
+        out_none = m(g2)
+    assert not torch.allclose(out_full[:2], out_none[:2], atol=1e-5)
+
+
+def test_spatial_context_requires_both_widths():
+    with pytest.raises(ValueError):
+        tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, f_sc_node=F_SC_N)
+    with pytest.raises(ValueError):
+        tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, f_sc_edge=F_SC_E)

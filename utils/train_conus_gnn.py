@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_conus_graph_inputs import (  # noqa: E402
     DEEP_REGIONAL_WTE_ANOM_COL,
     DEEP_REGIONAL_WTE_COL,
+    DUPUIT_FEATURE_COLS,
     FAC_REM_WTE_ANOM_COL,
     FAC_REM_WTE_COL,
     HAND_WTE_COL,
@@ -45,6 +46,10 @@ from build_conus_graph_inputs import (  # noqa: E402
     TARGET_WTE,
     TARGET_WTE_RESIDUAL,
 )
+
+# The hang expert's DTW column (--hang-anchor): the well-free Dupuit hang surface
+# depth written by the builder's --dupuit-hang-features.
+HANG_DTW_COL = DUPUIT_FEATURE_COLS[0]
 
 # Head-space target modes (WTE elevation OR residual-over-R): both reconstruct DTW
 # as `base - native` and carry obs_wte/z_surf; dtw_residual reconstructs `base + native`.
@@ -401,6 +406,13 @@ def main() -> None:
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto")
+    p.add_argument(
+        "--save-models",
+        action="store_true",
+        help="persist per-fold weights + the full standardization contract for raster "
+        "inference (models/fold_*.pt, models/shared_stats.pt, "
+        "models/inference_manifest.json); see notes/GNN_INFERENCE_10M_PLAN.md",
+    )
     # v2: anchor BC + pinball deep head ---------------------------------------
     p.add_argument(
         "--no-anchors",
@@ -452,6 +464,32 @@ def main() -> None:
         "step weight: a 2m well gets ~4x the weight of a 30m well at s=5",
     )
     p.add_argument(
+        "--confidence-weight",
+        type=float,
+        default=0.0,
+        help="depth-STRATIFIED confinement-confidence loss weight, alpha in [0,1] "
+        "(0 = off). Per-well raw weight = (1-alpha) + alpha*confinement_confidence, then "
+        "mean-normalized WITHIN each obs-depth band so the depth mix is preserved (raw "
+        "confidence is depth-confounded; see notes/ERROR_SOURCES.md). Down-weights "
+        "low-confidence (probable-mislabel) unconfined wells. Multiplies any depth weight. "
+        "Wells with no modeled confidence get neutral weight 1.0 (logged).",
+    )
+    p.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.0,
+        help="high-confidence training ablation: zero the loss weight for wells with "
+        "confinement_confidence < this (and for wells with no confidence). Excludes them "
+        "from the fit while keeping them in the scored OOF footprint. 0 = off.",
+    )
+    p.add_argument(
+        "--confidence-table",
+        default="/data/ssd2/handily/conus/wte_gnn/confidence_by_canonical.parquet",
+        help="parquet keyed by canonical_id with confinement_confidence (deduped); "
+        "source for --confidence-weight / --min-confidence. Built from the GWX product "
+        "version the bundle was keyed against (previous/, 8-char canonical_id).",
+    )
+    p.add_argument(
         "--fac-lambda",
         action="store_true",
         help="learned CONVEX blend head: pred = lam*FAC_anchor + (1-lam)*GNN_head, "
@@ -480,6 +518,37 @@ def main() -> None:
         "a three-regime map (terrain-coupled / deep-regional / free-head). "
         "Head-space targets only; exclusive with --fac-skip/--fac-gate/--fac-lambda/"
         "--pinball; composes with --sigma-head and the depth weights",
+    )
+    p.add_argument(
+        "--mirror-anchor",
+        action="store_true",
+        help="add a terrain-MIRROR expert to the prior gate (requires --prior-gate): "
+        "the subdued-replica shallow prior WTE = z_surf - d (constant DTW = d). "
+        "Head-space anomaly = base - d, built trainer-side from the carried "
+        "wte_resid_base -- well-free, target-blind, no rebuild. The gate becomes a "
+        "4-way softmax [fac, deep, mirror, head] and additionally sees "
+        "(fac_base - mirror_base), the scale-consistent 'FAC deeper than d' regime "
+        "signal. Gives the gate a shallow ruler where FAC over-deepens off-channel",
+    )
+    p.add_argument(
+        "--mirror-depth-m",
+        type=float,
+        default=3.0,
+        help="mirror offset d in meters (the small distance the water table sits "
+        "below the land surface under the mirror hypothesis)",
+    )
+    p.add_argument(
+        "--hang-anchor",
+        action="store_true",
+        help="add a Dupuit HANG expert to the prior gate (requires --prior-gate and "
+        "a bundle built with --dupuit-hang-features): the well-free boundary-"
+        "conditioned WTE hang surface, WTE = z_surf - dupuit_hang_dtw_m (kNN-IDW of "
+        "top-2-Strahler reach elevations). Head-space anomaly = base - "
+        "dupuit_hang_dtw_m; its own predicted DTW is dupuit_hang_dtw_m. The gate "
+        "additionally sees the hang-vs-deep DTW disagreement (boundary datum vs "
+        "well-IDW deep datum). Expert order [fac, deep, (mirror), hang, head]. "
+        "Gives the gate a regional-datum ruler where the well-IDW priors blow up "
+        "(Rathdrum-type basins); leak-free (stream elevations only)",
     )
     p.add_argument(
         "--directional-edges",
@@ -511,6 +580,26 @@ def main() -> None:
         "build_conus_graph_inputs.py --portfolio-read (portfolio_edges.parquet). The site "
         "reaches (+ their 2-hop channel context) are unioned into the prune set. Writes "
         "gnn_portfolio_attention.parquet. See notes/GNN_PHASE6_PLAN.md 6B.",
+    )
+    p.add_argument(
+        "--spatial-context",
+        action="store_true",
+        help="add the multi-scale spatial-context read: each well attends (segment-"
+        "softmax) over its lattice-snapped ring cells (2000/10000 m radii x 8 octants) carrying "
+        "the target-blind covariate bank, with azimuth/ring/rel-elev edge attrs -- the "
+        "direction x scale terrain view the point covariates radially average away. "
+        "ADDITIVE to the portfolio/mainstem read (own head slot). Requires a bundle "
+        "built with build_conus_graph_inputs.py --spatial-context. Writes "
+        "gnn_sc_attention.parquet. See notes/SPATIAL_CONTEXT.md.",
+    )
+    p.add_argument(
+        "--sc-no-azimuth",
+        action="store_true",
+        help="(control arm) drop the sc_sin_az/sc_cos_az edge channels before "
+        "standardization, reducing the spatial-context read to a radial mean (ring "
+        "one-hot + distance + rel-elev). The isolating ablation for the direction "
+        "bet: full ~= no-azimuth means the context nodes just rebuilt the saturated "
+        "point covariates.",
     )
     p.add_argument(
         "--query-writeback",
@@ -654,6 +743,38 @@ def main() -> None:
             )
         pf = pd.read_parquet(pf_path)
         pf_cols = man["portfolio_read"]["feature_cols"]
+
+    # --- spatial-context nodes/edges: rings x 8 octants of lattice cells per query -----
+    # SC cells are their OWN node set (indexed by sc_node_idx, independent of reach
+    # pruning), so unlike the portfolio sites they need no prune-union or remap.
+    use_sc = args.spatial_context
+    if args.sc_no_azimuth and not use_sc:
+        raise SystemExit("--sc-no-azimuth requires --spatial-context")
+    scn = sce = None
+    sc_node_cols = sc_edge_cols = None
+    if use_sc:
+        scn_path = gdir / "spatial_context_nodes.parquet"
+        sce_path = gdir / "spatial_context_edges.parquet"
+        if (
+            not scn_path.exists()
+            or not sce_path.exists()
+            or not man.get("spatial_context")
+        ):
+            raise SystemExit(
+                "--spatial-context set but the bundle has no spatial_context parquets "
+                "/ manifest block -- rebuild the graph with "
+                "build_conus_graph_inputs.py --spatial-context"
+            )
+        scn = pd.read_parquet(scn_path)
+        sce = pd.read_parquet(sce_path)
+        sc_node_cols = man["spatial_context"]["node_feature_cols"]
+        sc_edge_cols = list(man["spatial_context"]["edge_feature_cols"])
+        if args.sc_no_azimuth:
+            # Arm-2 control: strip the azimuth channels BEFORE standardization so the
+            # read degrades to a radial mean -- the isolating direction ablation.
+            sc_edge_cols = [
+                c for c in sc_edge_cols if c not in ("sc_sin_az", "sc_cos_az")
+            ]
 
     # --- prune reach graph to the n-hop neighborhood of attached reaches -------
     # The mainstem datum reaches (+ their own 2-hop channel context) are unioned in so
@@ -828,6 +949,35 @@ def main() -> None:
             device=device,
         )
         graph_tensors |= {"pf_ei": pf_ei, "pf_ea": pf_ea}
+    # spatial-context tensors: cell covariate bank standardized like reach_x, edge attrs
+    # like lat_ea (median-impute + missingness flags); cell->query direction (cell = src).
+    # Both are target-blind constants, so a global fit is train-blind by construction.
+    sc_x_t = sc_ea_t = None
+    if use_sc:
+        sc_x_t = torch.as_tensor(
+            apply_stats(scn, fit_stats(scn, sc_node_cols, None)),
+            dtype=torch.float32,
+            device=device,
+        )
+        sc_ea_t = torch.as_tensor(
+            apply_stats(sce, fit_stats(sce, sc_edge_cols, None)),
+            dtype=torch.float32,
+            device=device,
+        )
+        sc_ei = torch.as_tensor(
+            sce[["sc_node_idx", "query_node_idx"]].to_numpy().T,
+            dtype=torch.long,
+            device=device,
+        )
+        graph_tensors |= {"sc_x": sc_x_t, "sc_ei": sc_ei, "sc_ea": sc_ea_t}
+        log.info(
+            "spatial-context ON%s: %d cells, %d edges, node width %d, edge width %d",
+            " (no-azimuth control)" if args.sc_no_azimuth else "",
+            len(scn),
+            len(sce),
+            sc_x_t.shape[1],
+            sc_ea_t.shape[1],
+        )
     # query->reach write-back (6C): reversed lateral edges (query src -> reach dst), reusing
     # lat_ea unchanged (same attrs, opposite direction). No new file / no prune change.
     if args.query_writeback:
@@ -1086,6 +1236,49 @@ def main() -> None:
             len(qn),
             100.0 * deep_present.mean(),
         )
+    mirror_raw = mirror_present = mirror_pred_dtw = None
+    if args.mirror_anchor:
+        if not prior_gate:
+            raise SystemExit("--mirror-anchor requires --prior-gate")
+        # Terrain-mirror expert: WTE = z_surf - d, i.e. head-space anomaly = base - d
+        # (base is z_surf - R in wte_residual mode, z_surf in wte mode -- both work).
+        # Its own predicted DTW is the constant d. Well-free + target-blind.
+        mirror_raw = base - args.mirror_depth_m
+        mirror_present = np.isfinite(mirror_raw)
+        mirror_pred_dtw = np.where(mirror_present, args.mirror_depth_m, np.nan)
+        log.info(
+            "--mirror-anchor ON: terrain-mirror expert WTE = z_surf - %.1f m "
+            "(%d/%d wells carry it, %.1f%%)",
+            args.mirror_depth_m,
+            int(mirror_present.sum()),
+            len(qn),
+            100.0 * mirror_present.mean(),
+        )
+    hang_raw = hang_present = hang_pred_dtw = None
+    if args.hang_anchor:
+        if not prior_gate:
+            raise SystemExit("--hang-anchor requires --prior-gate")
+        if HANG_DTW_COL not in qn.columns:
+            raise SystemExit(
+                f"--hang-anchor: column {HANG_DTW_COL!r} not in query nodes -- "
+                "rebuild the bundle with --dupuit-hang-features"
+            )
+        # Dupuit hang expert: WTE = z_surf - hang_dtw -> head-space anomaly =
+        # base - hang_dtw (same convention as the deep expert). Well-free
+        # (stream elevations only), target-blind, no cross-fit needed.
+        hang_dtw = qn[HANG_DTW_COL].to_numpy("float64")
+        hang_raw = base - hang_dtw
+        hang_present = np.isfinite(hang_raw)
+        hang_pred_dtw = np.where(hang_present, hang_dtw, np.nan)
+        log.info(
+            "--hang-anchor ON: Dupuit hang expert WTE = z_surf - %s "
+            "(%d/%d wells carry it, %.1f%%; hang DTW median %.1f m)",
+            HANG_DTW_COL,
+            int(hang_present.sum()),
+            len(qn),
+            100.0 * hang_present.mean(),
+            float(np.nanmedian(hang_pred_dtw)),
+        )
 
     # --- depth-aware loss weighting: upweight the shallow band (FAC's gold) ---------
     sample_w_t = None
@@ -1122,18 +1315,96 @@ def main() -> None:
             args.shallow_weight,
         )
 
+    conf_meta = None
+    if args.confidence_weight > 0.0 or args.min_confidence > 0.0:
+        ctab = pd.read_parquet(
+            args.confidence_table, columns=["canonical_id", "confinement_confidence"]
+        ).drop_duplicates("canonical_id")
+        cmap = dict(
+            zip(
+                ctab["canonical_id"].to_numpy(),
+                ctab["confinement_confidence"].to_numpy("float64"),
+            )
+        )
+        conf = qn["canonical_id"].map(cmap).astype("float64").to_numpy()
+        present = np.isfinite(conf)
+        n_null = int((~present).sum())
+        # start from the existing depth weight (or ones), multiply in confidence
+        base_w = (
+            sample_w_t.detach().cpu().numpy().astype("float64")
+            if sample_w_t is not None
+            else np.ones(len(qn), "float64")
+        )
+        w = base_w.copy()
+        if args.confidence_weight > 0.0:
+            a = args.confidence_weight
+            raw = (1.0 - a) + a * conf  # present-only; NaN where absent
+            bands = np.digitize(obs_dtw, [2.0, 5.0, 10.0, 30.0])
+            cw = np.ones(len(qn), "float64")  # null wells stay neutral 1.0
+            for bi in np.unique(bands):
+                m = (bands == bi) & present
+                if m.any():
+                    cw[m] = raw[m] / raw[m].mean()  # band mean -> 1.0
+            w *= cw
+        n_excluded = 0
+        if args.min_confidence > 0.0:
+            keep = present & (conf >= args.min_confidence)
+            n_excluded = int((~keep).sum())
+            w *= keep.astype("float64")
+        sample_w = w.astype("float32")
+        sample_w_t = torch.as_tensor(sample_w, dtype=torch.float32, device=device)
+        conf_meta = {
+            "confidence_table": args.confidence_table,
+            "confidence_weight_alpha": args.confidence_weight,
+            "min_confidence": args.min_confidence,
+            "wells_with_confidence": int(present.sum()),
+            "wells_null_confidence": n_null,
+            "median_confidence_present": float(np.nanmedian(conf[present]))
+            if present.any()
+            else float("nan"),
+            "wells_excluded_min_confidence": n_excluded,
+        }
+        log.info(
+            "confidence weighting: alpha=%.2f min=%.2f | %d/%d wells have confidence "
+            "(median %.2f), %d null->neutral, %d excluded by min-confidence; "
+            "depth-stratified band-normalized",
+            args.confidence_weight,
+            args.min_confidence,
+            int(present.sum()),
+            len(qn),
+            float(np.nanmedian(conf[present])) if present.any() else float("nan"),
+            n_null,
+            n_excluded,
+        )
+
     f_ch, f_lat = ch_ea.shape[1], lat_ea.shape[1]
     f_ms = ms_ea.shape[1] if use_ms else None  # width incl. missingness flags
     f_pf = pf_ea.shape[1] if use_pf else None  # portfolio edge-attr width (6B)
+    f_sc_node = sc_x_t.shape[1] if use_sc else None  # SC widths incl. missing flags
+    f_sc_edge = sc_ea_t.shape[1] if use_sc else None
     native_oof = np.full(len(qn), np.nan)
     gate_oof = np.full(len(qn), np.nan) if fac_gate else None
     lambda_oof = np.full(len(qn), np.nan) if fac_lambda else None
     sigma_oof = np.full(len(qn), np.nan) if args.sigma_head else None
-    prior_gate_oof = np.full((len(qn), 3), np.nan) if prior_gate else None
+    gate_experts = None
+    if prior_gate:
+        # expert order must match the model's mixture; the head is always LAST.
+        gate_experts = (
+            ["fac", "deep"]
+            + (["mirror"] if args.mirror_anchor else [])
+            + (["hang"] if args.hang_anchor else [])
+            + ["head"]
+        )
+    prior_gate_oof = (
+        np.full((len(qn), len(gate_experts)), np.nan) if prior_gate else None
+    )
     learned_aquifer = use_aquifer and args.aquifer_route == "learned"
     aquifer_gate_oof = np.full(len(qn), np.nan) if learned_aquifer else None
     # per-edge portfolio attention, collected on each fold's test rows (6B OOF dump).
     pf_attn_rows: list[pd.DataFrame] = [] if use_pf else []
+    # per-edge spatial-context attention (which ring/octant is read) -- the learned
+    # direction x scale map, valuable regardless of the MAD outcome.
+    sc_attn_rows: list[pd.DataFrame] = []
     fold_log: list[dict] = []
     huber_delta_std_by_fold: list[float] = []
 
@@ -1171,6 +1442,8 @@ def main() -> None:
             f_anchor_query=f_aq,
             f_ms=f_ms,
             f_pf=f_pf,
+            f_sc_node=f_sc_node,
+            f_sc_edge=f_sc_edge,
             writeback=args.query_writeback,
             pinball=args.pinball,
             fac_skip=fac_skip,
@@ -1178,6 +1451,8 @@ def main() -> None:
             fac_lambda=fac_lambda,
             sigma=args.sigma_head,
             prior_gate=prior_gate,
+            mirror_anchor=args.mirror_anchor,
+            hang_anchor=args.hang_anchor,
             directional_edges=args.directional_edges,
             **aquifer_kwargs,
         ).to(device)
@@ -1208,6 +1483,34 @@ def main() -> None:
                 dc0,
                 ds0,
                 prefix="deep",
+            )
+        if args.mirror_anchor:
+            # mirror_pred_dtw is the constant d -> its standardized signal is 0
+            # everywhere (centered on itself); the informative tensor is mirror_base.
+            probe_feat |= _fac_feat(
+                mirror_raw,
+                mirror_present,
+                yc0,
+                ys0,
+                device,
+                mirror_pred_dtw,
+                float(args.mirror_depth_m),
+                1.0,
+                prefix="mirror",
+            )
+        if args.hang_anchor:
+            hc0 = float(np.nanmedian(hang_pred_dtw))
+            hs0 = float(1.4826 * np.nanmedian(np.abs(hang_pred_dtw - hc0)) or 1.0)
+            probe_feat |= _fac_feat(
+                hang_raw,
+                hang_present,
+                yc0,
+                ys0,
+                device,
+                hang_pred_dtw,
+                hc0,
+                hs0,
+                prefix="hang",
             )
         if has_anchor_bc:
             bc0 = (
@@ -1280,6 +1583,9 @@ def main() -> None:
             (target - y_c) / y_s, dtype=torch.float32, device=device
         )
         feat = {**graph_tensors, "query_x": query_x}
+        # anchor pred-dtw standardization stats, hoisted so --save-models can persist
+        # them for any flag combination (None where the anchor is off).
+        pc = ps = dc = ds = hc = hs = None
         if use_fac_anchor:
             if fac_pred_dtw is not None:
                 trp = tr & fac_present
@@ -1305,6 +1611,33 @@ def main() -> None:
                 ds,
                 prefix="deep",
             )
+        if args.mirror_anchor:
+            feat |= _fac_feat(
+                mirror_raw,
+                mirror_present,
+                y_c,
+                y_s,
+                device,
+                mirror_pred_dtw,
+                float(args.mirror_depth_m),
+                1.0,
+                prefix="mirror",
+            )
+        if args.hang_anchor:
+            trh = tr & hang_present
+            hc = float(np.median(hang_pred_dtw[trh]))
+            hs = float(1.4826 * np.median(np.abs(hang_pred_dtw[trh] - hc)) or 1.0)
+            feat |= _fac_feat(
+                hang_raw,
+                hang_present,
+                y_c,
+                y_s,
+                device,
+                hang_pred_dtw,
+                hc,
+                hs,
+                prefix="hang",
+            )
         # WTE Dirichlet BC value, standardized in THIS fold's target space (so the
         # injected head sits on the same scale as the standardized model output).
         if has_anchor_bc:
@@ -1328,6 +1661,8 @@ def main() -> None:
             f_anchor_query=f_aq,
             f_ms=f_ms,
             f_pf=f_pf,
+            f_sc_node=f_sc_node,
+            f_sc_edge=f_sc_edge,
             writeback=args.query_writeback,
             pinball=args.pinball,
             fac_skip=fac_skip,
@@ -1335,6 +1670,8 @@ def main() -> None:
             fac_lambda=fac_lambda,
             sigma=args.sigma_head,
             prior_gate=prior_gate,
+            mirror_anchor=args.mirror_anchor,
+            hang_anchor=args.hang_anchor,
             directional_edges=args.directional_edges,
             **aquifer_kwargs,
         ).to(device)
@@ -1391,6 +1728,51 @@ def main() -> None:
                     }
                 )
             )
+        if use_sc and model.sc_read.last_attn is not None:
+            # per-edge SC attention from the final full-batch forward, row-aligned with
+            # sce; TEST-query edges only (OOF). ring/octant are the nominal diagnostics
+            # carried by the builder -- this is the learned direction/scale map.
+            sc_attn = model.sc_read.last_attn.cpu().numpy().reshape(-1)
+            q_of_sc = sce["query_node_idx"].to_numpy("int64")
+            in_test_sc = test[q_of_sc]
+            sc_attn_rows.append(
+                pd.DataFrame(
+                    {
+                        "query_node_idx": q_of_sc[in_test_sc],
+                        "ring": sce["ring"].to_numpy("int64")[in_test_sc],
+                        "octant": sce["octant"].to_numpy("int64")[in_test_sc],
+                        "attn": sc_attn[in_test_sc],
+                        "fold": int(f),
+                    }
+                )
+            )
+        if args.save_models:
+            # Per-fold checkpoint = weights + the FULL standardization contract this
+            # fold's forward depends on (query scaler, target center/scale, anchor
+            # pred-dtw stats). The inference runner replays _fac_feat/apply_stats
+            # from these verbatim -- train/infer skew is a schema error, never drift.
+            mdir = out_dir / "models"
+            mdir.mkdir(exist_ok=True)
+            torch.save(
+                {
+                    "fold": int(f),
+                    "state_dict": {
+                        k: v.detach().cpu() for k, v in model.state_dict().items()
+                    },
+                    "y_c": y_c,
+                    "y_s": y_s,
+                    "q_stats": q_stats,
+                    "fac_stats": {"pc": pc, "ps": ps},
+                    "deep_stats": {"dc": dc, "ds": ds},
+                    "mirror_stats": (
+                        {"c": float(args.mirror_depth_m), "s": 1.0}
+                        if args.mirror_anchor
+                        else None
+                    ),
+                    "hang_stats": ({"hc": hc, "hs": hs} if args.hang_anchor else None),
+                },
+                mdir / f"fold_{int(f)}.pt",
+            )
         del model, query_x, y_std, feat
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
@@ -1421,6 +1803,69 @@ def main() -> None:
         raise SystemExit(
             f"{int((~np.isfinite(native_oof)).sum())} queries got no OOF prediction"
         )
+
+    if args.save_models:
+        # Fold-independent pieces: the reach/edge scalers (fit on the PRUNED training
+        # frames, T-side; inference applies them to its own pruned subgraph -- same
+        # physical quantities, same z-scoring) + a self-contained manifest so the
+        # runner reconstructs the exact WTEGraphNet ctor and feature schema without
+        # re-deriving anything from hyperparams.
+        mdir = out_dir / "models"
+        torch.save(
+            {"reach_stats": reach_stats, "ch_stats": ch_stats, "lat_stats": lat_stats},
+            mdir / "shared_stats.pt",
+        )
+        (mdir / "inference_manifest.json").write_text(
+            json.dumps(
+                {
+                    "graph_dir": str(gdir),
+                    "target_mode": target_mode,
+                    "dtw_base_col": base_col,
+                    "surface_elev_col": surface_col,
+                    "obs_wte_col": obs_wte_col,
+                    "effective_hidden": int(hidden),
+                    "channel_layers": int(args.channel_layers),
+                    "dropout": float(args.dropout),
+                    "seed": int(args.seed),
+                    "folds": [int(f) for f in folds],
+                    "flags": {
+                        "prior_gate": bool(prior_gate),
+                        "mirror_anchor": bool(args.mirror_anchor),
+                        "mirror_depth_m": float(args.mirror_depth_m),
+                        "hang_anchor": bool(args.hang_anchor),
+                        "sigma_head": bool(args.sigma_head),
+                        "fac_skip": bool(fac_skip),
+                        "fac_gate": bool(fac_gate),
+                        "fac_lambda": bool(fac_lambda),
+                        "directional_edges": bool(args.directional_edges),
+                        "query_writeback": bool(args.query_writeback),
+                        "mainstem_read": bool(use_ms),
+                        "portfolio_read": bool(use_pf),
+                        "spatial_context": bool(use_sc),
+                        "sc_no_azimuth": bool(args.sc_no_azimuth),
+                        "anchors": bool(use_anchors),
+                        "aquifer": bool(use_aquifer),
+                        "pinball": bool(args.pinball),
+                    },
+                    "gate_experts": gate_experts,
+                    "fac_anchor_col": fac_base_col if use_fac_anchor else None,
+                    "deep_anchor_col": deep_anchor_col,
+                    "hang_dtw_col": HANG_DTW_COL if args.hang_anchor else None,
+                    "feature_dims": {
+                        "reach": int(reach_x.shape[1]),
+                        "query": int(f_query),
+                        "channel_edge": int(f_ch),
+                        "lateral_edge": int(f_lat),
+                    },
+                    "query_feature_cols": query_cols,
+                    "reach_feature_cols": reach_cols,
+                    "channel_edge_feature_cols": ch_cols,
+                    "lateral_edge_feature_cols": lat_cols,
+                },
+                indent=2,
+            )
+        )
+        log.info("saved %d fold checkpoints + shared stats -> %s", len(folds), mdir)
 
     if fac_gate:
         # Verify the mechanism: the gate should RELEASE (c->0) for deep wells. Log the
@@ -1464,13 +1909,19 @@ def main() -> None:
         bands = [(0, 2), (2, 5), (5, 10), (10, 30), (30, np.inf)]
         msg = "; ".join(
             f"{lo}-{hi if hi != np.inf else '+'}m "
-            f"fac={np.nanmean(prior_gate_oof[m, 0]):.2f}/"
-            f"deep={np.nanmean(prior_gate_oof[m, 1]):.2f}/"
-            f"head={np.nanmean(prior_gate_oof[m, 2]):.2f}(n={int(m.sum())})"
+            + "/".join(
+                f"{nm}={np.nanmean(prior_gate_oof[m, j]):.2f}"
+                for j, nm in enumerate(gate_experts)
+            )
+            + f"(n={int(m.sum())})"
             for lo, hi in bands
             if (m := (obs_dtw >= lo) & (obs_dtw < hi)).any()
         )
-        log.info("prior-gate mean OOF weights (fac/deep/head) by obs-depth: %s", msg)
+        log.info(
+            "prior-gate mean OOF weights (%s) by obs-depth: %s",
+            "/".join(gate_experts),
+            msg,
+        )
 
     if learned_aquifer:
         # The aquifer correction should OPEN (gate->1) where the regional substrate
@@ -1510,10 +1961,9 @@ def main() -> None:
     if args.sigma_head:
         out_cols["gnn_sigma_m"] = sigma_oof  # per-well Laplace scale (meters)
     if prior_gate:
-        # three-regime map deliverable: which expert carries each well OOF.
-        out_cols["gate_w_fac"] = prior_gate_oof[:, 0]
-        out_cols["gate_w_deep"] = prior_gate_oof[:, 1]
-        out_cols["gate_w_head"] = prior_gate_oof[:, 2]
+        # regime-map deliverable: which expert carries each well OOF.
+        for j, nm in enumerate(gate_experts):
+            out_cols[f"gate_w_{nm}"] = prior_gate_oof[:, j]
     if learned_aquifer:
         out_cols["aquifer_gate"] = aquifer_gate_oof  # per-query aquifer-branch gate
     identity_max = None
@@ -1565,6 +2015,20 @@ def main() -> None:
                 f"{t}={by_type.get(t, float('nan')):.3f}"
                 for t in man["portfolio_read"]["site_types"]
             ),
+        )
+
+    if use_sc and sc_attn_rows:
+        # OOF per-edge spatial-context attention: the tells are (a) whether attention
+        # collapsed to one ring (-> per-ring pools fallback) and (b) any azimuthal
+        # asymmetry at the 10 km ring (the one narrow deep hypothesis).
+        sc_attn_df = pd.concat(sc_attn_rows, ignore_index=True)
+        sc_attn_df.to_parquet(out_dir / "gnn_sc_attention.parquet")
+        by_ring = sc_attn_df.groupby("ring")["attn"].mean()
+        by_oct = sc_attn_df.groupby("octant")["attn"].mean()
+        log.info(
+            "sc attention (OOF mean): rings %s | octants %s",
+            " ".join(f"r{i}={v:.4f}" for i, v in by_ring.items()),
+            " ".join(f"o{i}={v:.4f}" for i, v in by_oct.items()),
         )
 
     run = {
@@ -1632,10 +2096,15 @@ def main() -> None:
             "deep_anchor_col": deep_anchor_col if prior_gate else None,
             "wells_with_fac": int(fac_present.sum()) if prior_gate else None,
             "wells_with_deep": int(deep_present.sum()) if prior_gate else None,
+            "experts": gate_experts,
+            "mirror_anchor": bool(args.mirror_anchor),
+            "mirror_depth_m": args.mirror_depth_m if args.mirror_anchor else None,
+            "hang_anchor": bool(args.hang_anchor),
+            "hang_dtw_col": HANG_DTW_COL if args.hang_anchor else None,
+            "wells_with_hang": int(hang_present.sum()) if args.hang_anchor else None,
             "mean_oof_w": {
-                "fac": float(np.nanmean(prior_gate_oof[:, 0])),
-                "deep": float(np.nanmean(prior_gate_oof[:, 1])),
-                "head": float(np.nanmean(prior_gate_oof[:, 2])),
+                nm: float(np.nanmean(prior_gate_oof[:, j]))
+                for j, nm in enumerate(gate_experts)
             }
             if prior_gate
             else None,
@@ -1672,6 +2141,7 @@ def main() -> None:
             if args.depth_weight_scale > 0.0
             else None,
         },
+        "confidence_weighting": conf_meta,
         "directional_edges": bool(args.directional_edges),
         "pair_loss": {
             "weight": pair_w,
@@ -1694,6 +2164,18 @@ def main() -> None:
             else None,
             "pf_edge_feature_cols": pf_cols if use_pf else None,
             "f_pf": int(f_pf) if use_pf else None,
+        },
+        "spatial_context": {
+            "enabled": bool(use_sc),
+            "no_azimuth": bool(args.sc_no_azimuth) if use_sc else None,
+            "n_nodes": int(len(scn)) if use_sc else None,
+            "n_edges": int(len(sce)) if use_sc else None,
+            "radii_m": man["spatial_context"]["radii_m"] if use_sc else None,
+            "n_per_ring": man["spatial_context"]["n_per_ring"] if use_sc else None,
+            "sc_node_feature_cols": sc_node_cols if use_sc else None,
+            "sc_edge_feature_cols": sc_edge_cols if use_sc else None,
+            "f_sc_node": int(f_sc_node) if use_sc else None,
+            "f_sc_edge": int(f_sc_edge) if use_sc else None,
         },
         "query_writeback": {"enabled": bool(args.query_writeback)},
         "target_mode": target_mode,

@@ -308,6 +308,8 @@ class WTEGraphNet(nn.Module):
         f_anchor_query: int | None = None,
         f_ms: int | None = None,
         f_pf: int | None = None,
+        f_sc_node: int | None = None,
+        f_sc_edge: int | None = None,
         writeback: bool = False,
         pinball: bool = False,
         fac_skip: bool = False,
@@ -315,6 +317,8 @@ class WTEGraphNet(nn.Module):
         fac_lambda: bool = False,
         sigma: bool = False,
         prior_gate: bool = False,
+        mirror_anchor: bool = False,
+        hang_anchor: bool = False,
         directional_edges: bool = False,
         f_aquifer: int | None = None,
         f_aquifer_edge: int | None = None,
@@ -343,9 +347,18 @@ class WTEGraphNet(nn.Module):
             )
         if prior_gate and pinball:
             raise ValueError("prior_gate with the pinball head is not supported")
+        if mirror_anchor and not prior_gate:
+            # the mirror is an EXPERT of the gate, not a standalone anchor pathway.
+            raise ValueError("mirror_anchor requires prior_gate")
+        if hang_anchor and not prior_gate:
+            # the Dupuit hang surface is likewise an EXPERT of the gate only.
+            raise ValueError("hang_anchor requires prior_gate")
         self.has_anchor = f_anchor is not None
         self.has_ms = f_ms is not None
         self.has_pf = f_pf is not None
+        if (f_sc_node is None) != (f_sc_edge is None):
+            raise ValueError("f_sc_node and f_sc_edge must be set together")
+        self.has_sc = f_sc_node is not None
         self.writeback = writeback
         if self.has_ms and self.has_anchor:
             # anchors are off in prod; keep the head bookkeeping ([q, ctx_reach, ctx_*])
@@ -368,10 +381,17 @@ class WTEGraphNet(nn.Module):
         self.fac_lambda = fac_lambda
         self.sigma = sigma
         self.prior_gate = prior_gate
+        self.mirror_anchor = mirror_anchor
+        self.hang_anchor = hang_anchor
         self.directional_edges = directional_edges
         self.last_fac_gate: torch.Tensor | None = None
         self.last_fac_lambda: torch.Tensor | None = None
         self.last_prior_gate: torch.Tensor | None = None
+        # free-head expert output (std units) from the LAST forward; the inference
+        # renderer needs it to decompose the prior-gate mixture into expert WTE
+        # surfaces (wte_hat = sum w_i * expert_wte_i), so it is captured detached
+        # alongside last_prior_gate.
+        self.last_head_out: torch.Tensor | None = None
         # heteroscedastic log-scale (Laplace b) from the LAST forward; kept WITH grad
         # so the trainer's NLL can backprop through it (unlike the detached last_* QA
         # captures above).
@@ -459,6 +479,21 @@ class WTEGraphNet(nn.Module):
                 hidden, hidden, f_pf, hidden, dropout=dropout
             )
             head_in = hidden * 3  # [q, ctx_reach, ctx_pf]
+        if self.has_sc:
+            # spatial-context read: segment-softmax attention over each query's
+            # lattice-snapped ring-cell edges (radii x 8 octants), competing senders
+            # exactly like the portfolio sites -- same conv, its own instance. SC cells
+            # are RAW covariate nodes (no message passing among them), so they get
+            # their own encoder. Deliberately an ADDITIVE slot, not a tenant of the
+            # exclusive hidden*3 read-context slot above: the terrain read must
+            # compose with the production anchor/ms/pf configurations.
+            self.sc_enc = nn.Sequential(
+                nn.Linear(f_sc_node, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
+            )
+            self.sc_read = PortfolioReadConv(
+                hidden, hidden, f_sc_edge, hidden, dropout=dropout
+            )
+            head_in += hidden  # [.., ctx_sc]
         if self.writeback:
             # query->reach write-back (6C): one bipartite gated conv (query as src, reach as
             # dst) applied as a residual BEFORE the channel stack, so well context mixes 2
@@ -575,25 +610,43 @@ class WTEGraphNet(nn.Module):
                 nn.Linear(hidden, 1),
             )
         if self.prior_gate:
-            # K=3 softmax mixture generalizing fac_lambda: pred = w_fac*FAC_anchor +
-            # w_deep*deep_regional_anchor + w_head*GNN_head. The gate sees the query
-            # context, both anchor values/presences, each prior's own predicted DTW
-            # and their DISAGREEMENT -- where a shallow terrain prior and a deep
-            # aquifer prior diverge is itself the regime signal no single covariate
-            # carries. Absent priors are masked out of the softmax (weight -> 0,
-            # remaining experts renormalize).
-            self.prior_gate_mlp = nn.Sequential(
-                nn.Linear(head_in + 7, hidden),
-                nn.ReLU(),
-                nn.Linear(hidden, 3),
+            # K-way softmax mixture generalizing fac_lambda: pred = w_fac*FAC_anchor +
+            # w_deep*deep_regional_anchor [+ w_mirror*terrain_mirror] + w_head*GNN_head.
+            # The gate sees the query context, anchor values/presences, each prior's
+            # own predicted DTW and their DISAGREEMENT -- where a shallow terrain prior
+            # and a deep aquifer prior diverge is itself the regime signal no single
+            # covariate carries. Absent priors are masked out of the softmax (weight
+            # -> 0, remaining experts renormalize). The optional mirror expert
+            # (mirror_anchor) is the subdued-replica shallow prior WTE = z_surf - d;
+            # its inputs add mirror_base, mirror_pred_dtw and (fac_base - mirror_base)
+            # -- the two bases share the fold's target standardization, so their
+            # difference IS (d - fac_dtw)/y_s, the "FAC deeper than d" signal.
+            # Expert order: [fac, deep, (mirror), (hang), head] -- head always LAST.
+            # The optional hang expert (hang_anchor) is the well-free Dupuit hang
+            # surface WTE = z_surf - dupuit_hang_dtw (boundary-conditioned datum);
+            # its inputs add hang_base, hang_present, hang_pred_dtw and its DTW
+            # disagreement with the deep-IDW expert -- where the stream-boundary
+            # datum and the well-based deep datum diverge is the regime signal.
+            n_experts = 3 + int(self.mirror_anchor) + int(self.hang_anchor)
+            gate_in = (
+                head_in
+                + 7
+                + (3 if self.mirror_anchor else 0)
+                + (4 if self.hang_anchor else 0)
             )
-            # start mostly on the FREE HEAD (w_head ~ 0.79): epoch-0 behavior is near
-            # baseline, and handing off to an anchor is opt-in with evidence -- the
-            # 3-way analog of fac_lambda's anchored start, inverted because starting
-            # on FAC would poison the deep majority.
+            self.prior_gate_mlp = nn.Sequential(
+                nn.Linear(gate_in, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, n_experts),
+            )
+            # start mostly on the FREE HEAD (w_head ~ 0.79 at K=3): epoch-0 behavior
+            # is near baseline, and handing off to an anchor is opt-in with evidence --
+            # the K-way analog of fac_lambda's anchored start, inverted because
+            # starting on FAC would poison the deep majority. The head is always the
+            # LAST expert.
             nn.init.zeros_(self.prior_gate_mlp[-1].bias)
             with torch.no_grad():
-                self.prior_gate_mlp[-1].bias[2] = 2.0
+                self.prior_gate_mlp[-1].bias[-1] = 2.0
 
     def _augment_for_skip(self, h: torch.Tensor, g: dict):
         """Append the FAC raw-skip / confidence-gate pieces to the head input.
@@ -676,6 +729,12 @@ class WTEGraphNet(nn.Module):
                 h = torch.cat([q, ctx_reach, ctx_pf], dim=-1)
             else:
                 h = torch.cat([q, ctx_reach], dim=-1)
+        if self.has_sc:
+            # direction x scale terrain read: attend over the query's ring-cell
+            # edges (encoded raw covariate cells; azimuth/ring/rel-elev on the edge).
+            # Additive to whichever branch built h, so it composes with anchor/ms/pf.
+            ctx_sc = self.sc_read(self.sc_enc(g["sc_x"]), q, g["sc_ei"], g["sc_ea"])
+            h = torch.cat([h, ctx_sc], dim=-1)
         # FAC raw-skip / confidence-gate pieces (no-op when fac_skip is off).
         h, skip = self._augment_for_skip(h, g)
         if self.sigma:
@@ -701,18 +760,43 @@ class WTEGraphNet(nn.Module):
             dpd = g["deep_pred_dtw"].view(-1, 1)
             # prior disagreement (std units), defined only where BOTH priors exist.
             dis = (fpd - dpd) * fpres * dpres
-            logits = self.prior_gate_mlp(
-                torch.cat([h, fb, fpres, fpd, db, dpres, dpd, dis], dim=-1)
-            )
-            # mask absent experts out of the softmax; the head is always present.
-            mask = torch.cat([fpres, dpres, torch.ones_like(fpres)], dim=-1)
+            gate_in = [h, fb, fpres, fpd, db, dpres, dpd, dis]
+            ones = torch.ones_like(fpres)
+            expert_vals = [fb, db]
+            mask_parts = [fpres, dpres]
+            if self.mirror_anchor:
+                mb = g["mirror_base"].view(-1, 1)
+                mpd = g["mirror_pred_dtw"].view(-1, 1)
+                # fac and mirror bases share the fold's target standardization, so
+                # (fb - mb) IS (d - fac_dtw)/y_s -- the "FAC deeper than the mirror
+                # offset" regime signal, scale-consistent by construction.
+                dis_fm = (fb - mb) * fpres
+                gate_in += [mb, mpd, dis_fm]
+                expert_vals.append(mb)
+                mask_parts.append(ones)
+            if self.hang_anchor:
+                hb = g["hang_base"].view(-1, 1)
+                hpres = g["hang_present"].view(-1, 1)
+                hpd = g["hang_pred_dtw"].view(-1, 1)
+                # hang-vs-deep DTW disagreement: the boundary-conditioned datum
+                # against the well-IDW deep datum, defined where both exist.
+                dis_hd = (hpd - dpd) * hpres * dpres
+                gate_in += [hb, hpres, hpd, dis_hd]
+                expert_vals.append(hb)
+                mask_parts.append(hpres)
+            logits = self.prior_gate_mlp(torch.cat(gate_in, dim=-1))
+            # mask absent experts out of the softmax; mirror + head always present.
+            mask = torch.cat(mask_parts + [ones], dim=-1)
             w = torch.softmax(logits + (1.0 - mask) * -1e9, dim=-1)
             self.last_prior_gate = w.detach()
-            primary = (
-                w[:, 0:1] * fb + w[:, 1:2] * db + w[:, 2:3] * self.head(h)
-            ).squeeze(-1)
+            hv = self.head(h)
+            self.last_head_out = hv.detach().squeeze(-1)
+            expert_vals.append(hv)
+            primary = (w * torch.cat(expert_vals, dim=-1)).sum(-1)
         else:
-            primary = self.head(h).squeeze(-1) + skip
+            hv = self.head(h).squeeze(-1)
+            self.last_head_out = hv.detach()
+            primary = hv + skip
         # Regional-aquifer correction: gated additive delta over the stream primary.
         # "fixed_stream"/"off" short-circuit (no branch executed, no aquifer dropout
         # drawn) so the run is an EXACT no-op vs baseline; only "learned" contributes.
