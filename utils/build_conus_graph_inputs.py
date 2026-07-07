@@ -60,6 +60,7 @@ from build_stacker_features import (  # noqa: E402
     TRI,
     sample_coarse,
 )
+from build_dupuit_wte import build_boundaries, hang_interp  # noqa: E402
 from fac_rem_registry import sample_fac_rem, sample_str_top2_wte  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -103,6 +104,14 @@ STR_TOP2_WTE_ANOM_COL = "str_top2_wte_anom_m"  # str_top2 WTE - R (regional anom
 # over-mounds a bench, which is the missing bench signal.
 SIMPLE_IDW_WTE_COL = "simple_idw_wte_m"  # plain vw=0 well-IDW WTE surface (diagnostic)
 SIMPLE_IDW_WTE_ANOM_COL = "simple_idw_wte_anom_m"  # simple(vw=0) WTE - R
+# --residual-base ensemble_median only: the relief-aware (vw>0) well-IDW member exposed
+# as its own anomaly-over-the-median so ALL members are differenced from the base
+# (fac + relief here, simple via --ensemble-member-features); at each well exactly one
+# member anomaly is 0 (the median), so the trio also encodes which member won.
+RELIEF_IDW_WTE_COL = (
+    "relief_idw_wte_m"  # relief-aware well-IDW WTE surface (diagnostic)
+)
+RELIEF_IDW_WTE_ANOM_COL = "relief_idw_wte_anom_m"  # relief(vw>0) WTE - R
 # gridMET climate (EPSG:4326 -> sampled at lon/lat). Kept in wte_residual mode: a
 # NEGATIVE result in the pilot stacker does not mean it cannot help the GNN.
 CLIMATE_FEATURE_COLS = ["aridity_index", "mean_annual_precip_mm"]
@@ -136,6 +145,42 @@ IRRMAPPER_FREQ_RASTERS = {  # per-state EPSG:5070 uint8, nodata None (0 = never 
     "NV": "/nas/irrmapper/tif_exports/conus_freq/irrmapper_freq_NV_2015_2024_30m_5070.tif",
 }
 IRRIGATION_FEATURE_COLS = ["irr_freq_pct"]
+# Drilled-depth field (behind --drilled-depth-points): kNN-IDW mean + p90 of well
+# CONSTRUCTION depths from the GWX unconfined pool (build_drilled_depth_points.py).
+# "How deep do people have to drill here" is a behavioral deep-regime observation
+# no raster covariate carries (deep-bench finding: geology/climate/flux all AUC~0.5).
+# Construction metadata, NOT an observed water level -> deployment-available
+# everywhere, so no fold cross-fit; only the query well's OWN record and co-located
+# nest siblings are excluded (canonical_id + --drilled-depth-self-exclude-m).
+DRILLED_DEPTH_FEATURE_COLS = ["drilled_depth_idw_m", "drilled_depth_p90_m"]
+# Zell & Sanford 2020 steady-state features (behind --zell-sanford-features): USGS
+# calibrated CONUS MODFLOW6 steady-state solve, 250 m (doi:10.5066/P91LFFN1). The one
+# on-disk product carrying the REGIONAL lateral-flow datum (basin head set by a
+# discharge outlet tens of km away) that no local covariate encodes -- the
+# Rathdrum-type deep-basin failure mode. Feature path on purpose (drilled-depth
+# lesson: features moved every band while the deep gate expert stayed dead).
+# LEAKAGE CAVEAT: Z&S is CALIBRATED to long-term-average NWIS water levels (the same
+# population as our NWIS labels) through stiff HUC4 x surficial-geology zonal
+# parameters and cannot be fold-cross-fit -> NWIS-panel gains are an upper bound;
+# the non-NWIS panel (sources never in their objective) is the honest adjudicator.
+ZS_DTW_RASTER = "/nas/gwx/studies/analysis_ready/zell_sanford_2020_dtw/zell_sanford_2020_dtw_5070.tif"
+ZS_TRANS_RASTER = (
+    "/nas/gwx/studies/analysis_ready/zell_sanford_2020_dtw/"
+    "zell_sanford_2020_trans_5070.tif"
+)
+ZS_FEATURE_COLS = ["zs_dtw_m", "zs_resid_m", "zs_log_trans"]
+# Dupuit hang features (behind --dupuit-hang-features): well-free boundary-conditioned
+# WTE hang surface -- kNN-IDW of top-2-Strahler reach elevations per FAC basin
+# (build_dupuit_wte.build_boundaries/hang_interp) + distance to that boundary set.
+# Diagnostic verdict (2026-07-06, dupuit_prior/): the fitted Dupuit sag (gamma*d +
+# delta*d^2 per HUC8) is NOT the deep fix -- within failure-basin deep wells the
+# anomaly is uncorrelated with d (median spearman 0.10, sign-inconsistent; Rathdrum
+# got WORSE than the raw hang) -- but the raw hang surface is complementary to the
+# well-IDW R (error corr 0.35; wins 56%% of relief-R's |err|>15m blow-ups) and only
+# rho=0.74 to haf_10km. So the WELL-FREE pieces enter as features and the GNN learns
+# its own regional shape; the per-HUC8 quadratic stays out. Stream elevations only ->
+# leak-free by construction, deployment-available, no cross-fit.
+DUPUIT_FEATURE_COLS = ["dupuit_hang_dtw_m", "log1p_dupuit_d_m"]
 # Well model features (leak-free). Everything else on the query node is carried
 # for scoring/diagnostics only.
 QUERY_FEATURE_COLS = ["hand_m", "regional_idw_dtw_oof_m"]
@@ -324,6 +369,63 @@ REACH_COVARIATE_FEATURE_COLS = [
     "r_ndvi_amp",  # jja - djf amplitude
     "r_gsw_occ",  # continuous GSW occurrence (not just the wet flag)
 ]
+# --spatial-context: an isotropic, direction-resolved terrain/climate/recharge read
+# around each query. Concentric rings x 8 octant azimuths per well, each sample
+# SNAPPED to the canonical CONUS 100 m lattice (the inference-grid origin), so context
+# cells dedup across queries and train/inference share one node pool. Node features =
+# the 6A.1 covariate bank sampled at the cell center (target-blind); edge attrs carry
+# azimuth (sin/cos -- the directional bet: the point covariates are radially-averaged
+# scalars and the channel read is drainage-following), ring one-hot (scale), log
+# distance, and cell-vs-query rel-elev (the directional terrain gradient).
+# Round-2 (2026-07-07): the 300 m ring is dropped -- the payload fields (1 km dads
+# stack, 250 m+ bank rasters) are constant across it, so it bought nothing and pads
+# every query's read budget; re-add only with a genuinely sub-km payload.
+SPATIAL_CONTEXT_RADII = (2000.0, 10000.0)
+SPATIAL_CONTEXT_N = 8  # octant azimuths per ring
+SC_LATTICE_ORIGIN = (-2_540_000.0, 3_258_000.0)  # canonical 100 m grid, EPSG:5070
+SC_LATTICE_RES_M = 100.0
+SC_RING_COLS = [f"sc_r{int(r)}" for r in SPATIAL_CONTEXT_RADII]  # ring one-hot
+SC_EDGE_FEATURE_COLS = [
+    "sc_sin_az",  # azimuth query->cell, from the SNAPPED vector
+    "sc_cos_az",
+    *SC_RING_COLS,
+    "sc_log1p_dist_m",  # snapped query->cell distance
+    "sc_rel_elev_m",  # cell DEM elev - query land surface
+]
+# SC node covariate NaN budget. 0.05, not the reach bank's 0.02: 10 km ring cells
+# legitimately land on raster-footprint fringes, and the one col this rescues
+# (r_sediment_thickness_m, 2.03% NaN at monitoring cells) was INVESTIGATED
+# 2026-07-07 -- its NaN cells are in-bounds, on-DEM interior nodata of the
+# basin-fill product at the coastal/NE margins, and the query side already feeds
+# the SAME raster's NaN to the trainer's missingness indicators (L1360), so the
+# cell side dropping it was the inconsistency. Above 5%, stop and look.
+SC_NAN_DROP_FRAC = 0.05
+# SC payload v2 (notes/SC_COVARIATE_UPGRADE.md): dads-project static stack, CONUS
+# "HTD" 1 km EPSG:5070 grid, copied to the handily bank + reduced by
+# utils/build_dads_sc_covariates.py. Bands resolved by DESCRIPTION (not index) so a
+# re-derive that reorders bands fails loudly instead of sampling the wrong field.
+DADS_HTD_BANK = "/nas/handily/covariates/dads_htd_1km"
+DADS_SC_NODE_BANDS = {
+    # col -> (raster path relative to the bank, band description)
+    "d_slope": ("terrain_htd_1km.tif", "slope"),
+    "d_aspect_sin": ("terrain_htd_1km.tif", "aspect_sin"),
+    "d_aspect_cos": ("terrain_htd_1km.tif", "aspect_cos"),
+    "d_eth_m": (
+        "prism_effective_terrain_height_htd_1km.tif",
+        "effective_terrain_height_m",
+    ),
+    "d_terrain_i3d": ("prism_effective_terrain_i3d_htd_1km.tif", None),  # single-band
+    "d_facet_sin_12km": ("derived/facet_sincos_htd_1km.tif", "facet_sin_12km"),
+    "d_facet_cos_12km": ("derived/facet_sincos_htd_1km.tif", "facet_cos_12km"),
+    "d_facet_sin_36km": ("derived/facet_sincos_htd_1km.tif", "facet_sin_36km"),
+    "d_facet_cos_36km": ("derived/facet_sincos_htd_1km.tif", "facet_cos_36km"),
+    "d_rsun_jja": ("derived/rsun_seasonal_htd_1km.tif", "rsun_jja"),
+    "d_rsun_djf_jja_ratio": ("derived/rsun_seasonal_htd_1km.tif", "rsun_djf_jja_ratio"),
+    "d_ndvi_amp": ("derived/landsat_indices_htd_1km.tif", "ndvi_amp"),
+    "d_ndmi_p2": ("derived/landsat_indices_htd_1km.tif", "ndmi_p2"),
+    "d_mndwi_p2": ("derived/landsat_indices_htd_1km.tif", "mndwi_p2"),
+    "d_lst_b10_p2_k": ("derived/landsat_indices_htd_1km.tif", "b10_p2_k"),
+}
 # --upstream-accumulation-features (Phase 6A.2): length-weighted upstream-catchment means of
 # the 6A.1 locals (upstream recharge is the physical driver of the table AT the reach) + the
 # ONE surviving Phase-5 column upstream_wet_fraction (always finite: 0.0 on dry catchments).
@@ -470,6 +572,95 @@ def idw_at_points(
         dist, idx = dist[:, None], idx[:, None]
     w = 1.0 / np.maximum(dist, 1.0) ** power
     return (w * train_val[idx]).sum(1) / w.sum(1)
+
+
+def sample_drilled_depth(
+    points_path: str,
+    query_xy: np.ndarray,
+    k: int,
+    power: float,
+    query_ids: np.ndarray | None = None,
+    self_exclude_m: float = 0.0,
+) -> dict[str, np.ndarray]:
+    """Drilled-depth field: kNN IDW-mean + p90 of neighbor CONSTRUCTION depths.
+
+    The pool is the GWX unconfined drilled-depth product
+    (``build_drilled_depth_points.py``). Depth is construction metadata, not an
+    observed water level, so it is deployment-available everywhere and needs no
+    fold cross-fit. The training side passes ``query_ids`` + ``self_exclude_m``
+    so a well's OWN record and co-located piezometer-nest siblings (drilled to
+    bracket the same local table) never inform its own feature; inference
+    lattices pass neither (a lattice cell is not a well) and take the plain
+    kNN fast path.
+    """
+    pool = pd.read_parquet(points_path)
+    pxy = pool[["x5070", "y5070"]].to_numpy("float64")
+    pval = pool["drilled_depth_m"].to_numpy("float64")
+    tree = cKDTree(pxy)
+    if query_ids is None and self_exclude_m <= 0:
+        kk = min(k, len(pool))
+        dist, idx = tree.query(query_xy, k=kk)
+        if kk == 1:
+            dist, idx = dist[:, None], idx[:, None]
+        w = 1.0 / np.maximum(dist, 1.0) ** power
+        return {
+            "drilled_depth_idw_m": (w * pval[idx]).sum(1) / w.sum(1),
+            "drilled_depth_p90_m": np.percentile(pval[idx], 90.0, axis=1),
+        }
+    # Exclusion path: over-query, drop self/nest candidates, keep the k nearest rest.
+    kk = min(k + 16, len(pool))
+    dist, idx = tree.query(query_xy, k=kk)
+    if kk == 1:
+        dist, idx = dist[:, None], idx[:, None]
+    excl = dist < self_exclude_m
+    if query_ids is not None:
+        pid = pool["canonical_id"].to_numpy()
+        excl |= pid[idx] == np.asarray(query_ids)[:, None]
+    dist = np.where(excl, np.inf, dist)
+    order = np.argsort(dist, axis=1)[:, :k]
+    dist_k = np.take_along_axis(dist, order, axis=1)
+    val_k = pval[np.take_along_axis(idx, order, axis=1)]
+    kept = np.isfinite(dist_k)
+    if int(kept.sum(1).min()) == 0:
+        raise SystemExit(
+            "sample_drilled_depth: a query lost ALL candidates to self-exclusion "
+            "-- pool too sparse near a well; investigate (do not patch)"
+        )
+    w = np.where(kept, 1.0 / np.maximum(dist_k, 1.0) ** power, 0.0)
+    idw = (w * np.where(kept, val_k, 0.0)).sum(1) / w.sum(1)
+    p90 = np.nanpercentile(np.where(kept, val_k, np.nan), 90.0, axis=1)
+    return {"drilled_depth_idw_m": idw, "drilled_depth_p90_m": p90}
+
+
+def sample_zell_sanford(
+    x: np.ndarray,
+    y: np.ndarray,
+    well_surf_m: np.ndarray,
+    r_wte: np.ndarray,
+    dtw_raster: str = ZS_DTW_RASTER,
+    trans_raster: str = ZS_TRANS_RASTER,
+) -> dict[str, np.ndarray]:
+    """Zell & Sanford 2020 steady-state query features.
+
+    zs_dtw_m is the simulated depth to water (positive-down; small negatives are
+    real water-table-above-surface DRN discharge cells). zs_resid_m casts Z&S into
+    the target frame: (z_surf - zs_dtw) - R is its own estimate of the wte_residual
+    target. zs_log_trans is log10 of the calibrated transmissivity (m2/day) -- high
+    T marks the flat-table structural basins where the regional-datum failure lives.
+    Domain-edge nodata stays NaN (the trainer's apply_stats median-fills and appends
+    a missingness indicator).
+    """
+    zs_dtw = sample_coarse(dtw_raster, x, y)
+    trans = sample_coarse(trans_raster, x, y)
+    # log10 undefined at trans <= 0: treat like nodata. None occur at wells today;
+    # bilinear warp edges could produce them on inference lattices.
+    pos = trans > 0
+    log_trans = np.where(pos, np.log10(np.where(pos, trans, 1.0)), np.nan)
+    return {
+        "zs_dtw_m": zs_dtw,
+        "zs_resid_m": (well_surf_m - r_wte) - zs_dtw,
+        "zs_log_trans": log_trans,
+    }
 
 
 def crossfit_anchor_anomaly(
@@ -1377,6 +1568,214 @@ def sample_reach_covariates(
     }
 
 
+def sample_dads_sc_covariates(
+    x: np.ndarray, y: np.ndarray, bank: Path
+) -> dict[str, np.ndarray]:
+    """DADS_SC_NODE_BANDS at EPSG:5070 points -- nearest cell, one open per raster.
+
+    Bands are resolved by description (``None`` = the raster's only band); a missing
+    raster or description is a hard stop (the bank copy/derive step has not run or
+    the derive script changed its band layout -- do not sample blind).
+    """
+    import rasterio  # local: heavy import, SC-build only
+
+    by_raster: dict[str, list[tuple[str, str | None]]] = {}
+    for col, (rel, band_desc) in DADS_SC_NODE_BANDS.items():
+        by_raster.setdefault(rel, []).append((col, band_desc))
+    out: dict[str, np.ndarray] = {}
+    for rel, cols in by_raster.items():
+        path = bank / rel
+        if not path.exists():
+            raise SystemExit(
+                f"dads SC raster missing: {path} -- run the copy + "
+                "utils/build_dads_sc_covariates.py step first (notes/SC_COVARIATE_UPGRADE.md)"
+            )
+        with rasterio.open(path) as src:
+            desc = {d: i + 1 for i, d in enumerate(src.descriptions) if d}
+            t = src.transform
+            ci = np.floor((x - t.c) / t.a).astype(np.int64)
+            ri = np.floor((y - t.f) / t.e).astype(np.int64)
+            ok = (ri >= 0) & (ri < src.height) & (ci >= 0) & (ci < src.width)
+            for col, band_desc in cols:
+                if band_desc is None:
+                    if src.count != 1:
+                        raise SystemExit(f"{path}: expected single band for {col}")
+                    b = 1
+                elif band_desc in desc:
+                    b = desc[band_desc]
+                else:
+                    raise SystemExit(
+                        f"{path}: no band described '{band_desc}' (has {sorted(desc)})"
+                    )
+                arr = src.read(b)
+                v = np.full(x.shape, np.nan)
+                v[ok] = arr[ri[ok], ci[ok]].astype(np.float64)
+                if src.nodata is not None:
+                    v[v == src.nodata] = np.nan
+                out[col] = v
+    return out
+
+
+def spatial_context_cells(
+    xy: np.ndarray, qidx: np.ndarray
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Lattice-snapped spatial-context cells + query->cell edge geometry.
+
+    For each query, SPATIAL_CONTEXT_N nominal points on each SPATIAL_CONTEXT_RADII
+    ring (theta_k = k*360/N from east, CCW), snapped to the canonical 100 m lattice
+    cell and deduped across queries -> one shared cell pool. Azimuth/distance edge
+    attrs are computed from the SNAPPED query->cell-center vector (not the nominal
+    octant), so they describe what the model actually reads; the nominal ring/octant
+    indices are carried as diagnostic cols for the attention dump.
+
+    Returns ``(cells, edges)``: cells = sc_node_idx + cell-center x5070/y5070; edges =
+    query_node_idx/sc_node_idx/ring/octant + SC_EDGE_FEATURE_COLS minus sc_rel_elev_m
+    (the caller samples the DEM at the cells and adds it). Edge rows are query-major
+    in ``xy`` row order, ring-major within a query.
+    """
+    x0, y0 = SC_LATTICE_ORIGIN
+    res = SC_LATTICE_RES_M
+    theta = np.arange(SPATIAL_CONTEXT_N) * (2.0 * np.pi / SPATIAL_CONTEXT_N)
+    ring_r = np.asarray(SPATIAL_CONTEXT_RADII, "float64")
+    n_rings = len(ring_r)
+    offs_x = np.repeat(ring_r, SPATIAL_CONTEXT_N) * np.tile(np.cos(theta), n_rings)
+    offs_y = np.repeat(ring_r, SPATIAL_CONTEXT_N) * np.tile(np.sin(theta), n_rings)
+    n_per_q = n_rings * SPATIAL_CONTEXT_N
+    px = (xy[:, 0][:, None] + offs_x[None, :]).ravel()
+    py = (xy[:, 1][:, None] + offs_y[None, :]).ravel()
+    col = np.floor((px - x0) / res).astype("int64")
+    row = np.floor((py - y0) / res).astype("int64")
+    cells, inv = np.unique(np.column_stack([col, row]), axis=0, return_inverse=True)
+    ccx = x0 + (cells[:, 0].astype("float64") + 0.5) * res
+    ccy = y0 + (cells[:, 1].astype("float64") + 0.5) * res
+    cells_df = pd.DataFrame(
+        {
+            "sc_node_idx": np.arange(len(cells), dtype="int64"),
+            "x5070": ccx,
+            "y5070": ccy,
+        }
+    )
+    dx = ccx[inv] - np.repeat(xy[:, 0], n_per_q)
+    dy = ccy[inv] - np.repeat(xy[:, 1], n_per_q)
+    dist = np.hypot(dx, dy)  # inner ring 2 km >> cell half-diagonal -> never 0
+    ring = np.tile(np.repeat(np.arange(n_rings), SPATIAL_CONTEXT_N), len(xy))
+    edges = pd.DataFrame(
+        {
+            "query_node_idx": np.repeat(qidx, n_per_q),
+            "sc_node_idx": inv.astype("int64"),
+            "ring": ring.astype("int64"),
+            "octant": np.tile(
+                np.tile(np.arange(SPATIAL_CONTEXT_N), n_rings), len(xy)
+            ).astype("int64"),
+            "sc_sin_az": dy / dist,
+            "sc_cos_az": dx / dist,
+            "sc_log1p_dist_m": np.log1p(dist),
+        }
+    )
+    for i, c in enumerate(SC_RING_COLS):
+        edges[c] = (ring == i).astype("float64")
+    return cells_df, edges
+
+
+def build_spatial_context(
+    xy: np.ndarray,
+    qidx: np.ndarray,
+    well_surf_m: np.ndarray,
+    dem: str,
+    gdir: Path,
+    dads_bank: str | None = DADS_HTD_BANK,
+) -> dict:
+    """Build + write the spatial-context node/edge parquets; return the manifest block.
+
+    ``xy``/``qidx``/``well_surf_m`` are row-aligned per query. Cells get the 6A.1
+    covariate bank + the dads HTD 1 km payload (``dads_bank``; None disables, giving
+    the round-1 v1 payload) + DEM elevation at their (lattice-snapped, deduped)
+    centers; edges get ``sc_rel_elev_m`` on top of the geometry attrs. Shared by the
+    full bundle build (``--spatial-context``) and utils/augment_spatial_context.py,
+    so both paths emit byte-identical pieces.
+    """
+    sc_cells, sc_edges = spatial_context_cells(xy, qidx)
+    scx = sc_cells["x5070"].to_numpy("float64")
+    scy = sc_cells["y5070"].to_numpy("float64")
+    sc_z = sample_coarse(dem, scx, scy)
+    n_bad_z = int((~np.isfinite(sc_z)).sum())
+    if n_bad_z:
+        # Off-DEM cells (a coastal 10 km ring over water) keep NaN rel-elev for the
+        # trainer's missingness indicators; more than the covariate NaN budget means
+        # the lattice origin / DEM footprint disagree -- stop and look.
+        log.warning(
+            "spatial-context: %d/%d cells lack finite DEM elev (rel-elev stays NaN)",
+            n_bad_z,
+            len(sc_cells),
+        )
+        if n_bad_z / len(sc_cells) > 0.02:
+            raise SystemExit(
+                "spatial-context: >2% of context cells sample off the DEM -- the "
+                "lattice origin or DEM footprint is wrong, not a coastal fringe"
+            )
+    sc_cells["sc_z_m"] = sc_z
+    sc_occ = sample_reach_gsw_occ(scx, scy)
+    sc_cov = sample_reach_covariates(scx, scy, sc_occ)
+    candidate_cols = list(REACH_COVARIATE_FEATURE_COLS)
+    if dads_bank is not None:
+        sc_cov |= sample_dads_sc_covariates(scx, scy, Path(dads_bank))
+        candidate_cols += list(DADS_SC_NODE_BANDS)
+    sc_nan_frac = {c: float(np.isnan(v).mean()) for c, v in sc_cov.items()}
+    log.info(
+        "spatial-context covariate NaN fractions: %s",
+        " ".join(f"{c}={f:.3f}" for c, f in sc_nan_frac.items()),
+    )
+    sc_dropped = [c for c, f in sc_nan_frac.items() if f > SC_NAN_DROP_FRAC]
+    for c in sc_dropped:
+        log.warning(
+            "spatial-context: dropping node covariate %s (%.3f NaN > %.0f%%)",
+            c,
+            sc_nan_frac[c],
+            SC_NAN_DROP_FRAC * 100,
+        )
+    sc_node_cols = [c for c in candidate_cols if c not in sc_dropped]
+    for c in sc_node_cols:
+        sc_cells[c] = sc_cov[c]
+    # rel-elev from the snapped geometry: edge rows are query-major in xy row order
+    # (spatial_context_cells contract), so repeat the row-aligned surface.
+    n_per_q = len(SPATIAL_CONTEXT_RADII) * SPATIAL_CONTEXT_N
+    sc_edges["sc_rel_elev_m"] = sc_z[sc_edges["sc_node_idx"].to_numpy()] - np.repeat(
+        well_surf_m, n_per_q
+    )
+    sc_cells.to_parquet(gdir / "spatial_context_nodes.parquet")
+    sc_edges[
+        ["query_node_idx", "sc_node_idx", "ring", "octant", *SC_EDGE_FEATURE_COLS]
+    ].to_parquet(gdir / "spatial_context_edges.parquet")
+    log.info(
+        "spatial-context ON: %d cells (%.2f/query after dedup), %d edges, %d node cols",
+        len(sc_cells),
+        len(sc_cells) / max(len(xy), 1),
+        len(sc_edges),
+        len(sc_node_cols),
+    )
+    return {
+        "radii_m": list(SPATIAL_CONTEXT_RADII),
+        "n_per_ring": SPATIAL_CONTEXT_N,
+        "lattice_origin_5070": list(SC_LATTICE_ORIGIN),
+        "lattice_res_m": SC_LATTICE_RES_M,
+        "node_count": int(len(sc_cells)),
+        "edge_count": int(len(sc_edges)),
+        "node_feature_cols": sc_node_cols,
+        "dropped_node_cols": sc_dropped,
+        "nan_fraction_by_col": sc_nan_frac,
+        "nan_drop_frac": SC_NAN_DROP_FRAC,
+        "edge_feature_cols": SC_EDGE_FEATURE_COLS,
+        "dads_bank": str(dads_bank) if dads_bank is not None else None,
+        "dem_nonfinite_cells": n_bad_z,
+        "leakage_note": (
+            "context cells carry the target-blind 6A.1 covariate bank sampled at "
+            "lattice cell centers; edges carry azimuth sin/cos, ring one-hot, log "
+            "distance, and cell-vs-query relative elevation. No absolute elevation "
+            "/ head / target on any node or edge -> leak-free by construction."
+        ),
+    }
+
+
 def dist_to_wet_reach(
     qxy: np.ndarray,
     rx: np.ndarray,
@@ -1689,6 +2088,49 @@ def main() -> None:
         "(50%% of wells attach to Strahler-0 fingertips; see the topology review).",
     )
     ap.add_argument(
+        "--drilled-depth-points",
+        default=None,
+        help="(wte_residual only) point parquet from build_drilled_depth_points.py "
+        "(GWX unconfined wells with sane construction depth, EPSG:5070). Adds the "
+        "drilled-depth field (kNN IDW-mean + p90 of neighbor CONSTRUCTION depths, "
+        "--idw-k/--idw-power) as query features -- the behavioral deep-regime "
+        "observation ('how deep do people have to drill here') that no raster "
+        "covariate carries (deep-bench: geology/climate/flux all AUC~0.5). "
+        "Construction metadata, not a water level -> deployment-available, no fold "
+        "cross-fit; the query well's own record + nest siblings are excluded "
+        "(canonical_id + --drilled-depth-self-exclude-m).",
+    )
+    ap.add_argument(
+        "--drilled-depth-self-exclude-m",
+        type=float,
+        default=100.0,
+        help="exclusion radius (m) around each TRAINING well when sampling the "
+        "drilled-depth field: removes the well's own record and co-located "
+        "piezometer-nest siblings (whose construction depth is quasi-well-specific). "
+        "Inference lattices pass 0 (a lattice cell is not a well).",
+    )
+    ap.add_argument(
+        "--zell-sanford-features",
+        action="store_true",
+        help="(wte_residual only) add Zell & Sanford 2020 steady-state features "
+        "(zs_dtw_m / zs_resid_m / zs_log_trans) as query features -- the regional "
+        "lateral-flow datum missing from the local covariate bank (Rathdrum-type "
+        "deep-basin failure). Feature path on purpose (drilled-depth lesson: "
+        "features moved every band, the deep gate expert stayed dead). CAVEAT: "
+        "calibrated to NWIS long-term levels -> adjudicate on the non-NWIS panel.",
+    )
+    ap.add_argument(
+        "--dupuit-hang-features",
+        action="store_true",
+        help="(wte_residual only) add the well-free Dupuit hang features "
+        "(dupuit_hang_dtw_m = z_surf - kNN-IDW of top-2-Strahler reach elevations; "
+        "log1p_dupuit_d_m = distance to that boundary set) as query features. The "
+        "boundary-conditioned WTE hang surface is complementary to the well-IDW R "
+        "(error corr 0.35, wins 56%% of its blow-ups) and leak-free by construction "
+        "(stream elevations only). The fitted per-HUC8 Dupuit sag is deliberately "
+        "excluded (diagnostic NO-GO: anomaly uncorrelated with d in failure basins).",
+    )
+    ap.add_argument(
         "--ensemble-member-features",
         action="store_true",
         help="(wte_residual only) expose the ensemble members that are NOT the base as "
@@ -1808,6 +2250,23 @@ def main() -> None:
         "portfolio_edges.parquet + per-type portfolio_missing_* query flags; requires "
         "channel_edges + reach rep-points. See notes/GNN_PHASE6_PLAN.md 6B.",
     )
+    ap.add_argument(
+        "--spatial-context",
+        action="store_true",
+        help="build multi-scale spatial-context nodes: 2 rings (2000/10000 m) x 8 "
+        "octant azimuths of lattice-snapped 100 m cells per query, carrying the 6A.1 "
+        "covariate bank; edges carry azimuth sin/cos + ring one-hot + log distance + "
+        "rel-elev (the direction x scale terrain read the point covariates average "
+        "away). Writes spatial_context_nodes.parquet + spatial_context_edges.parquet. "
+        "Cells dedup on the canonical inference lattice. See notes/SPATIAL_CONTEXT.md.",
+    )
+    ap.add_argument(
+        "--dads-covariate-bank",
+        default=DADS_HTD_BANK,
+        help="handily-side copy of the dads HTD 1 km static stack for the SC payload "
+        "v2 cols (terrain/PRISM/facets/r.sun/Landsat; notes/SC_COVARIATE_UPGRADE.md). "
+        "Pass 'none' to build the round-1 v1 payload (6A.1 bank only).",
+    )
     args = ap.parse_args()
     gdir = Path(args.graph_dir)
     if args.evidence_features and args.target != TARGET_WTE_RESIDUAL:
@@ -1830,6 +2289,24 @@ def main() -> None:
             "--ensemble-member-features is wired into the wte_residual query bank only; "
             f"got target={args.target}"
         )
+    if args.drilled_depth_points and args.target != TARGET_WTE_RESIDUAL:
+        raise SystemExit(
+            "--drilled-depth-points is wired into the wte_residual query bank only; "
+            f"got target={args.target}"
+        )
+    drilled_depth_block: dict | None = None
+    if args.zell_sanford_features and args.target != TARGET_WTE_RESIDUAL:
+        raise SystemExit(
+            "--zell-sanford-features is wired into the wte_residual query bank only; "
+            f"got target={args.target}"
+        )
+    zell_sanford_block: dict | None = None
+    if args.dupuit_hang_features and args.target != TARGET_WTE_RESIDUAL:
+        raise SystemExit(
+            "--dupuit-hang-features is wired into the wte_residual query bank only; "
+            f"got target={args.target}"
+        )
+    dupuit_hang_block: dict | None = None
     if args.terrain_multiscale_features and args.target != TARGET_WTE_RESIDUAL:
         raise SystemExit(
             "--terrain-multiscale-features is wired into the wte_residual query bank only; "
@@ -2214,7 +2691,17 @@ def main() -> None:
                         f"{nm} member of ensemble_median R -- investigate (do not patch)"
                     )
             r_wte = np.median(np.vstack([relief_wte, simple_wte, fac_wte]), axis=0)
-            head_anom_cols = [FAC_REM_WTE_ANOM_COL, DEEP_REGIONAL_WTE_ANOM_COL]
+            # Every member differenced from the median base: fac + relief anomalies
+            # here (simple via --ensemble-member-features). At each well exactly one
+            # member anomaly is 0 (it IS the median), so the trio also tells the
+            # model which member won locally.
+            wells[RELIEF_IDW_WTE_COL] = relief_wte
+            wells[RELIEF_IDW_WTE_ANOM_COL] = relief_wte - r_wte
+            head_anom_cols = [
+                FAC_REM_WTE_ANOM_COL,
+                DEEP_REGIONAL_WTE_ANOM_COL,
+                RELIEF_IDW_WTE_ANOM_COL,
+            ]
         else:
             r_wte = str_top2
             head_anom_cols = [FAC_REM_WTE_ANOM_COL, DEEP_REGIONAL_WTE_ANOM_COL]
@@ -2287,6 +2774,79 @@ def main() -> None:
                     float(np.isfinite(vals).mean()),
                     float((vals > 0).mean()),
                 )
+        if args.drilled_depth_points:
+            dd_field = sample_drilled_depth(
+                args.drilled_depth_points,
+                xy,
+                args.idw_k,
+                args.idw_power,
+                query_ids=wells["canonical_id"].to_numpy(),
+                self_exclude_m=args.drilled_depth_self_exclude_m,
+            )
+            for col, vals in dd_field.items():
+                wells[col] = vals
+                log.info(
+                    "  %s: %.3f finite frac, median %.1f m",
+                    col,
+                    float(np.isfinite(vals).mean()),
+                    float(np.nanmedian(vals)),
+                )
+            drilled_depth_block = {
+                "points": args.drilled_depth_points,
+                "pool_n": int(
+                    len(
+                        pd.read_parquet(
+                            args.drilled_depth_points, columns=["drilled_depth_m"]
+                        )
+                    )
+                ),
+                "k": args.idw_k,
+                "power": args.idw_power,
+                "self_exclude_m": args.drilled_depth_self_exclude_m,
+                "feature_cols": DRILLED_DEPTH_FEATURE_COLS,
+            }
+        if args.zell_sanford_features:
+            zs = sample_zell_sanford(xy[:, 0], xy[:, 1], well_surf_m, r_wte)
+            for col, vals in zs.items():
+                wells[col] = vals
+                log.info(
+                    "  %s: %.3f finite frac, median %.2f",
+                    col,
+                    float(np.isfinite(vals).mean()),
+                    float(np.nanmedian(vals)),
+                )
+            zell_sanford_block = {
+                "dtw_raster": ZS_DTW_RASTER,
+                "trans_raster": ZS_TRANS_RASTER,
+                "feature_cols": ZS_FEATURE_COLS,
+            }
+        if args.dupuit_hang_features:
+            bnd = build_boundaries(
+                str(gdir / "reach_nodes.parquet"), args.geom, top_orders=2
+            )
+            hang_wte, d_bnd = hang_interp(
+                bnd[["cx", "cy"]].to_numpy("float64"),
+                bnd["reach_elev_m"].to_numpy("float64"),
+                xy,
+                k=8,
+                power=2.0,
+            )
+            wells["dupuit_hang_dtw_m"] = well_surf_m - hang_wte
+            wells["log1p_dupuit_d_m"] = np.log1p(d_bnd)
+            log.info(
+                "  dupuit hang: %d boundary reaches; dupuit_hang_dtw_m median %.1f m, "
+                "d_m median %.0f m",
+                len(bnd),
+                float(np.nanmedian(wells["dupuit_hang_dtw_m"])),
+                float(np.median(d_bnd)),
+            )
+            dupuit_hang_block = {
+                "boundary_reaches": int(len(bnd)),
+                "top_orders": 2,
+                "idw_k": 8,
+                "idw_power": 2.0,
+                "feature_cols": DUPUIT_FEATURE_COLS,
+            }
         target_col = WTE_RESIDUAL_TARGET_COL
         regional_prior_col = REGIONAL_WTE_COL  # carried; the DTW base is wte_resid_base
         query_feature_cols = (
@@ -2304,6 +2864,9 @@ def main() -> None:
                 else []
             )
             + (IRRIGATION_FEATURE_COLS if args.irrigation_features else [])
+            + (DRILLED_DEPTH_FEATURE_COLS if args.drilled_depth_points else [])
+            + (ZS_FEATURE_COLS if args.zell_sanford_features else [])
+            + (DUPUIT_FEATURE_COLS if args.dupuit_hang_features else [])
         )
         log.info(
             "target=wte_residual  residual_base=%s  R=%s  R-MAD(DTW)=%.2f m  "
@@ -2876,6 +3439,25 @@ def main() -> None:
             ),
         }
 
+    # Spatial-context read: rings x 8 octants of lattice-snapped context cells per ----------
+    # query. New node type; the trainer attends over the ring-cell edges (segment softmax), so no
+    # query/reach cols change here -- just the two parquets + a manifest block. Shared with
+    # utils/augment_spatial_context.py (adds the pieces to an existing bundle).
+    spatial_context_block = None
+    if args.spatial_context:
+        spatial_context_block = build_spatial_context(
+            xy,
+            wells["query_node_idx"].to_numpy("int64"),
+            well_surf_m,
+            args.dem,
+            gdir,
+            dads_bank=(
+                None
+                if str(args.dads_covariate_bank).lower() == "none"
+                else args.dads_covariate_bank
+            ),
+        )
+
     # Carry the surface datum + observed WTE in both modes (cheap, enables cross-
     # mode diagnostics + the WTE identity check); mode-specific target/priors added.
     extra_keep = [SURFACE_ELEV_COL, OBS_WTE_COL, "well_class", "confinement_class"]
@@ -3124,6 +3706,8 @@ def main() -> None:
                 FAC_REM_WTE_ANOM_COL: "(z_surf - fac_rem_dtw) - R, from the FAC raster "
                 "registry; NaN outside the built basins (NaN+indicator)",
                 DEEP_REGIONAL_WTE_ANOM_COL: "deep-well WTE IDW - R (deep-regime anomaly)",
+                RELIEF_IDW_WTE_ANOM_COL: "relief-aware (vw>0) well-IDW WTE member - R "
+                "(member anomaly-from-the-median; 0 where relief IS the median)",
             }
             leakage_notes += [
                 "wte_residual / residual_base=ensemble_median: R = the per-well MEDIAN of "
@@ -3134,7 +3718,9 @@ def main() -> None:
                 "level. Both well-IDW members are cross-fit LEAVE-ONE-FOLD-OUT on the GNN's "
                 "CV folds (leak-free w.r.t. evaluation); FAC-REM is well-free. Same full FAC "
                 "footprint as relief_idw (no str_top2). The model predicts the graph-"
-                "structured head residual over R; FAC + deep enter as anomalies-from-R.",
+                "structured head residual over R; FAC + relief + deep enter as anomalies-"
+                "from-R (add --ensemble-member-features for the simple member's anomaly, "
+                "completing the differenced member set).",
                 "HAND features removed; gridMET aridity KEPT. FAC-REM sourced from "
                 "fac_rem_registry (same as the inference grid), not the stacker shard.",
                 "Anchors not supported in this mode yet (anchor BC would need a "
@@ -3226,6 +3812,70 @@ def main() -> None:
                 "top; single-scale TWI ~wash). All target-blind + translation-invariant "
                 "(relative elevation / dimensionless) -> RGA-safe, no leakage."
             )
+        if args.drilled_depth_points:
+            wte_features["drilled_depth_idw_m"] = (
+                "kNN IDW-mean of neighbor well CONSTRUCTION depths (m) from the GWX "
+                "unconfined drilled-depth pool (self/nest excluded on the train side)"
+            )
+            wte_features["drilled_depth_p90_m"] = (
+                "p90 of the same neighbor construction depths (m) -- flags 'deep "
+                "drilling happens here' even where the local median is shallow"
+            )
+            leakage_notes.append(
+                "Drilled-depth field (--drilled-depth-points): kNN IDW-mean + p90 of "
+                "neighbor wells' CONSTRUCTION depths from the GWX unconfined pool "
+                "(build_drilled_depth_points.py). Construction metadata, NOT an "
+                "observed water level: neighboring wells' drilled depths are public "
+                "record available at any prediction point in deployment, so no fold "
+                "cross-fit is needed (unlike the label-built R / deep-IDW priors). "
+                "The one leak channel -- a training well's OWN record (and co-located "
+                "piezometer-nest siblings, drilled to bracket the same local table) "
+                "encoding its own water level -- is closed by excluding pool wells "
+                "matching the query's canonical_id or within "
+                "--drilled-depth-self-exclude-m. Depth correlates with the water "
+                "table because drillers chase it; that correlation is the SIGNAL "
+                "(a behavioral deep-regime observation), not leakage."
+            )
+        if args.zell_sanford_features:
+            wte_features["zs_dtw_m"] = (
+                "Zell & Sanford 2020 simulated steady-state DTW (m, positive-down; "
+                "small negatives are real DRN discharge cells), 250 m"
+            )
+            wte_features["zs_resid_m"] = (
+                "(z_surf - zs_dtw_m) - R: Z&S's own estimate of the wte_residual "
+                "target (its WTE anomaly over the residual base)"
+            )
+            wte_features["zs_log_trans"] = (
+                "log10 calibrated transmissivity (m2/day) from the same solve -- "
+                "high-T structural-basin regime marker"
+            )
+            leakage_notes.append(
+                "Zell & Sanford features (--zell-sanford-features): the simulation "
+                "is CALIBRATED to long-term-average NWIS water levels (plus NHD/NWI "
+                "head targets) -- the same population as the NWIS labels -- through "
+                "stiff HUC4 x surficial-geology zonal parameters, and cannot be fold "
+                "cross-fit. Real but diffuse leakage into NWIS-well metrics: treat "
+                "NWIS-panel gains as an upper bound and adjudicate this arm on the "
+                "non-NWIS panel (sources never in the Z&S objective). The per-"
+                "subdomain calibration well lists ({ID}_wl.csv on ScienceBase) can "
+                "mark contaminated labels exactly if needed."
+            )
+        if args.dupuit_hang_features:
+            wte_features["dupuit_hang_dtw_m"] = (
+                "z_surf - kNN-IDW of top-2-Strahler reach elevations per FAC basin: "
+                "depth below the boundary-conditioned WTE hang surface (well-free)"
+            )
+            wte_features["log1p_dupuit_d_m"] = (
+                "log1p distance (m) to the nearest top-2-Strahler boundary reach -- "
+                "the Dupuit coordinate; the GNN learns its own regional shape in it"
+            )
+            leakage_notes.append(
+                "Dupuit hang features (--dupuit-hang-features): built from stream "
+                "reach elevations only (no wells anywhere in the construction) -> "
+                "leak-free by construction, no fold cross-fit needed. The fitted "
+                "per-HUC8 Dupuit sag was diagnosed uninformative in failure basins "
+                "and is deliberately not included (see build_dupuit_wte.py)."
+            )
     else:
         target_mode = TARGET_DTW_RESIDUAL
         target_units = "m"
@@ -3315,12 +3965,16 @@ def main() -> None:
         "irrigation_features": IRRIGATION_FEATURE_COLS
         if args.irrigation_features
         else [],
+        "drilled_depth": drilled_depth_block,
+        "zell_sanford": zell_sanford_block,
+        "dupuit_hang": dupuit_hang_block,
         "ds_datum": ds_datum_block,
         "mainstem_read": mainstem_read_block,
         "wet_propagation": wet_propagation_block,
         "reach_covariates": reach_covariates_block,
         "upstream_accumulation": upstream_accum_block,
         "portfolio_read": portfolio_read_block,
+        "spatial_context": spatial_context_block,
         "evidence_params": {
             "ndvi_jja": NDVI_JJA,
             "ndvi_djf": NDVI_DJF,

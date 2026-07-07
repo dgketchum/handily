@@ -585,3 +585,324 @@ def test_join_obs_metadata_duplicate_id_keeps_first(tmp_path):
     bc.join_obs_metadata(wells, str(path))
     assert wells.loc[0, "obs_count"] == 340
     assert wells.loc[0, "well_depth"] == 7.0
+
+
+def _dd_pool(tmp_path, rows):
+    pool = pd.DataFrame(
+        rows, columns=["canonical_id", "x5070", "y5070", "drilled_depth_m"]
+    )
+    pool["source"] = "test"
+    path = tmp_path / "drilled_depth_points.parquet"
+    pool.to_parquet(path, index=False)
+    return str(path)
+
+
+def test_sample_drilled_depth_fast_path_idw_and_p90(tmp_path):
+    # No exclusion args -> plain kNN. Query sits ON p0 (dist 0 clamps to 1 m in
+    # the weight), so p0 dominates the k=2 IDW; p90 spans both neighbors.
+    path = _dd_pool(
+        tmp_path,
+        [("p0", 0.0, 0.0, 10.0), ("p1", 1000.0, 0.0, 20.0), ("p2", 2000.0, 0.0, 30.0)],
+    )
+    out = bc.sample_drilled_depth(path, np.array([[0.0, 0.0]]), k=2, power=2.0)
+    w = np.array([1.0, 1.0 / 1000.0**2])
+    expect = (w * np.array([10.0, 20.0])).sum() / w.sum()
+    assert out["drilled_depth_idw_m"][0] == pytest.approx(expect)
+    assert out["drilled_depth_p90_m"][0] == pytest.approx(19.0)
+
+
+def test_sample_drilled_depth_self_exclusion_by_id(tmp_path):
+    # The query well's OWN pool record is dropped even at radius 0; the feature
+    # comes from the remaining neighbors only.
+    path = _dd_pool(
+        tmp_path,
+        [("p0", 0.0, 0.0, 10.0), ("p1", 1000.0, 0.0, 20.0), ("p2", 2000.0, 0.0, 30.0)],
+    )
+    out = bc.sample_drilled_depth(
+        path,
+        np.array([[0.0, 0.0]]),
+        k=2,
+        power=2.0,
+        query_ids=np.array(["p0"]),
+        self_exclude_m=0.0,
+    )
+    w = np.array([1.0 / 1000.0**2, 1.0 / 2000.0**2])
+    expect = (w * np.array([20.0, 30.0])).sum() / w.sum()
+    assert out["drilled_depth_idw_m"][0] == pytest.approx(expect)
+    assert out["drilled_depth_p90_m"][0] == pytest.approx(29.0)
+
+
+def test_sample_drilled_depth_nest_sibling_radius_exclusion(tmp_path):
+    # A co-located nest sibling (different canonical_id, 50 m away) is removed by
+    # the radius; the first legit neighbor outside the radius is kept.
+    path = _dd_pool(
+        tmp_path,
+        [
+            ("p0", 0.0, 0.0, 10.0),
+            ("nest", 50.0, 0.0, 999.0),
+            ("p1", 200.0, 0.0, 20.0),
+            ("p2", 1000.0, 0.0, 30.0),
+        ],
+    )
+    out = bc.sample_drilled_depth(
+        path,
+        np.array([[0.0, 0.0]]),
+        k=2,
+        power=2.0,
+        query_ids=np.array(["p0"]),
+        self_exclude_m=100.0,
+    )
+    w = np.array([1.0 / 200.0**2, 1.0 / 1000.0**2])
+    expect = (w * np.array([20.0, 30.0])).sum() / w.sum()
+    assert out["drilled_depth_idw_m"][0] == pytest.approx(expect)
+    assert 999.0 not in [out["drilled_depth_p90_m"][0]]
+    assert out["drilled_depth_p90_m"][0] == pytest.approx(29.0)
+
+
+def test_sample_drilled_depth_all_excluded_raises(tmp_path):
+    # Pool collapses to the query well itself -> zero usable neighbors must be a
+    # loud failure, not a silent NaN.
+    path = _dd_pool(tmp_path, [("p0", 0.0, 0.0, 10.0)])
+    with pytest.raises(SystemExit, match="self-exclusion"):
+        bc.sample_drilled_depth(
+            path,
+            np.array([[0.0, 0.0]]),
+            k=2,
+            power=2.0,
+            query_ids=np.array(["p0"]),
+            self_exclude_m=100.0,
+        )
+
+
+def _write_zs_raster(path, values, nodata=-99999.0):
+    """3x3 EPSG:5070 float32 raster at 100 m res, top-left (0, 300)."""
+    import rasterio
+    from rasterio.transform import from_origin
+
+    arr = np.asarray(values, dtype="float32").reshape(3, 3)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=3,
+        width=3,
+        count=1,
+        dtype="float32",
+        crs="EPSG:5070",
+        transform=from_origin(0.0, 300.0, 100.0, 100.0),
+        nodata=nodata,
+    ) as dst:
+        dst.write(arr, 1)
+
+
+def test_sample_zell_sanford_values_resid_and_nodata(tmp_path):
+    dtw = tmp_path / "zs_dtw.tif"
+    trans = tmp_path / "zs_trans.tif"
+    # top row: dtw 10/20/nodata; trans 100 / 0 (log-undefined) / 1000
+    _write_zs_raster(dtw, [[10.0, 20.0, -99999.0], [5.0] * 3, [5.0] * 3])
+    _write_zs_raster(trans, [[100.0, 0.0, 1000.0], [10.0] * 3, [10.0] * 3])
+    x = np.array([50.0, 150.0, 250.0])  # centers of the three top-row cells
+    y = np.array([250.0, 250.0, 250.0])
+    z_surf = np.array([1000.0, 1000.0, 1000.0])
+    r_wte = np.array([985.0, 985.0, 985.0])
+    out = bc.sample_zell_sanford(
+        x, y, z_surf, r_wte, dtw_raster=str(dtw), trans_raster=str(trans)
+    )
+    np.testing.assert_allclose(out["zs_dtw_m"][:2], [10.0, 20.0])
+    assert np.isnan(out["zs_dtw_m"][2])  # raster nodata -> NaN, never a magnitude
+    # zs_resid = (z_surf - zs_dtw) - R: Z&S's own estimate of the wte_residual target
+    np.testing.assert_allclose(out["zs_resid_m"][:2], [5.0, -5.0])
+    assert np.isnan(out["zs_resid_m"][2])
+    np.testing.assert_allclose(out["zs_log_trans"][0], 2.0)
+    assert np.isnan(out["zs_log_trans"][1])  # trans <= 0 -> NaN (log undefined)
+    np.testing.assert_allclose(out["zs_log_trans"][2], 3.0)
+
+
+# ---------------------------------------------------------------------------
+# Spatial-context cells: lattice snap, dedup, edge geometry (--spatial-context)
+# ---------------------------------------------------------------------------
+def _sc_query_at_cell_center(col=1000, row=2000):
+    """A query sitting exactly ON a canonical-lattice cell center."""
+    x0, y0 = bc.SC_LATTICE_ORIGIN
+    res = bc.SC_LATTICE_RES_M
+    return np.array([[x0 + (col + 0.5) * res, y0 + (row + 0.5) * res]])
+
+
+def test_spatial_context_cells_counts_and_schema():
+    xy = _sc_query_at_cell_center()
+    cells, edges = bc.spatial_context_cells(xy, np.array([7], dtype="int64"))
+    n_per_q = len(bc.SPATIAL_CONTEXT_RADII) * bc.SPATIAL_CONTEXT_N
+    assert len(edges) == n_per_q == 16
+    # one query, rings >= 2 km on a 100 m lattice -> all 16 cells distinct
+    assert len(cells) == 16
+    assert (edges["query_node_idx"] == 7).all()
+    assert cells["sc_node_idx"].tolist() == list(range(16))
+    # ring-major, octant-minor tiling (the attention-dump contract)
+    assert edges["ring"].tolist() == [0] * 8 + [1] * 8
+    assert edges["octant"].tolist() == list(range(8)) * 2
+    # ring one-hot rows sum to 1 and match the ring index
+    oh = edges[["sc_r2000", "sc_r10000"]].to_numpy()
+    np.testing.assert_allclose(oh.sum(axis=1), 1.0)
+    assert (oh.argmax(axis=1) == edges["ring"].to_numpy()).all()
+    # azimuth is a unit vector
+    np.testing.assert_allclose(
+        edges["sc_sin_az"] ** 2 + edges["sc_cos_az"] ** 2, 1.0, atol=1e-9
+    )
+    # rel-elev is the caller's job (needs the DEM), not part of the geometry
+    assert "sc_rel_elev_m" not in edges.columns
+
+
+def test_spatial_context_cells_snap_geometry_exact():
+    xy = _sc_query_at_cell_center()
+    cells, edges = bc.spatial_context_cells(xy, np.array([0], dtype="int64"))
+    res = bc.SC_LATTICE_RES_M
+    dist = np.expm1(edges["sc_log1p_dist_m"].to_numpy())
+    # snapped distance stays within a cell half-diagonal of the nominal radius
+    nominal = np.repeat(np.asarray(bc.SPATIAL_CONTEXT_RADII), bc.SPATIAL_CONTEXT_N)
+    assert (np.abs(dist - nominal) <= res * np.sqrt(2) / 2 + 1e-9).all()
+    # query on a cell center + cardinal offsets (multiples of 100) -> EXACT snap:
+    # octant 0 (due east) at r=2000 lands on the center 20 cells east.
+    e = edges.iloc[0]
+    assert e["ring"] == 0 and e["octant"] == 0
+    np.testing.assert_allclose(np.expm1(e["sc_log1p_dist_m"]), 2000.0)
+    np.testing.assert_allclose([e["sc_cos_az"], e["sc_sin_az"]], [1.0, 0.0], atol=1e-9)
+    c = cells.set_index("sc_node_idx").loc[int(e["sc_node_idx"])]
+    np.testing.assert_allclose(
+        [c["x5070"] - xy[0, 0], c["y5070"] - xy[0, 1]], [2000.0, 0.0], atol=1e-6
+    )
+    # octant 2 (due north) at r=10000: exact vertical snap
+    n = edges[(edges["ring"] == 1) & (edges["octant"] == 2)].iloc[0]
+    np.testing.assert_allclose([n["sc_cos_az"], n["sc_sin_az"]], [0.0, 1.0], atol=1e-9)
+    np.testing.assert_allclose(np.expm1(n["sc_log1p_dist_m"]), 10000.0)
+
+
+def test_spatial_context_cells_dedup_across_queries():
+    q1 = _sc_query_at_cell_center()
+    xy = np.vstack([q1, q1 + 1.0])  # 1.4 m apart: same lattice cell for every sample
+    cells, edges = bc.spatial_context_cells(xy, np.array([0, 1], dtype="int64"))
+    assert len(edges) == 32
+    assert len(cells) == 16  # shared pool: the second query dedups onto the first
+    a = edges[edges["query_node_idx"] == 0].sort_values(["ring", "octant"])
+    b = edges[edges["query_node_idx"] == 1].sort_values(["ring", "octant"])
+    assert a["sc_node_idx"].tolist() == b["sc_node_idx"].tolist()
+    # but the snapped geometry is per-query (query 2 is 1.4 m off the centers)
+    assert not np.allclose(
+        a["sc_log1p_dist_m"].to_numpy(), b["sc_log1p_dist_m"].to_numpy()
+    )
+
+
+def test_spatial_context_edge_cols_contract():
+    # the trainer's --sc-no-azimuth control drops EXACTLY these two channels
+    assert {"sc_sin_az", "sc_cos_az"} < set(bc.SC_EDGE_FEATURE_COLS)
+    kept = [c for c in bc.SC_EDGE_FEATURE_COLS if c not in ("sc_sin_az", "sc_cos_az")]
+    assert kept == [
+        "sc_r2000",
+        "sc_r10000",
+        "sc_log1p_dist_m",
+        "sc_rel_elev_m",
+    ]
+
+
+def _write_bank_raster(path, band_descs, res=100.0, n=4, nodata=None):
+    """Tiny EPSG:5070 raster at origin (0, n*res); band b filled with 10*b."""
+    import rasterio
+    from rasterio.transform import from_origin
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = np.stack(
+        [
+            np.full((n, n), 10.0 * (b + 1), dtype="float32")
+            for b in range(len(band_descs))
+        ]
+    )
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=n,
+        width=n,
+        count=len(band_descs),
+        dtype="float32",
+        crs="EPSG:5070",
+        transform=from_origin(0.0, n * res, res, res),
+        nodata=nodata,
+    ) as dst:
+        dst.write(data)
+        for i, d in enumerate(band_descs, start=1):
+            if d is not None:
+                dst.set_band_description(i, d)
+
+
+def _make_dads_bank(tmp_path):
+    bank = tmp_path / "dads_htd_1km"
+    _write_bank_raster(
+        bank / "terrain_htd_1km.tif",
+        ["elevation", "slope", "aspect_sin", "aspect_cos", "tpi_4", "tpi_10"],
+    )
+    _write_bank_raster(
+        bank / "prism_effective_terrain_height_htd_1km.tif",
+        ["effective_terrain_height_m"],
+    )
+    # single-band raster deliberately WITHOUT a description (col maps band None -> 1)
+    _write_bank_raster(
+        bank / "prism_effective_terrain_i3d_htd_1km.tif", [None], nodata=-9.0
+    )
+    _write_bank_raster(
+        bank / "derived/facet_sincos_htd_1km.tif",
+        ["facet_sin_12km", "facet_cos_12km", "facet_sin_36km", "facet_cos_36km"],
+    )
+    _write_bank_raster(
+        bank / "derived/rsun_seasonal_htd_1km.tif",
+        [
+            "rsun_djf",
+            "rsun_mam",
+            "rsun_jja",
+            "rsun_son",
+            "rsun_ann",
+            "rsun_djf_jja_ratio",
+        ],
+    )
+    _write_bank_raster(
+        bank / "derived/landsat_indices_htd_1km.tif",
+        [f"ndvi_p{p}" for p in range(5)]
+        + ["ndvi_amp", "ndmi_p2", "mndwi_p2", "b10_p2_k", "b10_amp_k"],
+    )
+    return bank
+
+
+def test_sample_dads_sc_covariates_band_resolution(tmp_path):
+    bank = _make_dads_bank(tmp_path)
+    # in-bounds point (cell centers at 50..350) + out-of-bounds point
+    x = np.array([150.0, 1e7])
+    y = np.array([250.0, 1e7])
+    out = bc.sample_dads_sc_covariates(x, y, bank)
+    assert set(out) == set(bc.DADS_SC_NODE_BANDS)
+    # description-resolved band values: band b carries 10*b
+    assert out["d_slope"][0] == 20.0  # terrain band 2
+    assert out["d_aspect_cos"][0] == 40.0  # terrain band 4
+    assert out["d_eth_m"][0] == 10.0
+    assert out["d_terrain_i3d"][0] == 10.0  # None -> the only band
+    assert out["d_facet_cos_36km"][0] == 40.0
+    assert out["d_rsun_jja"][0] == 30.0  # rsun band 3
+    assert out["d_rsun_djf_jja_ratio"][0] == 60.0
+    assert out["d_ndvi_amp"][0] == 60.0  # landsat band 6
+    assert out["d_lst_b10_p2_k"][0] == 90.0
+    # out-of-bounds -> NaN for every col
+    assert all(np.isnan(v[1]) for v in out.values())
+
+
+def test_sample_dads_sc_covariates_missing_raster_and_band(tmp_path):
+    bank = _make_dads_bank(tmp_path)
+    (bank / "terrain_htd_1km.tif").unlink()
+    with pytest.raises(SystemExit, match="dads SC raster missing"):
+        bc.sample_dads_sc_covariates(np.array([150.0]), np.array([250.0]), bank)
+    # restore terrain but break a derived band description -> loud failure
+    _write_bank_raster(
+        bank / "terrain_htd_1km.tif",
+        ["elevation", "slope", "aspect_sin", "aspect_cos", "tpi_4", "tpi_10"],
+    )
+    _write_bank_raster(
+        bank / "derived/rsun_seasonal_htd_1km.tif", ["rsun_djf", "WRONG_NAME"]
+    )
+    with pytest.raises(SystemExit, match="no band described 'rsun_jja'"):
+        bc.sample_dads_sc_covariates(np.array([150.0]), np.array([250.0]), bank)
