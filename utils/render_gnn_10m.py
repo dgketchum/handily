@@ -154,7 +154,9 @@ def recompose(
     return wte10, fallback
 
 
-def render_basin(basin: str, man: dict, model_name: str) -> None:
+def render_basin(
+    basin: str, man: dict, model_name: str, write_dem: bool = False
+) -> None:
     gdirb = HUC8_ROOT / basin / "gnn" / model_name
     coarse_wte = gdirb / "gnn_wte_100m.tif"
     if not coarse_wte.exists():
@@ -249,6 +251,11 @@ def render_basin(basin: str, man: dict, model_name: str) -> None:
         layers["gnn_sigma_10m.tif"] = np.where(
             valid, up(gdirb / "gnn_sigma_100m.tif"), np.nan
         )
+    # The aligned 3DEP DEM the recompose already warped onto the master grid --
+    # persisted (pixel-locked to gnn_dtw_10m) so a downstream gdaldem hillshade
+    # needs no per-basin regridding. Kept only when requested (viewing basemap).
+    if write_dem:
+        layers["gnn_dem_10m.tif"] = dem10
     for name, arr in layers.items():
         write_tif(gdirb / name, arr, transform)
         with rasterio.open(gdirb / name, "r+") as dst:
@@ -313,6 +320,11 @@ def main() -> None:
     ap.add_argument(
         "--overwrite", action="store_true", help="re-render basins with existing 10 m"
     )
+    ap.add_argument(
+        "--write-dem",
+        action="store_true",
+        help="also write gnn_dem_10m.tif (aligned 3DEP DEM) for a downstream hillshade",
+    )
     args = ap.parse_args()
     model_dir = Path(args.model_dir)
     model_name = model_dir.name
@@ -330,7 +342,7 @@ def main() -> None:
         if not args.overwrite and out.exists():
             skipped += 1
             continue
-        render_basin(b, man, model_name)
+        render_basin(b, man, model_name, write_dem=args.write_dem)
         done += 1
     log.info("render complete: %d basins, %d skipped (existing)", done, skipped)
 
