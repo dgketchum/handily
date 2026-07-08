@@ -274,3 +274,24 @@ def test_load_models_rejects_non_gate_arm(tmp_path):
     (mdir / "inference_manifest.json").write_text(json.dumps(man))
     with pytest.raises(SystemExit, match="prior-gate arms only"):
         inf.load_models(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# water pseudo-row pool discipline
+# ---------------------------------------------------------------------------
+def test_well_pool_drops_water_pseudo_rows():
+    qn = pd.DataFrame(
+        {
+            "canonical_id": ["w1", "water_0000001", "w2"],
+            "is_water_pseudo": [False, True, False],
+        }
+    )
+    out = inf.well_pool(qn)
+    assert list(out["canonical_id"]) == ["w1", "w2"]
+    assert list(out.index) == [0, 1]
+
+
+def test_well_pool_noop_without_column():
+    qn = pd.DataFrame({"canonical_id": ["w1", "w2"]})
+    out = inf.well_pool(qn)
+    assert out is qn

@@ -51,7 +51,9 @@ from rasterio.transform import from_origin
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_conus_graph_inputs import (  # noqa: E402
     DEM,
+    WATER_BLOCKS_PARQUET,
     _relief_coords,
+    _sample_gsw_occurrence,
     attach_lateral_attrs,
     build_lateral_edges,
     deep_well_mask,
@@ -59,6 +61,7 @@ from build_conus_graph_inputs import (  # noqa: E402
     sample_gridmet,
     sample_relief_etrm,
     sample_terrain_multiscale,
+    water_query_features,
 )
 from build_stacker_features import sample_coarse  # noqa: E402
 from fac_rem_registry import sample_fac_rem  # noqa: E402
@@ -102,6 +105,26 @@ def write_tif(path: Path, arr: np.ndarray, transform, count: int = 1, descs=None
         dst.write(a)
         for i, d in enumerate(descs or [], start=1):
             dst.set_band_description(i, d)
+
+
+def well_pool(qn: pd.DataFrame) -> pd.DataFrame:
+    """Real wells only: water pseudo-rows are labels, never prior sources.
+
+    The training-time crossfit priors (relief-IDW R, deep-datum IDW) pooled on
+    wells exclusively; the inference-time all-well IDW counterparts must match,
+    or the gate sees R/deep surfaces drawn toward stage — a distribution the
+    checkpoints never trained on.
+    """
+    if "is_water_pseudo" not in qn.columns:
+        return qn
+    water = qn["is_water_pseudo"].astype(bool)
+    if water.any():
+        log.info(
+            "well pool: dropped %d/%d water pseudo-rows (labels, never prior sources)",
+            int(water.sum()),
+            len(qn),
+        )
+    return qn[~water].reset_index(drop=True)
 
 
 def snapped_window(bounds: tuple, res: float) -> tuple:
@@ -490,6 +513,7 @@ def infer_basin(
     bman: dict,
     args,
     device: str,
+    water_xy: np.ndarray | None = None,
 ) -> None:
     man = models["manifest"]
     out_dir = HUC8_ROOT / basin / "gnn" / args.model_name
@@ -566,6 +590,15 @@ def infer_basin(
         sample_gridmet(qx, qy),
     ):
         for c, v in d_cov.items():
+            frame[c] = v
+    if water_xy is not None:
+        from pyproj import Transformer
+
+        lon_q, lat_q = Transformer.from_crs(5070, 4326, always_xy=True).transform(
+            qx, qy
+        )
+        frame["gsw_occ_pct"] = _sample_gsw_occurrence(lon_q, lat_q)
+        for c, v in water_query_features(qxy, z_surf, water_xy, args.dem).items():
             frame[c] = v
     missing = [c for c in man["query_feature_cols"] if c not in frame.columns]
     if missing:
@@ -734,7 +767,15 @@ def main() -> None:
 
     gdir = Path(man["graph_dir"])
     bman = json.loads((gdir / "graph_manifest.json").read_text())
-    qn = pd.read_parquet(gdir / "query_nodes.parquet")
+    qn = well_pool(pd.read_parquet(gdir / "query_nodes.parquet"))
+    water_xy = None
+    if man["flags"].get("water_features"):
+        blocks = pd.read_parquet(gdir / WATER_BLOCKS_PARQUET)
+        water_xy = blocks[["x5070", "y5070"]].to_numpy("float64")
+        log.info(
+            "water features ON: %d permanent-water blocks (bundle cache)",
+            len(water_xy),
+        )
     wells = {
         "xy": qn[["x5070", "y5070"]].to_numpy("float64"),
         "z": qn[man["surface_elev_col"]].to_numpy("float64"),
@@ -778,7 +819,18 @@ def main() -> None:
         if not args.overwrite and (out_dir / "gnn_dtw_100m.tif").exists():
             skipped += 1
             continue
-        infer_basin(b, models, wells, rn_full, ce_full, geom, bman, args, args.device)
+        infer_basin(
+            b,
+            models,
+            wells,
+            rn_full,
+            ce_full,
+            geom,
+            bman,
+            args,
+            args.device,
+            water_xy=water_xy,
+        )
         done += 1
     log.info("inference complete: %d basins run, %d skipped (existing)", done, skipped)
 
