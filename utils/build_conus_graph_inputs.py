@@ -134,6 +134,22 @@ EVIDENCE_FEATURE_COLS = [
     "dist_to_wet_reach_m",  # distance to nearest stream reach with GSW water evidence
     "log1p_dist_to_wet_reach_m",
 ]
+# Water-stage supervision (behind --water-features / --water-pseudo-labels; see
+# notes/WATER_STAGE_SUPERVISION_PLAN.md). Permanent-water BLOCKS are ~10x10-px
+# (~280 m) aggregates of the JRC GSW occurrence tiles whose block-MEAN occurrence
+# clears the threshold -- wide lakes/rivers only, so dry arroyos and narrow
+# ephemeral channels can never enter (deliberately not Ma's burn-all-streams).
+# The gate diagnosis (Rio Chama): FAC-REM reads DTW 0.00 on water but the gate
+# routes 0.52 to the constant-depth mirror -- it has NO query-side surface-water
+# signal and NO labels there. Features give it the signal; pseudo-rows (stage =
+# hydro-flattened DEM, a real free-surface observation) give it the gradient.
+WATER_FEATURE_COLS = [
+    "gsw_occ_pct",  # GSW occurrence at the query point (0-100)
+    "log1p_dist_perm_water_m",  # distance to nearest permanent-water block
+    "hand_perm_water_m",  # z_surf(query) - DEM(nearest block) -- height above stage
+]
+WBD_HU8_PARQUET = "/nas/hydrography/HUC_Boundaries/wbd_national/wbdhu8_5070.parquet"
+WATER_BLOCKS_PARQUET = "permanent_water_blocks.parquet"  # cached in the bundle dir
 # IrrMapper irrigation frequency (behind --irrigation-features): % of 2015-2024 years
 # a 30 m pixel was classified irrigated. Mechanism: sustained irrigation recharges a
 # local shallow mound the terrain cannot see (flood-irrigated hay valleys), and the
@@ -268,6 +284,7 @@ QUERY_DIAGNOSTIC_COLS = [
     "cv_fold",
     "cv_unit",
     "block_40km",
+    "is_water_pseudo",  # water-stage pseudo-row flag (False for every real well)
 ]
 # GWX observation metadata carried on query nodes (diagnostics, NEVER features):
 # period-of-record, observation count, and construction depths. These feed the
@@ -419,8 +436,10 @@ DADS_SC_NODE_BANDS = {
     "d_facet_cos_12km": ("derived/facet_sincos_htd_1km.tif", "facet_cos_12km"),
     "d_facet_sin_36km": ("derived/facet_sincos_htd_1km.tif", "facet_sin_36km"),
     "d_facet_cos_36km": ("derived/facet_sincos_htd_1km.tif", "facet_cos_36km"),
-    "d_rsun_jja": ("derived/rsun_seasonal_htd_1km.tif", "rsun_jja"),
-    "d_rsun_djf_jja_ratio": ("derived/rsun_seasonal_htd_1km.tif", "rsun_djf_jja_ratio"),
+    # r.sun cols deferred (2026-07-07): the 365-band seasonal reduction is slow to
+    # derive; re-add once rsun_seasonal_htd_1km.tif lands (notes/SC_COVARIATE_UPGRADE.md).
+    # "d_rsun_jja": ("derived/rsun_seasonal_htd_1km.tif", "rsun_jja"),
+    # "d_rsun_djf_jja_ratio": ("derived/rsun_seasonal_htd_1km.tif", "rsun_djf_jja_ratio"),
     "d_ndvi_amp": ("derived/landsat_indices_htd_1km.tif", "ndvi_amp"),
     "d_ndmi_p2": ("derived/landsat_indices_htd_1km.tif", "ndmi_p2"),
     "d_mndwi_p2": ("derived/landsat_indices_htd_1km.tif", "mndwi_p2"),
@@ -536,18 +555,24 @@ def crossfit_idw(
     power: float,
     z: np.ndarray | None = None,
     vw: float = 0.0,
+    pool: np.ndarray | None = None,
 ) -> np.ndarray:
     """Leave-one-fold-out IDW(kNN) of a scalar well value -- the leak-free prior.
 
     Scalar-generic: ``value`` is DTW for the regional DTW prior and observed WTE
     for the head-space prior. A held-out fold's wells are never in their own
     neighbor set. ``z``/``vw`` enable the relief-aware lift (see ``_relief_coords``).
+    ``pool`` (bool mask) restricts the NEIGHBOR set beyond the fold split --
+    predictions still cover every row. Used to keep water-stage pseudo-rows out
+    of the prior (they are labels, never prior sources); None is byte-identical
+    to the historical behavior.
     """
     coords = _relief_coords(xy, z, vw)
     pred = np.full(len(value), np.nan)
+    pool_all = np.ones(len(value), bool) if pool is None else np.asarray(pool, bool)
     for f in np.unique(fold):
         te = fold == f
-        tr = ~te
+        tr = (~te) & pool_all
         tree = cKDTree(coords[tr])
         dist, idx = tree.query(coords[te], k=k)
         if k == 1:
@@ -793,6 +818,37 @@ def build_lateral_edges(
             "is_controlling": (rank == 0).astype("float64"),
         }
     )
+
+
+def attach_lateral_attrs(
+    lat: pd.DataFrame,
+    reach_nodes: pd.DataFrame,
+    query_surf_m: np.ndarray,
+    conductance_p: float,
+) -> pd.DataFrame:
+    """Reach-side + Darcy attrs on freshly built lateral edges (shared train/infer).
+
+    Adds reach drainage/Strahler, query-vs-reach relative elevation (the missing
+    shallow signal, in RGA-safe relative form) and conductance from lateral distance
+    and reach drainage. ``query_surf_m`` is the query land-surface elevation indexed
+    by ``query_node_idx`` -- wells at build time, lattice cells at inference time
+    (``infer_conus_gnn.py``), on the same DEM datum.
+    """
+    r_logdr = reach_nodes.set_index("reach_node_idx")["log1p_totda_km2"]
+    r_strah = reach_nodes.set_index("reach_node_idx")["streamorde"]
+    r_elev = reach_nodes.set_index("reach_node_idx")["reach_elev_m"]
+    r_totda = reach_nodes.set_index("reach_node_idx")["totdasqkm"]
+    lat["reach_log1p_drainage_km2"] = r_logdr.reindex(lat["reach_node_idx"]).to_numpy()
+    lat["reach_strahler"] = r_strah.reindex(lat["reach_node_idx"]).to_numpy()
+    lat_reach_elev = r_elev.reindex(lat["reach_node_idx"]).to_numpy()
+    lat["rel_elev_query_reach_m"] = (
+        query_surf_m[lat["query_node_idx"].to_numpy()] - lat_reach_elev
+    )
+    lat_reach_drain = r_totda.reindex(lat["reach_node_idx"]).to_numpy()
+    lat["lateral_conductance"] = np.log1p(
+        np.clip(lat_reach_drain, 0, None)
+    ) - conductance_p * np.log1p(np.clip(lat["lateral_dist_m"].to_numpy(), 0, None))
+    return lat
 
 
 def build_octant_lateral_edges(
@@ -1822,6 +1878,177 @@ def dist_to_wet_reach(
     return d
 
 
+def _block_reduce_occ(occ: np.ndarray, block_px: int) -> tuple[np.ndarray, np.ndarray]:
+    """Block-mean GSW occurrence + valid fraction over ``block_px`` x ``block_px`` blocks.
+
+    JRC occurrence is uint8 0-100 with UNTAGGED fill above 100 (no nodata in the
+    tile header), so validity is ``occ <= 100``. Trailing rows/cols that do not
+    fill a whole block are dropped (never padded -- a padded block would dilute
+    the mean). Returns (mean_occ_over_valid, valid_frac); mean is NaN where a
+    block has zero valid pixels.
+    """
+    h, w = occ.shape
+    hb, wb = h // block_px, w // block_px
+    if hb == 0 or wb == 0:
+        return np.zeros((0, 0)), np.zeros((0, 0))
+    a = occ[: hb * block_px, : wb * block_px].astype("float64")
+    valid = a <= 100.0
+    blocks_v = valid.reshape(hb, block_px, wb, block_px)
+    cnt = blocks_v.sum(axis=(1, 3)).astype("float64")
+    s = np.where(valid, a, 0.0).reshape(hb, block_px, wb, block_px).sum(axis=(1, 3))
+    mean = np.where(cnt > 0, s / np.maximum(cnt, 1.0), np.nan)
+    return mean, cnt / float(block_px * block_px)
+
+
+def permanent_water_blocks(
+    occ_threshold: float,
+    block_px: int = 10,
+    min_valid_frac: float = 0.5,
+    tiles_dir: Path = GSW_OCC_DIR,
+) -> pd.DataFrame:
+    """Permanent-water block centers (EPSG:5070) from the JRC GSW occurrence tiles.
+
+    A block qualifies when its block-MEAN occurrence >= ``occ_threshold`` over a
+    mostly-valid block (valid frac >= ``min_valid_frac``) -- i.e. ~the whole
+    ~280 m block is near-permanently inundated. That selector admits lakes and
+    wide rivers only; narrow/ephemeral channels cannot qualify, which is the
+    whole point (see WATER_FEATURE_COLS note). Tiles are streamed in row chunks
+    so the 40k x 40k uint8 rasters never load whole.
+    """
+    import rasterio
+    from pyproj import Transformer
+    from rasterio.windows import Window
+
+    tiles = sorted(Path(tiles_dir).glob("*.tif"))
+    if not tiles:
+        raise SystemExit(f"no GSW occurrence tiles in {tiles_dir}")
+    chunk_rows = block_px * 512
+    lon_all: list[np.ndarray] = []
+    lat_all: list[np.ndarray] = []
+    for tp in tiles:
+        with rasterio.open(tp) as ds:
+            t = ds.transform
+            n_tile = 0
+            for r0 in range(0, ds.height - ds.height % block_px, chunk_rows):
+                nrows = min(chunk_rows, ds.height - ds.height % block_px - r0)
+                a = ds.read(1, window=Window(0, r0, ds.width, nrows))
+                mean, vfrac = _block_reduce_occ(a, block_px)
+                keep = (vfrac >= min_valid_frac) & np.isfinite(mean)
+                keep &= mean >= occ_threshold
+                if not keep.any():
+                    continue
+                rr, cc = np.where(keep)
+                col_px = (cc + 0.5) * block_px
+                row_px = r0 + (rr + 0.5) * block_px
+                lon, lat = t * (col_px, row_px)
+                lon_all.append(np.asarray(lon))
+                lat_all.append(np.asarray(lat))
+                n_tile += int(keep.sum())
+            if n_tile:
+                log.info("  %s: %d permanent-water blocks", tp.name, n_tile)
+    if not lon_all:
+        raise SystemExit(
+            f"no permanent-water blocks at occ>={occ_threshold} -- check the GSW "
+            "tiles / threshold"
+        )
+    lon = np.concatenate(lon_all)
+    lat = np.concatenate(lat_all)
+    x, y = Transformer.from_crs(4326, 5070, always_xy=True).transform(lon, lat)
+    log.info(
+        "permanent water: %d blocks (occ>=%g, block=%dpx, valid>=%.2f)",
+        len(x),
+        occ_threshold,
+        block_px,
+        min_valid_frac,
+    )
+    return pd.DataFrame({"x5070": x, "y5070": y})
+
+
+def water_query_features(
+    qxy: np.ndarray,
+    q_surf: np.ndarray,
+    block_xy: np.ndarray,
+    dem_path: str,
+    sampler=None,
+) -> dict[str, np.ndarray]:
+    """Distance + height-above-stage features from the permanent-water block pool.
+
+    ``hand_perm_water_m`` = z_surf(query) - DEM(nearest block center): the DEM is
+    hydro-flattened over wide water, so the nearest-block elevation IS the local
+    stage. DEM is sampled only at the unique nearest blocks (not the full pool).
+    ``sampler`` defaults to sample_coarse; tests inject a synthetic one.
+    """
+    if sampler is None:
+        sampler = sample_coarse
+    dist, idx = cKDTree(block_xy).query(qxy, k=1)
+    uniq, inv = np.unique(idx, return_inverse=True)
+    z_u = sampler(dem_path, block_xy[uniq, 0], block_xy[uniq, 1])
+    return {
+        "log1p_dist_perm_water_m": np.log1p(dist),
+        "hand_perm_water_m": np.asarray(q_surf, "float64") - np.asarray(z_u)[inv],
+    }
+
+
+def build_water_rows(
+    block_xy: np.ndarray,
+    huc8_polys_path: str,
+    per_huc8_cap: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Water-stage pseudo-observation rows from (pre-filtered) permanent-water blocks.
+
+    Callers pass blocks already restricted to the serve footprint (finite FAC +
+    finite DEM). Rows get huc8 by WBD point-in-polygon (blocks matching no HUC8
+    polygon are dropped and logged -- coastal/border water), then a seeded
+    per-HUC8 subsample caps density so no reservoir shoreline swamps the well
+    loss. mean_dtw = 0 by definition of the free surface; wte_obs/z_surf are
+    filled by the main flow's shared DEM sampling like any query row.
+    """
+    polys = gpd.read_parquet(huc8_polys_path)[["huc8", "geometry"]]
+    if polys.crs is None or polys.crs.to_epsg() != 5070:
+        raise SystemExit(f"HUC8 polys not EPSG:5070: {huc8_polys_path}")
+    pts = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(block_xy[:, 0], block_xy[:, 1]), crs=5070
+    )
+    joined = gpd.sjoin(pts, polys, predicate="within", how="left")
+    joined = joined[~joined.index.duplicated(keep="first")].sort_index()
+    huc8 = joined["huc8"].to_numpy(object)
+    miss = pd.isna(huc8)
+    if miss.any():
+        log.info(
+            "water rows: %d/%d blocks match no HUC8 polygon -- dropped",
+            int(miss.sum()),
+            len(huc8),
+        )
+    df = pd.DataFrame(
+        {
+            "x5070": block_xy[~miss, 0],
+            "y5070": block_xy[~miss, 1],
+            "huc8": huc8[~miss].astype(str),
+        }
+    )
+    rng = np.random.RandomState(seed)
+    # seeded per-HUC8 cap: stable under row order (sort by coords first).
+    df = df.sort_values(["x5070", "y5070"]).reset_index(drop=True)
+    keep_idx = []
+    for _, grp in df.groupby("huc8", sort=True):
+        take = grp.index.to_numpy()
+        if len(take) > per_huc8_cap:
+            take = rng.choice(take, size=per_huc8_cap, replace=False)
+        keep_idx.append(take)
+    df = df.loc[np.sort(np.concatenate(keep_idx))].reset_index(drop=True)
+    df["canonical_id"] = [f"water_{i:07d}" for i in range(len(df))]
+    df["source"] = "GSW_STAGE"
+    df["well_class"] = "water_pseudo"
+    df["is_nwis"] = False
+    df["is_water_pseudo"] = True
+    df["huc4"] = df["huc8"].str[:4]
+    df["huc2"] = df["huc8"].str[:2]
+    df["mean_dtw"] = 0.0  # the free surface: DTW = 0 on permanent water
+    df["hand_m"] = np.nan
+    return df
+
+
 def build_anchor_query_edges(
     axy: np.ndarray, qxy: np.ndarray, knn: int, max_dist_m: float
 ) -> pd.DataFrame:
@@ -2076,6 +2303,52 @@ def main() -> None:
         type=float,
         default=50.0,
         help="candidate-reach radius (km) around wells for the wet-reach KD-tree",
+    )
+    ap.add_argument(
+        "--water-features",
+        action="store_true",
+        help="(wte_residual only) add WATER_FEATURE_COLS -- GSW occurrence at the "
+        "query, distance to the nearest permanent-water block, and height above "
+        "its stage (nearest-block DEM). The gate's missing surface-water routing "
+        "signal (notes/WATER_STAGE_SUPERVISION_PLAN.md).",
+    )
+    ap.add_argument(
+        "--water-pseudo-labels",
+        action="store_true",
+        help="(wte_residual only) add water-stage pseudo-observation query rows at "
+        "permanent-water blocks (mean_dtw=0, wte_obs=stage=hydro-flattened DEM), "
+        "flagged is_water_pseudo. They are labels only: masked out of every "
+        "cross-fit prior pool, excluded from trainer/scorer metrics, and "
+        "down-weighted via the trainer's --water-label-weight.",
+    )
+    ap.add_argument(
+        "--water-occ-threshold",
+        type=float,
+        default=90.0,
+        help="block-mean GSW occurrence %% for a ~280 m block to count as permanent "
+        "water (wide lakes/rivers only; dry arroyos can never qualify)",
+    )
+    ap.add_argument(
+        "--water-block-px",
+        type=int,
+        default=10,
+        help="GSW pixels per block side for the permanent-water aggregation "
+        "(10 px ~ 280 m)",
+    )
+    ap.add_argument(
+        "--water-per-huc8-cap",
+        type=int,
+        default=50,
+        help="max water pseudo-rows per HUC8 (seeded subsample) so reservoir "
+        "shorelines cannot swamp the well loss",
+    )
+    ap.add_argument(
+        "--water-max-well-dist-km",
+        type=float,
+        default=100.0,
+        help="drop water blocks farther than this from every well before the FAC "
+        "probe (keeps the registry sampling cheap; open water with no wells in "
+        "reach carries no learnable context anyway)",
     )
     ap.add_argument(
         "--fac-rem-feature",
@@ -2358,13 +2631,12 @@ def main() -> None:
             reach_nodes["reach_node_idx"].to_numpy("int64"),
         )
     )
-    r_logdr = reach_nodes.set_index("reach_node_idx")["log1p_totda_km2"]
-    r_strah = reach_nodes.set_index("reach_node_idx")["streamorde"]
     if "reach_elev_m" not in reach_nodes.columns:
         raise SystemExit(
             "reach_nodes lacks reach_elev_m -- rebuild the reach graph with the v2 "
             "build_conus_reach_graph.py (rel-elev edge attrs)"
         )
+    # anchor->reach edge attrs (below) reuse the same reach lookups
     r_elev = reach_nodes.set_index("reach_node_idx")["reach_elev_m"]
     r_totda = reach_nodes.set_index("reach_node_idx")["totdasqkm"]
 
@@ -2440,6 +2712,78 @@ def main() -> None:
             )
         wells = wells[keep_r].reset_index(drop=True)
 
+    # --- water-stage supervision (features + pseudo-rows) ---------------------
+    # Blocks are built once and cached in the bundle dir (inference reuses them).
+    # Pseudo-rows join the query frame HERE -- after the population/footprint
+    # filters, before folds/priors/features -- so folds, block_40km, samplers,
+    # lateral edges, and anchors treat them uniformly. They are kept OUT of every
+    # cross-fit prior pool below (labels, never prior sources).
+    wells["is_water_pseudo"] = False
+    water_blocks = None
+    water_meta = None
+    if args.water_features or args.water_pseudo_labels:
+        if args.target != TARGET_WTE_RESIDUAL:
+            raise SystemExit(
+                "--water-features/--water-pseudo-labels are wte_residual-only"
+            )
+        cache = gdir / WATER_BLOCKS_PARQUET
+        if cache.exists():
+            water_blocks = pd.read_parquet(cache)
+            log.info("permanent water: %d blocks (cached %s)", len(water_blocks), cache)
+        else:
+            water_blocks = permanent_water_blocks(
+                args.water_occ_threshold, args.water_block_px
+            )
+            water_blocks.to_parquet(cache)
+        water_meta = {
+            "features_enabled": bool(args.water_features),
+            "pseudo_labels_enabled": bool(args.water_pseudo_labels),
+            "occ_threshold_pct": args.water_occ_threshold,
+            "block_px": args.water_block_px,
+            "n_blocks": int(len(water_blocks)),
+            "blocks_parquet": str(cache),
+            "feature_cols": WATER_FEATURE_COLS if args.water_features else [],
+            "leakage_note": "pseudo-rows are masked out of every cross-fit prior "
+            "pool and excluded from trainer val/test metrics + scorer panels",
+        }
+    if args.water_pseudo_labels:
+        bxy = water_blocks[["x5070", "y5070"]].to_numpy("float64")
+        wxy_now = wells[["x5070", "y5070"]].to_numpy("float64")
+        near = (
+            cKDTree(wxy_now).query(bxy, k=1)[0] <= args.water_max_well_dist_km * 1000.0
+        )
+        cand = bxy[near]
+        log.info(
+            "water rows: %d/%d blocks within %g km of a well",
+            int(near.sum()),
+            len(bxy),
+            args.water_max_well_dist_km,
+        )
+        fac_p = sample_fac_rem(cand[:, 0], cand[:, 1])
+        zs_p = sample_coarse(args.dem, cand[:, 0], cand[:, 1])
+        on_footprint = np.isfinite(fac_p) & np.isfinite(zs_p)
+        log.info(
+            "water rows: %d/%d candidate blocks on the FAC+DEM serve footprint",
+            int(on_footprint.sum()),
+            len(cand),
+        )
+        wrows = build_water_rows(
+            cand[on_footprint],
+            WBD_HU8_PARQUET,
+            args.water_per_huc8_cap,
+            args.seed,
+        )
+        log.info(
+            "water rows: %d pseudo-observations after per-HUC8 cap %d (%d HUC8s)",
+            len(wrows),
+            args.water_per_huc8_cap,
+            int(wrows["huc8"].nunique()),
+        )
+        water_meta["n_pseudo_rows"] = int(len(wrows))
+        water_meta["per_huc8_cap"] = args.water_per_huc8_cap
+        water_meta["max_well_dist_km"] = args.water_max_well_dist_km
+        wells = pd.concat([wells, wrows], ignore_index=True)
+
     wells["query_node_idx"] = np.arange(len(wells), dtype="int64")
 
     # CV folds (HUC12-blocked by default) + within-train val blocks (40 km).
@@ -2466,11 +2810,14 @@ def main() -> None:
     )
 
     # Leak-free regional IDW-DTW prior, cross-fit on the GNN's HUC4 folds.
+    # real_pool masks water pseudo-rows out of EVERY prior's neighbor set (labels,
+    # never prior sources); priors still predict AT the water rows.
+    real_pool = (~wells["is_water_pseudo"]).to_numpy(bool)
     xy = wells[["x5070", "y5070"]].to_numpy("float64")
     dtw = wells["mean_dtw"].to_numpy("float64")
     fold = wells["cv_fold"].to_numpy()
     wells["regional_idw_dtw_oof_m"] = crossfit_idw(
-        xy, dtw, fold, args.idw_k, args.idw_power
+        xy, dtw, fold, args.idw_k, args.idw_power, pool=real_pool
     )
     log.info(
         "regional IDW prior: MAD=%.2f m (in-CV)",
@@ -2479,8 +2826,11 @@ def main() -> None:
 
     # Deep regional aquifer datum: cross-fit IDW from the deepest-quartile wells
     # only (local per-HUC6), a smooth deep base free of riparian/shallow pull.
-    deep = deep_well_mask(
-        wells, args.deep_quantile, args.deep_unit, args.min_deep_per_unit
+    # Quantiles are computed on real wells only, then scattered (a water row is
+    # never 'deep', and its mean_dtw=0 must not skew the local threshold).
+    deep = np.zeros(len(wells), bool)
+    deep[real_pool] = deep_well_mask(
+        wells[real_pool], args.deep_quantile, args.deep_unit, args.min_deep_per_unit
     )
     wells["regional_deep_idw_dtw_oof_m"] = crossfit_deep_idw(
         xy, xy[deep], dtw[deep], fold, fold[deep], args.idw_k_deep, args.idw_power
@@ -2647,6 +2997,7 @@ def main() -> None:
                 args.idw_power,
                 z=well_surf_m,
                 vw=args.r_relief_vw,
+                pool=real_pool,
             )
             if not np.isfinite(r_wte).all():
                 raise SystemExit(
@@ -2670,6 +3021,7 @@ def main() -> None:
                 args.idw_power,
                 z=well_surf_m,
                 vw=args.r_relief_vw,
+                pool=real_pool,
             )
             simple_wte = crossfit_idw(
                 xy,
@@ -2679,6 +3031,7 @@ def main() -> None:
                 args.idw_power,
                 z=well_surf_m,
                 vw=0.0,
+                pool=real_pool,
             )
             for nm, member in (
                 ("relief", relief_wte),
@@ -2738,7 +3091,14 @@ def main() -> None:
         ensemble_member_anom_cols = []
         if args.ensemble_member_features:
             simple_wte_feat = crossfit_idw(
-                xy, wte, fold, args.idw_k, args.idw_power, z=well_surf_m, vw=0.0
+                xy,
+                wte,
+                fold,
+                args.idw_k,
+                args.idw_power,
+                z=well_surf_m,
+                vw=0.0,
+                pool=real_pool,
             )
             if not np.isfinite(simple_wte_feat).all():
                 raise SystemExit(
@@ -2754,6 +3114,31 @@ def main() -> None:
             wells[col] = vals
         for col, vals in sample_gridmet(xy[:, 0], xy[:, 1]).items():
             wells[col] = vals
+        # Water-context features: the gate's surface-water routing signal (occ at
+        # the query + distance/height-above the nearest permanent-water block).
+        if args.water_features:
+            from pyproj import Transformer
+
+            lon_q, lat_q = Transformer.from_crs(5070, 4326, always_xy=True).transform(
+                xy[:, 0], xy[:, 1]
+            )
+            wells["gsw_occ_pct"] = _sample_gsw_occurrence(lon_q, lat_q)
+            wq = water_query_features(
+                xy,
+                well_surf_m,
+                water_blocks[["x5070", "y5070"]].to_numpy("float64"),
+                args.dem,
+            )
+            for col, vals in wq.items():
+                wells[col] = vals
+            for col in WATER_FEATURE_COLS:
+                v = wells[col].to_numpy("float64")
+                log.info(
+                    "  %s: %.3f finite frac, median %.2f",
+                    col,
+                    float(np.isfinite(v).mean()),
+                    float(np.nanmedian(v)),
+                )
         # Multi-scale terrain-position family (height-above-floor + TPI + TWI x 4 scales).
         if args.terrain_multiscale_features:
             for col, vals in sample_terrain_multiscale(xy[:, 0], xy[:, 1]).items():
@@ -2867,6 +3252,7 @@ def main() -> None:
             + (DRILLED_DEPTH_FEATURE_COLS if args.drilled_depth_points else [])
             + (ZS_FEATURE_COLS if args.zell_sanford_features else [])
             + (DUPUIT_FEATURE_COLS if args.dupuit_hang_features else [])
+            + (WATER_FEATURE_COLS if args.water_features else [])
         )
         log.info(
             "target=wte_residual  residual_base=%s  R=%s  R-MAD(DTW)=%.2f m  "
@@ -2932,20 +3318,7 @@ def main() -> None:
         )
     else:
         lat = build_lateral_edges(xy, geom, comid_to_idx, args.knn_lateral)
-    lat["reach_log1p_drainage_km2"] = r_logdr.reindex(lat["reach_node_idx"]).to_numpy()
-    lat["reach_strahler"] = r_strah.reindex(lat["reach_node_idx"]).to_numpy()
-    # Darcy attrs: well-vs-reach relative elevation (the missing shallow signal, in
-    # RGA-safe relative form) + conductance from lateral distance and reach drainage.
-    lat_reach_elev = r_elev.reindex(lat["reach_node_idx"]).to_numpy()
-    lat["rel_elev_query_reach_m"] = (
-        well_surf_m[lat["query_node_idx"].to_numpy()] - lat_reach_elev
-    )
-    lat_reach_drain = r_totda.reindex(lat["reach_node_idx"]).to_numpy()
-    lat["lateral_conductance"] = np.log1p(
-        np.clip(lat_reach_drain, 0, None)
-    ) - args.conductance_p * np.log1p(
-        np.clip(lat["lateral_dist_m"].to_numpy(), 0, None)
-    )
+    lat = attach_lateral_attrs(lat, reach_nodes, well_surf_m, args.conductance_p)
     if args.octant_lateral:
         log.info(
             "lateral edges: %d (OCTANT: %d wells, %d sectors, k_search=%d, mean %.2f "
@@ -3968,6 +4341,7 @@ def main() -> None:
         "drilled_depth": drilled_depth_block,
         "zell_sanford": zell_sanford_block,
         "dupuit_hang": dupuit_hang_block,
+        "water": water_meta,
         "ds_datum": ds_datum_block,
         "mainstem_read": mainstem_read_block,
         "wet_propagation": wet_propagation_block,

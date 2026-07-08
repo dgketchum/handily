@@ -852,17 +852,6 @@ def _make_dads_bank(tmp_path):
         ["facet_sin_12km", "facet_cos_12km", "facet_sin_36km", "facet_cos_36km"],
     )
     _write_bank_raster(
-        bank / "derived/rsun_seasonal_htd_1km.tif",
-        [
-            "rsun_djf",
-            "rsun_mam",
-            "rsun_jja",
-            "rsun_son",
-            "rsun_ann",
-            "rsun_djf_jja_ratio",
-        ],
-    )
-    _write_bank_raster(
         bank / "derived/landsat_indices_htd_1km.tif",
         [f"ndvi_p{p}" for p in range(5)]
         + ["ndvi_amp", "ndmi_p2", "mndwi_p2", "b10_p2_k", "b10_amp_k"],
@@ -883,8 +872,6 @@ def test_sample_dads_sc_covariates_band_resolution(tmp_path):
     assert out["d_eth_m"][0] == 10.0
     assert out["d_terrain_i3d"][0] == 10.0  # None -> the only band
     assert out["d_facet_cos_36km"][0] == 40.0
-    assert out["d_rsun_jja"][0] == 30.0  # rsun band 3
-    assert out["d_rsun_djf_jja_ratio"][0] == 60.0
     assert out["d_ndvi_amp"][0] == 60.0  # landsat band 6
     assert out["d_lst_b10_p2_k"][0] == 90.0
     # out-of-bounds -> NaN for every col
@@ -902,7 +889,177 @@ def test_sample_dads_sc_covariates_missing_raster_and_band(tmp_path):
         ["elevation", "slope", "aspect_sin", "aspect_cos", "tpi_4", "tpi_10"],
     )
     _write_bank_raster(
-        bank / "derived/rsun_seasonal_htd_1km.tif", ["rsun_djf", "WRONG_NAME"]
+        bank / "derived/landsat_indices_htd_1km.tif",
+        [f"ndvi_p{p}" for p in range(5)]
+        + ["ndvi_amp", "WRONG_NAME", "mndwi_p2", "b10_p2_k", "b10_amp_k"],
     )
-    with pytest.raises(SystemExit, match="no band described 'rsun_jja'"):
+    with pytest.raises(SystemExit, match="no band described 'ndmi_p2'"):
         bc.sample_dads_sc_covariates(np.array([150.0]), np.array([250.0]), bank)
+
+
+# ---------------------------------------------------------------------------
+# Water-stage supervision: permanent-water blocks, query features, pseudo-rows
+# (--water-features / --water-pseudo-labels)
+# ---------------------------------------------------------------------------
+def test_block_reduce_occ_fill_masking_mean_and_valid_frac():
+    # 4x4 uint8, block_px=2 -> 2x2 blocks. Values >100 are UNTAGGED JRC fill.
+    occ = np.array(
+        [
+            [100, 100, 255, 255],
+            [100, 100, 255, 90],
+            [80, 80, 0, 0],
+            [80, 80, 0, 0],
+        ],
+        dtype="uint8",
+    )
+    mean, vf = bc._block_reduce_occ(occ, 2)
+    assert mean.shape == (2, 2) and vf.shape == (2, 2)
+    assert mean[0, 0] == 100.0 and vf[0, 0] == 1.0
+    # fill pixels are excluded from the mean, not treated as 0
+    assert mean[0, 1] == 90.0 and vf[0, 1] == 0.25
+    assert mean[1, 0] == 80.0 and vf[1, 0] == 1.0
+    assert mean[1, 1] == 0.0
+
+
+def test_block_reduce_occ_all_fill_nan_and_trailing_dropped():
+    # 5x5 with block_px=2: the trailing row/col never pad into a block.
+    occ = np.full((5, 5), 255, dtype="uint8")
+    mean, vf = bc._block_reduce_occ(occ, 2)
+    assert mean.shape == (2, 2)
+    assert np.isnan(mean).all() and (vf == 0.0).all()
+
+
+def _write_gsw_tile(path, occ):
+    """Tiny EPSG:4326 uint8 tile at JRC resolution (0.00025 deg), no nodata tag."""
+    import rasterio
+    from rasterio.transform import from_origin
+
+    arr = np.asarray(occ, dtype="uint8")
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=arr.shape[0],
+        width=arr.shape[1],
+        count=1,
+        dtype="uint8",
+        crs="EPSG:4326",
+        transform=from_origin(-106.0, 36.0, 0.00025, 0.00025),
+    ) as dst:
+        dst.write(arr, 1)
+
+
+def test_permanent_water_blocks_selector_and_block_centers(tmp_path):
+    from pyproj import Transformer
+
+    # 2x2 blocks: only top-left qualifies (mean 95 >= 90, fully valid).
+    # top-right mean 10; bottom-left all fill (valid_frac 0); bottom-right
+    # mean 87.5 < 90 -- the wide-water-only selector.
+    occ = np.array(
+        [
+            [95, 95, 10, 10],
+            [95, 95, 10, 10],
+            [255, 255, 95, 80],
+            [255, 255, 95, 80],
+        ],
+        dtype="uint8",
+    )
+    _write_gsw_tile(tmp_path / "t.tif", occ)
+    blocks = bc.permanent_water_blocks(
+        90.0, block_px=2, min_valid_frac=0.5, tiles_dir=tmp_path
+    )
+    assert len(blocks) == 1
+    lon, lat = Transformer.from_crs(5070, 4326, always_xy=True).transform(
+        blocks["x5070"].to_numpy(), blocks["y5070"].to_numpy()
+    )
+    # block center = pixel coords (1, 1) on the tile grid
+    np.testing.assert_allclose(lon[0], -106.0 + 1.0 * 0.00025, atol=1e-9)
+    np.testing.assert_allclose(lat[0], 36.0 - 1.0 * 0.00025, atol=1e-9)
+
+
+def test_permanent_water_blocks_no_qualifying_blocks_raises(tmp_path):
+    _write_gsw_tile(tmp_path / "t.tif", np.full((4, 4), 50, dtype="uint8"))
+    with pytest.raises(SystemExit, match="no permanent-water blocks"):
+        bc.permanent_water_blocks(90.0, block_px=2, tiles_dir=tmp_path)
+
+
+def test_water_query_features_dist_hand_and_unique_block_sampling():
+    block_xy = np.array([[0.0, 0.0], [1000.0, 0.0]])
+    qxy = np.array([[300.0, 0.0], [100.0, 0.0], [900.0, 0.0]])
+    q_surf = np.array([1050.0, 1030.0, 1010.0])
+    calls = []
+
+    def fake_sampler(path, xs, ys):
+        calls.append(np.asarray(xs))
+        return np.where(np.asarray(xs) == 0.0, 1000.0, 990.0)
+
+    wf = bc.water_query_features(qxy, q_surf, block_xy, "unused.tif", fake_sampler)
+    np.testing.assert_allclose(
+        wf["log1p_dist_perm_water_m"], np.log1p([300.0, 100.0, 100.0])
+    )
+    # hand = z_surf(query) - stage(nearest block); sign: above water is positive
+    np.testing.assert_allclose(wf["hand_perm_water_m"], [50.0, 30.0, 20.0])
+    # DEM sampled once, at the UNIQUE nearest blocks only (2, not 3)
+    assert len(calls) == 1 and len(calls[0]) == 2
+
+
+def _write_huc8_polys(path, crs=5070):
+    import geopandas as gpd
+    from shapely.geometry import box
+
+    polys = gpd.GeoDataFrame(
+        {"huc8": ["10010001", "10020002"]},
+        geometry=[box(0, 0, 1000, 1000), box(2000, 0, 3000, 1000)],
+        crs=crs,
+    )
+    polys.to_parquet(path)
+
+
+def test_build_water_rows_cap_schema_and_determinism(tmp_path):
+    polys = tmp_path / "hu8.parquet"
+    _write_huc8_polys(polys)
+    # 5 blocks in HUC8 A, 2 in B, 1 outside every polygon (dropped)
+    block_xy = np.array(
+        [[100.0 * i + 100.0, 500.0] for i in range(5)]
+        + [[2100.0, 500.0], [2500.0, 500.0], [9000.0, 9000.0]]
+    )
+    rows = bc.build_water_rows(block_xy, str(polys), per_huc8_cap=3, seed=42)
+    assert len(rows) == 3 + 2  # A capped, B kept whole, no-match dropped
+    assert (rows["huc8"].value_counts()["10010001"]) == 3
+    assert rows["canonical_id"].str.startswith("water_").all()
+    assert rows["canonical_id"].is_unique
+    assert (rows["source"] == "GSW_STAGE").all()
+    assert (rows["well_class"] == "water_pseudo").all()
+    assert (~rows["is_nwis"]).all()
+    assert rows["is_water_pseudo"].all()
+    assert (rows["mean_dtw"] == 0.0).all()
+    assert rows["hand_m"].isna().all()
+    assert (rows["huc4"] == rows["huc8"].str[:4]).all()
+    assert (rows["huc2"] == rows["huc8"].str[:2]).all()
+    # seeded cap is deterministic (and order-stable: rows sorted by coords)
+    again = bc.build_water_rows(block_xy, str(polys), per_huc8_cap=3, seed=42)
+    pd.testing.assert_frame_equal(rows, again)
+
+
+def test_build_water_rows_rejects_non_5070_polys(tmp_path):
+    polys = tmp_path / "hu8_4326.parquet"
+    _write_huc8_polys(polys, crs=4326)
+    with pytest.raises(SystemExit, match="not EPSG:5070"):
+        bc.build_water_rows(np.array([[0.5, 0.5]]), str(polys), 10, 0)
+
+
+def test_crossfit_idw_pool_none_identical_and_excludes_pooled_rows():
+    # query (fold 0) at x=0; fold-1 neighbors at x=1 (value 100, the pseudo-row),
+    # x=2 (10), x=3 (20). A second fold-0 row keeps every training pool >= k=2.
+    xy = np.array([[0.0, 0.0], [10.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]])
+    value = np.array([0.0, 5.0, 100.0, 10.0, 20.0])
+    fold = np.array([0, 0, 1, 1, 1])
+    base = bc.crossfit_idw(xy, value, fold, k=2, power=2.0)
+    all_true = bc.crossfit_idw(xy, value, fold, k=2, power=2.0, pool=np.ones(5, bool))
+    np.testing.assert_array_equal(base, all_true)  # None is byte-identical
+    pool = np.array([True, True, False, True, True])  # mask the pseudo-row out
+    pooled = bc.crossfit_idw(xy, value, fold, k=2, power=2.0, pool=pool)
+    # without the pool the 100-value row dominates; with it the prediction
+    # comes from the 10/20 rows only
+    assert base[0] > 50.0
+    assert 10.0 <= pooled[0] <= 20.0
