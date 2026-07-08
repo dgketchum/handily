@@ -415,6 +415,15 @@ def main() -> None:
 
     df = pd.read_parquet(gdir / "gnn_oof_predictions.parquet")
     df["huc2"] = df["huc2"].astype(str).str.zfill(2)
+    if "is_water_pseudo" in df.columns:
+        # Water-stage pseudo-rows are training labels, not validation wells: drop
+        # them before EVERY downstream consumer (hand_cal isotonic fit, Ma coverage
+        # assert, WTE identity, NWIS split, panels, fgb). The trainer logs their
+        # own OOF panel; the well panels here must stay baseline-comparable.
+        n0 = len(df)
+        df = df[~df["is_water_pseudo"].astype(bool)].reset_index(drop=True)
+        if n0 - len(df):
+            log.info("dropped %d water pseudo-rows from scoring", n0 - len(df))
     log.info(
         "loaded %d OOF predictions (%d non-NWIS, %d NWIS)",
         len(df),

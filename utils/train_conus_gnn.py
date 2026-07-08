@@ -483,6 +483,17 @@ def main() -> None:
         "from the fit while keeping them in the scored OOF footprint. 0 = off.",
     )
     p.add_argument(
+        "--water-label-weight",
+        type=float,
+        default=0.25,
+        help="loss weight for water-stage pseudo-rows (is_water_pseudo, bundles built "
+        "with --water-pseudo-labels). Applied AFTER the depth/confidence weight paths "
+        "so water rows are exempt from both (synthetic ids have no confinement label; "
+        "--min-confidence must not zero them). 0.0 = rows are loss-inert but still "
+        "OOF-predicted (the features-alone routing arm). Ignored when the bundle has "
+        "no water rows.",
+    )
+    p.add_argument(
         "--confidence-table",
         default="/data/ssd2/handily/conus/wte_gnn/confidence_by_canonical.parquet",
         help="parquet keyed by canonical_id with confinement_confidence (deduped); "
@@ -708,6 +719,23 @@ def main() -> None:
     le = pd.read_parquet(gdir / "lateral_edges.parquet")
     assert (rn["reach_node_idx"].to_numpy() == np.arange(len(rn))).all()
     assert (qn["query_node_idx"].to_numpy() == np.arange(len(qn))).all()
+
+    # Water-stage pseudo-rows (labels only, never metrics): default-False for
+    # bundles predating --water-pseudo-labels. `real` masks every fit/metric.
+    water = (
+        qn["is_water_pseudo"].to_numpy(bool)
+        if "is_water_pseudo" in qn.columns
+        else np.zeros(len(qn), bool)
+    )
+    real = ~water
+    if water.any():
+        log.info(
+            "water pseudo-rows: %d/%d query rows (label weight %.2f; excluded from "
+            "val/test metrics + standardization fits)",
+            int(water.sum()),
+            len(qn),
+            args.water_label_weight,
+        )
 
     # --- mainstem-read edges (item 2): one query->datum read edge per covered well ----
     use_ms = args.mainstem_read
@@ -1377,6 +1405,25 @@ def main() -> None:
             n_excluded,
         )
 
+    # Water-row weight LAST: overrides the depth path (obs_dtw=0 would max-weight
+    # them) and the confidence path (no confinement label -> --min-confidence would
+    # zero them). At 0.0 the rows are loss-inert but still OOF-predicted.
+    if water.any():
+        w_np = (
+            sample_w_t.detach().cpu().numpy().astype("float64")
+            if sample_w_t is not None
+            else np.ones(len(qn), "float64")
+        )
+        w_np[water] = args.water_label_weight
+        sample_w_t = torch.as_tensor(
+            w_np.astype("float32"), dtype=torch.float32, device=device
+        )
+        log.info(
+            "water label weight: %d rows -> %.2f (post depth/confidence paths)",
+            int(water.sum()),
+            args.water_label_weight,
+        )
+
     f_ch, f_lat = ch_ea.shape[1], lat_ea.shape[1]
     f_ms = ms_ea.shape[1] if use_ms else None  # width incl. missingness flags
     f_pf = pf_ea.shape[1] if use_pf else None  # portfolio edge-attr width (6B)
@@ -1420,8 +1467,9 @@ def main() -> None:
     )
 
     # All-wells query features for the memory probe (shapes match any fold).
+    # Stats fit on real wells only (water pseudo-rows never shape a fit).
     probe_x = torch.as_tensor(
-        apply_stats(qn, fit_stats(qn, query_cols, None)),
+        apply_stats(qn, fit_stats(qn, query_cols, real)),
         dtype=torch.float32,
         device=device,
     )
@@ -1551,6 +1599,9 @@ def main() -> None:
             radius_m=args.pair_radius_m,
             k=args.pair_k,
         )
+        if water.any() and len(all_pairs):
+            # pair loss compares label differences at full weight -- wells only.
+            all_pairs = all_pairs[real[all_pairs[:, 0]] & real[all_pairs[:, 1]]]
         log.info(
             "anti-compression pair loss ON: lambda=%.2f radius=%.0fm k=%d -> "
             "%d global nearby-well pairs",
@@ -1564,7 +1615,9 @@ def main() -> None:
         test = qn[fold_col].to_numpy() == f
         trainval = ~test
         va = val_blocks(trainval, blocks, args.val_frac, rng)
+        va &= real  # early stop on wells only; water val-block rows fall to train
         tr = trainval & ~va
+        trr = tr & real  # standardization/anchor fits on real wells only
         pair_idx = None
         if all_pairs is not None and len(all_pairs):
             both_tr = tr[all_pairs[:, 0]] & tr[all_pairs[:, 1]]
@@ -1573,12 +1626,12 @@ def main() -> None:
                 pair_idx = torch.as_tensor(
                     all_pairs[both_tr].T, dtype=torch.long, device=device
                 )
-        q_stats = fit_stats(qn, query_cols, tr)
+        q_stats = fit_stats(qn, query_cols, trr)
         query_x = torch.as_tensor(
             apply_stats(qn, q_stats), dtype=torch.float32, device=device
         )
-        y_c = float(np.median(target[tr]))
-        y_s = float(1.4826 * np.median(np.abs(target[tr] - y_c)) or 1.0)
+        y_c = float(np.median(target[trr]))
+        y_s = float(1.4826 * np.median(np.abs(target[trr] - y_c)) or 1.0)
         y_std = torch.as_tensor(
             (target - y_c) / y_s, dtype=torch.float32, device=device
         )
@@ -1588,7 +1641,7 @@ def main() -> None:
         pc = ps = dc = ds = hc = hs = None
         if use_fac_anchor:
             if fac_pred_dtw is not None:
-                trp = tr & fac_present
+                trp = trr & fac_present
                 pc = float(np.median(fac_pred_dtw[trp]))
                 ps = float(1.4826 * np.median(np.abs(fac_pred_dtw[trp] - pc)) or 1.0)
                 feat |= _fac_feat(
@@ -1597,7 +1650,7 @@ def main() -> None:
             else:
                 feat |= _fac_feat(fac_raw, fac_present, y_c, y_s, device)
         if prior_gate:
-            trd = tr & deep_present
+            trd = trr & deep_present
             dc = float(np.median(deep_pred_dtw[trd]))
             ds = float(1.4826 * np.median(np.abs(deep_pred_dtw[trd] - dc)) or 1.0)
             feat |= _fac_feat(
@@ -1624,7 +1677,7 @@ def main() -> None:
                 prefix="mirror",
             )
         if args.hang_anchor:
-            trh = tr & hang_present
+            trh = trr & hang_present
             hc = float(np.median(hang_pred_dtw[trh]))
             hs = float(1.4826 * np.median(np.abs(hang_pred_dtw[trh] - hc)) or 1.0)
             feat |= _fac_feat(
@@ -1778,6 +1831,7 @@ def main() -> None:
             torch.cuda.empty_cache()
         native_oof[test] = native[test]
         pred_dtw = _native_to_dtw(native, base, target_mode)
+        ter = test & real  # headline test MAD on wells only (water rows excluded)
         log.info(
             "fold %d: train=%d val=%d test=%d | val DTW-MAD=%.3f @%d | test=%.3f",
             f,
@@ -1786,7 +1840,7 @@ def main() -> None:
             test.sum(),
             best_mad,
             best_epoch,
-            float(np.nanmedian(np.abs(pred_dtw[test] - obs_dtw[test]))),
+            float(np.nanmedian(np.abs(pred_dtw[ter] - obs_dtw[ter]))),
         )
         fold_log.append(
             {
@@ -1846,6 +1900,11 @@ def main() -> None:
                         "anchors": bool(use_anchors),
                         "aquifer": bool(use_aquifer),
                         "pinball": bool(args.pinball),
+                        "water_features": bool(
+                            (man.get("water") or {}).get("features_enabled")
+                        ),
+                        "water_label_weight": float(args.water_label_weight),
+                        "water_pseudo_rows": int(water.sum()),
                     },
                     "gate_experts": gate_experts,
                     "fac_anchor_col": fac_base_col if use_fac_anchor else None,
@@ -1874,7 +1933,7 @@ def main() -> None:
         msg = "; ".join(
             f"{lo}-{hi if hi != np.inf else '+'}m c={np.nanmean(gate_oof[m]):.2f}(n={int(m.sum())})"
             for lo, hi in bands
-            if (m := (obs_dtw >= lo) & (obs_dtw < hi) & fac_present).any()
+            if (m := (obs_dtw >= lo) & (obs_dtw < hi) & fac_present & real).any()
         )
         log.info("fac-gate mean OOF gate by obs-depth: %s", msg)
 
@@ -1886,7 +1945,7 @@ def main() -> None:
             f"{lo}-{hi if hi != np.inf else '+'}m "
             f"lam={np.nanmean(lambda_oof[m]):.2f}(n={int(m.sum())})"
             for lo, hi in bands
-            if (m := (obs_dtw >= lo) & (obs_dtw < hi) & fac_present).any()
+            if (m := (obs_dtw >= lo) & (obs_dtw < hi) & fac_present & real).any()
         )
         log.info("fac-lambda mean OOF blend by obs-depth: %s", msg)
 
@@ -1898,7 +1957,7 @@ def main() -> None:
             f"{lo}-{hi if hi != np.inf else '+'}m "
             f"sig={np.nanmedian(sigma_oof[m]):.2f}m(n={int(m.sum())})"
             for lo, hi in bands
-            if (m := (obs_dtw >= lo) & (obs_dtw < hi)).any()
+            if (m := (obs_dtw >= lo) & (obs_dtw < hi) & real).any()
         )
         log.info("sigma-head median OOF sigma by obs-depth: %s", msg)
 
@@ -1915,7 +1974,7 @@ def main() -> None:
             )
             + f"(n={int(m.sum())})"
             for lo, hi in bands
-            if (m := (obs_dtw >= lo) & (obs_dtw < hi)).any()
+            if (m := (obs_dtw >= lo) & (obs_dtw < hi) & real).any()
         )
         log.info(
             "prior-gate mean OOF weights (%s) by obs-depth: %s",
@@ -1932,11 +1991,41 @@ def main() -> None:
             f"{lo}-{hi if hi != np.inf else '+'}m "
             f"g={np.nanmean(aquifer_gate_oof[m]):.3f}(n={int(m.sum())})"
             for lo, hi in bands
-            if (m := (obs_dtw >= lo) & (obs_dtw < hi)).any()
+            if (m := (obs_dtw >= lo) & (obs_dtw < hi) & real).any()
         )
         log.info("aquifer-gate mean OOF gate by obs-depth: %s", msg)
 
     gnn_dtw = _native_to_dtw(native_oof, base, target_mode)
+    water_panel = None
+    if water.any():
+        # The generalize-to-unseen-water readout: |pred DTW| on water rows in their
+        # held-out folds (truth is 0 on permanent water). Gate weights show routing.
+        wd = np.abs(gnn_dtw[water])
+        water_panel = {
+            "n": int(water.sum()),
+            "abs_dtw_median_m": float(np.nanmedian(wd)),
+            "abs_dtw_p90_m": float(np.nanpercentile(wd, 90)),
+            "frac_within_0p5m": float(np.nanmean(wd <= 0.5)),
+            "frac_within_1m": float(np.nanmean(wd <= 1.0)),
+        }
+        log.info(
+            "water OOF panel: n=%d |DTW| median=%.2f m p90=%.2f m "
+            "frac<=0.5m=%.2f frac<=1m=%.2f",
+            water_panel["n"],
+            water_panel["abs_dtw_median_m"],
+            water_panel["abs_dtw_p90_m"],
+            water_panel["frac_within_0p5m"],
+            water_panel["frac_within_1m"],
+        )
+        if prior_gate:
+            water_panel["gate_w_mean"] = {
+                nm: float(np.nanmean(prior_gate_oof[water, j]))
+                for j, nm in enumerate(gate_experts)
+            }
+            log.info(
+                "water OOF gate weights (mean): %s",
+                " ".join(f"{k}={v:.2f}" for k, v in water_panel["gate_w_mean"].items()),
+            )
     # Common scoring columns (DTW + the named regional/deep DTW priors + benchmarks),
     # so the scorer's predictor set is identical across modes.
     out_cols = {
@@ -1948,6 +2037,7 @@ def main() -> None:
         "huc2": qn["huc2"].to_numpy(),
         "cv_fold": qn[fold_col].to_numpy(),
         "obs_dtw_m": obs_dtw,
+        "is_water_pseudo": water,
         "regional_idw_dtw_oof_m": qn["regional_idw_dtw_oof_m"].to_numpy(),
         "regional_deep_idw_dtw_oof_m": qn["regional_deep_idw_dtw_oof_m"].to_numpy(),
         "janssen_dtw_m": qn["janssen_dtw"].to_numpy(),
@@ -2089,6 +2179,12 @@ def main() -> None:
             "median_oof_sigma_m": float(np.nanmedian(sigma_oof))
             if args.sigma_head
             else None,
+        },
+        "water": {
+            "n_pseudo_rows": int(water.sum()),
+            "label_weight": float(args.water_label_weight),
+            "bundle_block": man.get("water"),
+            "oof_panel": water_panel,
         },
         "prior_gate": {
             "enabled": bool(prior_gate),
