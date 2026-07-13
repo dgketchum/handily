@@ -53,6 +53,7 @@ from gwx_wells import (  # noqa: E402
     load_window_wells,
     resid_stats,
     sample_raster,
+    shallow_skill,
     surface_water_distance,
     tag_setting,
 )
@@ -83,6 +84,14 @@ def main() -> None:
     )
     p.add_argument("--gwx-index", default=GWX_INDEX)
     p.add_argument("--out-dir", required=True)
+    p.add_argument(
+        "--holdout-oof",
+        default=None,
+        help="OOF predictions parquet (x5070/y5070). Wells co-located with a "
+        "training well (exact 1 m 5070 key) are DROPPED, giving the fair "
+        "spatial-holdout sub-panel for an inference mosaic the model saw part of "
+        "at training. Applied AFTER confinement/source screening.",
+    )
     p.add_argument("--exclude-sources", default="nwis,ngwmn")
     p.add_argument(
         "--include-sources",
@@ -121,6 +130,26 @@ def main() -> None:
         if include
         else f"excluding sources={sorted(exclude)}",
     )
+
+    if args.holdout_oof:
+        oof = pd.read_parquet(args.holdout_oof, columns=["x5070", "y5070"])
+
+        def _key(x, y):
+            xi = np.round(np.asarray(x, "float64")).astype("int64")
+            yi = np.round(np.asarray(y, "float64")).astype("int64")
+            return np.char.add(np.char.add(xi.astype(str), "_"), yi.astype(str))
+
+        train_keys = set(_key(oof["x5070"].to_numpy(), oof["y5070"].to_numpy()))
+        wk = _key(wells["x5070"].to_numpy(), wells["y5070"].to_numpy())
+        keep = ~pd.Series(wk, index=wells.index).isin(train_keys).to_numpy()
+        n0 = len(wells)
+        wells = wells.loc[keep].copy()
+        log.info(
+            "holdout: dropped %d/%d wells co-located with a training well -> %d held-out",
+            n0 - len(wells),
+            n0,
+            len(wells),
+        )
 
     lon = wells["longitude"].to_numpy()
     lat = wells["latitude"].to_numpy()
@@ -202,6 +231,46 @@ def main() -> None:
     summary_path = out_dir / "score_summary.csv"
     summary.to_csv(summary_path, index=False)
 
+    # Depth-specific accuracy is the CENTRAL accuracy statement, not the aggregate.
+    # The aggregate MAD is dominated by whichever depth band is most populous (in
+    # arid NM that is the 30+ m tail), so it hides the shallow-prior crossover the
+    # product is actually for. Ship the full per-band panel (n + its share of the
+    # population, MAD, bias AND medR, RMSE, p95, catastrophic-miss fractions) for
+    # every predictor as a first-class block of the accuracy assessment.
+    def _band_label(lo: float, hi: float) -> str:
+        return f"{lo:g}-{hi:g}m" if hi < 1e9 else f"{lo:g}+m"
+
+    n_cf = len(cw)
+    by_depth_band: dict[str, dict] = {}
+    for label in preds:
+        pred = cw[f"pred_{label}"].to_numpy()
+        bands: dict[str, dict] = {}
+        for lo, hi in DEPTH_BANDS:
+            m = (obs >= lo) & (obs < hi)
+            st = resid_stats(pred[m], obs[m])
+            if st is None:
+                st = {"n": 0}
+            st["frac_of_wells"] = float(m.sum()) / n_cf if n_cf else float("nan")
+            bands[_band_label(lo, hi)] = st
+        by_depth_band[label] = bands
+
+    # Shallow-class precision/recall (<2/<5/<10 m) per predictor, on the common
+    # footprint and split valley/upland -- the shallow water-table call is the
+    # GW-subsidy use case, and MAD alone hides the precision/recall trade
+    # (a shallow prior that over-calls shallow has high recall but low precision).
+    shallow_pr: dict[str, dict] = {}
+    for scope, mask in [
+        ("all", np.ones(len(cw), dtype=bool)),
+        ("valley", (cw["setting"] == "valley").to_numpy()),
+        ("upland", (cw["setting"] == "upland").to_numpy()),
+    ]:
+        if mask.sum() < 25:
+            continue
+        shallow_pr[scope] = {
+            label: shallow_skill(cw.loc[mask, f"pred_{label}"].to_numpy(), obs[mask])
+            for label in preds
+        }
+
     keep_cols = [
         "source",
         "well_class",
@@ -226,12 +295,15 @@ def main() -> None:
         "excluded_sources": sorted(exclude),
         "included_sources": sorted(include),
         "confinement_classes": list(conf),
+        "holdout_oof": args.holdout_oof,
         "n_window": int(len(wells)),
         "n_common_footprint": int(len(cw)),
         "predictors": preds,
         "headline": {
             label: resid_stats(cw[f"pred_{label}"].to_numpy(), obs) for label in preds
         },
+        "by_depth_band": by_depth_band,
+        "shallow_pr": shallow_pr,
     }
     with open(out_dir / "validation_run.json", "w") as f:
         json.dump(run, f, indent=2)
@@ -242,7 +314,7 @@ def main() -> None:
         f"\n=== {args.pred_label} vs benchmarks on {len(cw)} GWX unconfined wells "
         f"({src_note}) ==="
     )
-    console_groups = ["all", "setting", "well_class", "obs_depth", "fac_dist_stream"]
+    console_groups = ["all", "setting", "well_class", "fac_dist_stream"]
     if args.surface_water:
         console_groups.append("sw_dist")
     for gt in console_groups:
@@ -254,6 +326,38 @@ def main() -> None:
                 if not r.empty:
                     line += f"  {label} MAD={r['mad_m'].iloc[0]:5.2f} bias={r['bias_m'].iloc[0]:+5.2f}"
             print(line)
+        print()
+
+    # Depth-specific accuracy panel -- the full metric set per band, the accuracy
+    # statement the product is judged on (never MAD alone). One block per band so
+    # the shallow-prior crossover and the deep-tail spread are both visible.
+    print("=== depth-specific accuracy (obs-depth banded, common footprint) ===")
+    first_pred = next(iter(preds))
+    for lo, hi in DEPTH_BANDS:
+        band = _band_label(lo, hi)
+        n = int(by_depth_band[first_pred][band]["n"])
+        share = by_depth_band[first_pred][band].get("frac_of_wells", 0.0)
+        print(f"-- {band}  (n={n}, {100 * share:.0f}% of wells) --")
+        for label in preds:
+            st = by_depth_band[label][band]
+            if not st.get("n"):
+                continue
+            print(
+                f"   {label:10} MAD={st['mad_m']:6.2f} bias={st['bias_m']:+7.2f} "
+                f"medR={st['median_residual_m']:+7.2f} RMSE={st['rmse_m']:6.2f} "
+                f"p95={st['p95_abs_err_m']:7.2f} f>10m={st['frac_abs_err_gt_10m']:.2f}"
+            )
+    print()
+
+    if "all" in shallow_pr:
+        print("=== shallow-class precision/recall (common footprint, 'all') ===")
+        for label in preds:
+            sk = shallow_pr["all"][label]
+            cells = " ".join(
+                f"{thr}:P{v['precision']:.2f}/R{v['recall']:.2f}"
+                for thr, v in sk.items()
+            )
+            print(f"  {label:12} {cells}")
         print()
     log.info("Wrote %s and %s", summary_path, resid_name)
 

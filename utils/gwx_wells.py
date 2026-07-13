@@ -147,15 +147,58 @@ def surface_water_distance(
     return cKDTree(np.c_[xs, ys]).query(qxy)[0]
 
 
+SHALLOW_THRESHOLDS = (2.0, 5.0, 10.0)
+
+
 def resid_stats(pred: np.ndarray, obs: np.ndarray) -> dict | None:
+    """Central error + the bias/median split + RMSE + the catastrophic-tail spread.
+
+    p90/p95 absolute-error percentiles and the >10 m / >25 m miss fractions expose
+    the deep catastrophic tail that MAD suppresses (CLAUDE.md metric doctrine: the
+    tail is where the 30+ m regime lives). Extra keys are additive -- existing
+    callers that read mad/bias/median/rmse are unaffected.
+    """
     r = pred - obs
     r = r[np.isfinite(r)]
     if r.size == 0:
         return None
+    a = np.abs(r)
     return {
         "n": int(r.size),
-        "mad_m": float(np.median(np.abs(r))),
+        "mad_m": float(np.median(a)),
         "bias_m": float(np.mean(r)),
         "median_residual_m": float(np.median(r)),
         "rmse_m": float(np.sqrt(np.mean(r**2))),
+        "p90_abs_err_m": float(np.percentile(a, 90)),
+        "p95_abs_err_m": float(np.percentile(a, 95)),
+        "frac_abs_err_gt_10m": float(np.mean(a > 10.0)),
+        "frac_abs_err_gt_25m": float(np.mean(a > 25.0)),
     }
+
+
+def shallow_skill(
+    pred: np.ndarray, obs: np.ndarray, thresholds=SHALLOW_THRESHOLDS
+) -> dict:
+    """Precision/recall for the 'shallow water table' call at each threshold.
+
+    Same definition as score_conus_gnn.shallow_skill so the shipped-raster panel
+    and the leak-free OOF panel report the shallow-class skill identically: a
+    positive call is pred < thr, ground truth is obs < thr.
+    """
+    out = {}
+    m = np.isfinite(pred) & np.isfinite(obs)
+    p, o = pred[m], obs[m]
+    for thr in thresholds:
+        pred_s, obs_s = p < thr, o < thr
+        tp = int((pred_s & obs_s).sum())
+        fp = int((pred_s & ~obs_s).sum())
+        fn = int((~pred_s & obs_s).sum())
+        prec = tp / (tp + fp) if (tp + fp) else float("nan")
+        rec = tp / (tp + fn) if (tp + fn) else float("nan")
+        out[f"<{thr:g}m"] = {
+            "precision": prec,
+            "recall": rec,
+            "n_obs_shallow": int(obs_s.sum()),
+            "n_pred_shallow": int(pred_s.sum()),
+        }
+    return out
