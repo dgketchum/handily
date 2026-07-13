@@ -30,9 +30,11 @@ from pathlib import Path
 
 import geopandas as gpd
 
+from handily.io import WBD_NATIONAL_DIR, load_huc
+
 log = logging.getLogger("build_ruby_domain")
 
-WBD_DEFAULT = "/nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape/WBDHU8.shp"
+WBD_HU8_PARQUET = f"{WBD_NATIONAL_DIR}/wbdhu8_5070.parquet"
 NHDPOINT_DEFAULT = "/nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape/NHDPoint.shp"
 HUC8_DEFAULT = "10020003"
 SPRING_FCODE = 45800
@@ -50,7 +52,6 @@ def _col(gdf: gpd.GeoDataFrame, name: str) -> str:
 
 def extract_domain(
     out_root: Path,
-    wbd_path: str,
     nhdpoint_path: str,
     huc8: str,
     buffer_km: float,
@@ -61,13 +62,11 @@ def extract_domain(
     for d in (boundary_dir, springs_dir, notes_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    log.info("Reading WBD: %s", wbd_path)
-    wbd = gpd.read_file(wbd_path)
-    hcol, ncol = _col(wbd, "huc8"), _col(wbd, "name")
-    ruby = wbd[wbd[hcol] == huc8].copy()
+    log.info("Reading canonical WBD HU8 for %s", huc8)
+    ruby = load_huc(8, huc=huc8)
     if len(ruby) != 1:
         raise ValueError(f"expected exactly 1 HUC8 {huc8}, got {len(ruby)}")
-    name = str(ruby[ncol].iloc[0])
+    name = str(ruby["name"].iloc[0])
     ruby = ruby.to_crs(WORK_CRS)
     area_km2 = float(ruby.area.sum() / 1e6)
     bounds_wgs84 = [float(v) for v in ruby.to_crs(4326).total_bounds]
@@ -103,7 +102,7 @@ def extract_domain(
         "buffer_km": buffer_km,
         "spring_fcode": SPRING_FCODE,
         "spring_count_inside_huc8": int(len(inside)),
-        "sources": {"wbd": wbd_path, "nhdpoint": nhdpoint_path},
+        "sources": {"wbd": WBD_HU8_PARQUET, "nhdpoint": nhdpoint_path},
         "outputs": {
             "boundary": str(boundary_path),
             "boundary_buffer": str(buffer_path),
@@ -127,14 +126,12 @@ def main() -> None:
         default="/data/ssd2/handily/mt/regional/ruby_huc8",
         help="Ruby regional workspace root",
     )
-    p.add_argument("--wbd-path", default=WBD_DEFAULT)
     p.add_argument("--nhdpoint-path", default=NHDPOINT_DEFAULT)
     p.add_argument("--huc8", default=HUC8_DEFAULT)
     p.add_argument("--buffer-km", type=float, default=BUFFER_KM)
     args = p.parse_args()
     note = extract_domain(
         Path(args.out_root),
-        args.wbd_path,
         args.nhdpoint_path,
         args.huc8,
         args.buffer_km,

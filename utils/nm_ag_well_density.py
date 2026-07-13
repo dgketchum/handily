@@ -22,8 +22,9 @@ from pathlib import Path
 import geopandas as gpd
 import pyarrow.parquet as pq
 
+from handily.io import load_huc
+
 PROD = "/data/ssd2/gwx/products/current/wells.geoparquet"
-HUC8 = "/mnt/mco_nas1/dgketchum/boundaries/wbd/NHD_H_New_Mexico_State_Shape/Shape/WBDHU8.shp"
 FIELDS = "/mnt/mco_nas1/dgketchum/openET/OpenET_GeoDatabase_5071/NM.shp"
 OUT = Path("/data/ssd2/handily/nm/regional/ag_shallow_scan")
 NM_SOURCES = ["nm_ose", "nm_sta"]
@@ -51,7 +52,9 @@ def main():
     )
 
     # --- HUC8 + OpenET fields (work in the fields' projected CRS for areas/dist) ---
-    huc = gpd.read_file(HUC8)[["huc8", "name", "geometry"]]
+    # NM basins (85) from the canonical national WBD via the pipe-separated states col.
+    huc = load_huc(8, columns=["name", "states"])
+    huc = huc[huc["states"].fillna("").str.contains("NM")][["huc8", "name", "geometry"]]
     fields = gpd.read_file(FIELDS)
     crs = fields.crs
     wells = wells.to_crs(crs)

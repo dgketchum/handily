@@ -38,12 +38,9 @@ import geopandas as gpd
 import rasterio
 from rasterio.windows import Window, from_bounds
 
-log = logging.getLogger("window_regional_to_huc8")
+from handily.io import load_huc
 
-WBD8_DEFAULT = (
-    "/mnt/mco_nas1/dgketchum/boundaries/wbd/"
-    "NHD_H_New_Mexico_State_Shape/Shape/WBDHU8.shp"
-)
+log = logging.getLogger("window_regional_to_huc8")
 
 
 def _snap_bounds_to_grid(bounds, transform):
@@ -87,7 +84,6 @@ def main() -> None:
     ap.add_argument("--mainstem-dir", required=True)
     ap.add_argument("--huc8", required=True)
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--wbd8", default=WBD8_DEFAULT)
     ap.add_argument("--buffer-m", type=float, default=5000.0)
     ap.add_argument(
         "--rasters",
@@ -106,13 +102,10 @@ def main() -> None:
     with rasterio.open(dem_path) as dem:
         dem_crs, dem_transform = dem.crs, dem.transform
 
-    huc = gpd.read_file(args.wbd8)
-    hcol = "huc8" if "huc8" in huc.columns else "HUC8"
-    ncol = "name" if "name" in huc.columns else "NAME"
-    poly = huc[huc[hcol] == args.huc8]
+    poly = load_huc(8, huc=args.huc8)
     if poly.empty:
-        raise SystemExit(f"HUC8 {args.huc8} not found in {args.wbd8}")
-    name = str(poly.iloc[0][ncol])
+        raise SystemExit(f"HUC8 {args.huc8} not found in canonical WBD")
+    name = str(poly.iloc[0]["name"])
     poly_dem = poly.to_crs(dem_crs)
 
     buffered = poly_dem.buffer(args.buffer_m).total_bounds
@@ -142,7 +135,7 @@ def main() -> None:
     log.info("clipped streams -> %d reaches", len(streams))
 
     # HUC8 polygon as the (unbuffered) basin boundary, in the DEM CRS.
-    poly_dem[[hcol, ncol, "geometry"]].to_file(
+    poly_dem[["huc8", "name", "geometry"]].to_file(
         out_dir / "basin_boundary.fgb", driver="FlatGeobuf"
     )
 

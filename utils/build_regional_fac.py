@@ -2,7 +2,7 @@
 
 Usage:
     uv run python utils/build_regional_fac.py \
-        --wbd-path /nas/boundaries/wbd/NHD_H_Nevada_State_Shape/Shape/WBDHU6.shp \
+        --wbd-path /nas/hydrography/HUC_Boundaries/wbd_national/wbdhu6_5070.parquet \
         --huc6 160401 \
         --out-dir /data/ssd2/handily/nv/regional/humboldt \
         --threshold 5000 \
@@ -28,7 +28,9 @@ logging.basicConfig(
 
 def main():
     parser = argparse.ArgumentParser(description="Build regional FAC stream network")
-    parser.add_argument("--wbd-path", required=True, help="Path to WBD shapefile")
+    parser.add_argument(
+        "--wbd-path", required=True, help="Path to WBD boundary (.parquet or .shp)"
+    )
     huc_group = parser.add_mutually_exclusive_group(required=True)
     huc_group.add_argument(
         "--huc6", nargs="+", help="One or more HUC6 codes (e.g. 130100 130201)"
@@ -46,8 +48,12 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load basin boundary — supports HUC6 or HUC8 (union of multiple)
-    wbd_gdf = gpd.read_file(args.wbd_path)
+    # Load basin boundary — supports HUC6 or HUC8 (union of multiple).
+    # Canonical WBD is GeoParquet; still accept a legacy shapefile path.
+    if str(args.wbd_path).endswith(".parquet"):
+        wbd_gdf = gpd.read_parquet(args.wbd_path)
+    else:
+        wbd_gdf = gpd.read_file(args.wbd_path)
     if args.huc6:
         col = "huc6" if "huc6" in wbd_gdf.columns else "HUC6"
         basin = wbd_gdf[wbd_gdf[col].isin(args.huc6)]

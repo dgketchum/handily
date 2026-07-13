@@ -13,6 +13,7 @@ from rasterio.warp import transform_bounds
 import rioxarray as rxr
 from pynhd import NHD
 from shapely.geometry import box
+from shapely.geometry.base import BaseGeometry
 from rioxarray.merge import merge_arrays
 
 LOGGER = logging.getLogger("handily.io")
@@ -62,59 +63,82 @@ def _ensure_shapefile_spatial_index(shp_path: str) -> None:
         )
 
 
-def get_huc10_boundary(
-    huc10: str, wbd_local_dir: str | None = None
+WBD_NATIONAL_DIR = "/nas/hydrography/HUC_Boundaries/wbd_national"
+_WBD_LEVELS = (2, 4, 6, 8, 10, 12)
+
+
+def _aoi_to_5070_geom(aoi) -> BaseGeometry:
+    """Return a single EPSG:5070 geometry for spatially subsetting the WBD.
+
+    A GeoDataFrame/GeoSeries is reprojected via its own CRS. A bare shapely
+    geometry or a ``(minx, miny, maxx, maxy)`` bbox carries no CRS and is
+    assumed to already be in EPSG:5070 (the WBD's native CRS).
+    """
+    if isinstance(aoi, (gpd.GeoDataFrame, gpd.GeoSeries)):
+        if aoi.crs is None:
+            raise ValueError("aoi GeoDataFrame/GeoSeries must have a CRS to reproject")
+        return aoi.to_crs(5070).union_all()
+    if isinstance(aoi, BaseGeometry):
+        return aoi
+    if isinstance(aoi, (tuple, list)) and len(aoi) == 4:
+        return box(*aoi)
+    raise TypeError(f"Unsupported aoi type for load_huc: {type(aoi)!r}")
+
+
+def load_huc(
+    level: int, huc: str | None = None, aoi=None, columns=None
 ) -> gpd.GeoDataFrame:
-    """Get HUC-10 boundary, preferring a local WBD HU10 shapefile."""
-    if wbd_local_dir is None:
-        raise ValueError(
-            "wbd_local_dir is required to load WBDHU10 locally; e.g., "
-            "/nas/boundaries/wbd/NHD_H_Montana_State_Shape/Shape"
-        )
+    """Load canonical national HUC{level} polygons (EPSG:5070).
 
-    path = os.path.expanduser(wbd_local_dir)
-    shp_path = None
-    if os.path.isdir(path):
-        candidates = [
-            os.path.join(path, "WBDHU10.shp"),
-            os.path.join(path, "Shape", "WBDHU10.shp"),
-        ]
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                shp_path = candidate
-                break
-        if shp_path is None:
-            hits = glob.glob(os.path.join(path, "**", "WBDHU10.shp"), recursive=True)
-            if hits:
-                shp_path = hits[0]
-    elif os.path.isfile(path) and path.lower().endswith(".shp"):
-        shp_path = path
+    Reads ``{WBD_NATIONAL_DIR}/wbdhu{level}_5070.parquet``.
 
-    if shp_path is None or not os.path.exists(shp_path):
-        raise FileNotFoundError(
-            "Could not find WBDHU10.shp. Ensure the state WBD zip is extracted and set wbd_local_dir "
-            "to the extracted '.../NHD_H_<State>_State_Shape/Shape' folder."
-        )
+    Parameters
+    ----------
+    level : int
+        HUC level, one of {2, 4, 6, 8, 10, 12}.
+    huc : str, optional
+        Exact code filter on the ``huc{level}`` column (a zero-padded string,
+        e.g. ``"04080204"``).
+    aoi : shapely geometry, GeoDataFrame/GeoSeries, or bbox tuple, optional
+        Spatial subset. A GeoDataFrame/GeoSeries is reprojected to EPSG:5070 via
+        its own CRS; a bare geometry or bbox is assumed to already be in 5070.
+        Rows intersecting the aoi are kept.
+    columns : sequence of str, optional
+        Column subset; the ``huc{level}`` key and ``geometry`` are always kept.
 
-    LOGGER.info("Loading WBDHU10 from local shapefile: %s", shp_path)
-    hu10 = gpd.read_file(shp_path)
-    col = None
-    for c in hu10.columns:
-        lc = c.lower()
-        if lc == "huc10" or lc == "huc_10":
-            col = c
-            break
-    if col is None:
-        raise ValueError("HUC10 attribute not found in WBDHU10 shapefile.")
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        HUC polygons in EPSG:5070, keyed by ``huc{level}``.
+    """
+    if level not in _WBD_LEVELS:
+        raise ValueError(f"HUC level must be one of {_WBD_LEVELS}, got {level!r}")
 
-    gdf = hu10[hu10[col].astype(str) == str(huc10)].copy()
-    if gdf.empty:
-        raise ValueError(
-            f"HUC10 {huc10} not found in local WBDHU10 shapefile: {shp_path}"
-        )
-    if col != "huc10":
-        gdf = gdf.rename(columns={col: "huc10"})
+    key = f"huc{level}"
+    path = os.path.join(WBD_NATIONAL_DIR, f"wbdhu{level}_5070.parquet")
+
+    read_columns = None
+    if columns is not None:
+        read_columns = list(dict.fromkeys([key, *columns, "geometry"]))
+
+    LOGGER.info("Loading canonical WBD HU%d: %s", level, path)
+    gdf = gpd.read_parquet(path, columns=read_columns)
+
+    if huc is not None:
+        gdf = gdf[gdf[key].astype(str) == str(huc)]
+
+    if aoi is not None:
+        gdf = gdf[gdf.intersects(_aoi_to_5070_geom(aoi))]
+
     return gdf.reset_index(drop=True)
+
+
+def get_huc10_boundary(huc10: str) -> gpd.GeoDataFrame:
+    """Get a HUC-10 boundary from the canonical national WBD (EPSG:5070)."""
+    gdf = load_huc(10, huc=huc10)
+    if gdf.empty:
+        raise ValueError(f"HUC10 {huc10} not found in {WBD_NATIONAL_DIR}")
+    return gdf
 
 
 def get_flowlines_within_aoi(
