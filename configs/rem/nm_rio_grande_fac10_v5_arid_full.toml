@@ -1,0 +1,62 @@
+# NM Rio Grande-Albuquerque (HUC8 13020203) FAC10 REM — v5 (arid-physiography retune).
+#
+# v4 inherited the Ruby/Beaverhead montane-valley profile wholesale (only
+# ndvi_mid was NM-specific). Diagnosis against NM GWX unconfined wells showed the
+# v4 REM is montane-tuned for a setting it does not match: a wide arid rift valley
+# with a big perennial mainstem, multi-km floodplain, long EPHEMERAL arroyo
+# tributaries, and a deep regional table. Symptoms at the wells:
+#   - near-channel valley DTW biased ~1-4 m too shallow (channel reference pinned
+#     too high) — floodplain wells obs ~2.3 m, FAC ~1.0 m;
+#   - solved head_depth mean 0.72 m: nearly the whole network treated as
+#     near-surface-wet, because montane propagation (down_distance 20 km) over-
+#     extends wetness up/down ephemeral arroyos.
+# Coverage is NOT a problem (REM covers 95% of the basin footprint), so idw_radius
+# / post_smooth are left at the accepted slopebase_idw300 anti-pooling values.
+#
+# This retune keeps FAC strictly a near-channel/riparian estimator. It does NOT
+# chase the deep regional table (rmax_max / area_sag_hi left alone — that is the
+# regional model's job and inflating them would corrupt the riparian skill).
+# Validate ONLY against NM GWX unconfined/marginal wells in the riparian zone +
+# near-channel NHD springs; never against Ma.
+#
+# Tier 1 — valley base calibration (fix the measured near-channel shallow bias):
+#   below_bed_offset_m 0 -> 1.5   order/area-pinned (assumed-wet, not imagery-
+#                                 confirmed) reaches sit 1.5 m below bed, per the
+#                                 solver's own losing/diverted-valley intent;
+#                                 NDWI-confirmed wet reaches stay at the surface.
+#   d_min_off_support_m 0.5 -> 1.0  un-supported reaches floored a touch deeper.
+# Tier 2 — arid wet-network extent (stop false-wet arroyo propagation):
+#   down_distance_scale_m 20000 -> 8000   limit downstream wetness inheritance.
+#   elevation_scale_m 25 -> 15            quench upslope propagation faster.
+#   strahler_distance_scale 0.5 -> 1.0    mainstem propagates far, order-1 arroyos
+#                                         do not (ld_eff scales with order).
+# Tier 3 — wide-floodplain cross-section base:
+#   max_crossing_strip_m 800 -> 1500      let strips span the multi-km floodplain
+#                                         instead of falling back to short fills.
+#   naked_fill_m 200 -> 300               larger local flat for true interfluves.
+
+profile = "profiles/ruby_fac10_baseline.toml"
+
+[seed]
+ndvi_mid = 0.32
+
+[strips]
+max_crossing_strip_m = 1500.0
+naked_fill_m = 300.0
+
+[propagation]
+down_distance_scale_m = 8000.0
+elevation_scale_m = 15.0
+strahler_distance_scale = 1.0
+
+[solver]
+below_bed_offset_m = 1.5
+d_min_off_support_m = 1.0
+
+[paths]
+dem_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/dem_10m.tif"
+streams_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/streams_regional.fgb"
+fac_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/flow_accumulation.tif"
+ndvi_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/evidence/s2/s2_wetness_seed_10m.tif"
+support_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/evidence/naip/naip_ndwi_support_3yr_5m_channelclean.tif"
+out_dir = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/rem/nm_rga_v5_arid_full"

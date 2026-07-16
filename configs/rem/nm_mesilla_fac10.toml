@@ -1,0 +1,50 @@
+# NM Mesilla valley (HUC8 13030102) FAC10 REM.
+#
+# Same arid-rift regime as Rio Grande-Albuquerque (v5): perennial Rio Grande
+# mainstem, multi-km irrigated floodplain, long ephemeral arroyo tributaries,
+# deep regional table. The v5 arid-physiography retune is inherited wholesale
+# (strips / propagation / solver) because the diagnosis that produced it —
+# montane propagation over-extends false wetness up/down ephemeral arroyos, and
+# the near-channel reference sits too shallow — applies identically here.
+#
+# DIFFERENCE FROM v5: the seed evidence raster is a RAW NAIP NDVI median
+# (naip_ndvi_3yr_10m.tif), NOT the [0,1] S2 spring-NDVI+fall-NDWI wetness index.
+# EE quota was exhausted, so the seed reverted to a coarse multi-year NAIP NDVI
+# (decode scale 4, ~9.6 m), validated against OpenET fields vs desert at
+# separability AUC 0.75 (in-field q0.9 ~0.65, desert q0.9 ~0.04). Because NAIP
+# NDVI lives on the native [-1, 1] scale, the sigmoid is recentered:
+#   ndvi_mid 0.40 -> 0.20   between desert reach q0.9 (~0.05) and valley (~0.4)
+#   ndvi_scale 0.12 -> 0.06 crisp transition matching the tighter NDVI spread
+# (these are the rem_fac_config native-NDVI defaults; the S2 0.32/0.40 mids were
+# for min-max-scaled data). The channelclean NAIP open-water support still
+# overrides the seed to support_override=1.0 on persistent mainstem water.
+#
+# Validate ONLY against NM GWX unconfined/marginal wells in the riparian zone +
+# near-channel NHD springs; never against Ma.
+
+profile = "profiles/ruby_fac10_baseline.toml"
+
+[seed]
+ndvi_mid = 0.20
+ndvi_scale = 0.06
+
+[strips]
+max_crossing_strip_m = 1500.0
+naked_fill_m = 300.0
+
+[propagation]
+down_distance_scale_m = 8000.0
+elevation_scale_m = 15.0
+strahler_distance_scale = 1.0
+
+[solver]
+below_bed_offset_m = 1.5
+d_min_off_support_m = 1.0
+
+[paths]
+dem_path = "/data/ssd2/handily/nm/regional/mesilla/dem_10m.tif"
+streams_path = "/data/ssd2/handily/nm/regional/mesilla/streams_regional.fgb"
+fac_path = "/data/ssd2/handily/nm/regional/mesilla/flow_accumulation.tif"
+ndvi_path = "/data/ssd2/handily/nm/regional/mesilla/evidence/naip/naip_ndvi_3yr_10m.tif"
+support_path = "/data/ssd2/handily/nm/regional/mesilla/evidence/naip/naip_ndwi_support_3yr_5m_channelclean.tif"
+out_dir = "/data/ssd2/handily/nm/regional/mesilla/rem/nm_mesilla_v5_arid"

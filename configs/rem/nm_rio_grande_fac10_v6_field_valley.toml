@@ -1,0 +1,55 @@
+# NM Rio Grande-Albuquerque (HUC8 13020203) FAC10 REM — v6 field-valley tune.
+#
+# Domain objective: improve the existing FAC algorithm for irrigated OpenET field
+# neighborhoods on the Strahler-5 valley floor (`elev_above_str5_m <= 20 m`)
+# without adding gates, confidence logic, or a hybrid/regional prior.
+#
+# Targeted head-solve sweeps against NM GWX water-table wells near OpenET fields
+# showed the dominant v5 error in this domain is a too-shallow channel-head floor:
+# unsupported / weakly-supported reaches sit ~1 m below bed, while field-neighborhood
+# wells have median observed DTW around 2-3 m. Raising the physical losing-reach
+# floor is better than pushing NDVI seed thresholds or sag weights; aggressive
+# NDVI shifts start losing true shallow recall.
+#
+# Effective deltas vs v5:
+#   d_min_off_support_m 1.0 -> 2.5   unsupported reaches are treated as losing /
+#                                  disconnected enough to put the table ~2.5 m
+#                                  below the local channel bed.
+#   below_bed_offset_m 1.5 -> 2.0    order/area-pinned but unconfirmed reaches use
+#                                  the same semi-arid losing-valley assumption;
+#                                  imagery-confirmed support pins stay at bed.
+#
+# Approximate reach-head rescore, field <=500 m and elev_above_str5 <=20 m:
+#   v5: n=31, recall<=10 1.00, precision<=10 0.77, MAD 1.44 m, bias -1.44 m
+#   v6: n=31, recall<=10 1.00, precision<=10 0.79, MAD 1.08 m, bias -0.58 m
+#
+# Validation diagnostics:
+#   /data/ssd2/handily/nm/regional/rio_grande_albuquerque/validation/
+#     fac_field_param_targeted_sweep.csv
+#     fac_field_param_floor25_sweep.csv
+
+profile = "profiles/ruby_fac10_baseline.toml"
+
+[seed]
+ndvi_mid = 0.32
+
+[strips]
+max_crossing_strip_m = 1500.0
+naked_fill_m = 300.0
+
+[propagation]
+down_distance_scale_m = 8000.0
+elevation_scale_m = 15.0
+strahler_distance_scale = 1.0
+
+[solver]
+below_bed_offset_m = 2.0
+d_min_off_support_m = 2.5
+
+[paths]
+dem_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/dem_10m.tif"
+streams_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/streams_regional.fgb"
+fac_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/flow_accumulation.tif"
+ndvi_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/evidence/s2/s2_wetness_seed_10m.tif"
+support_path = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/evidence/naip/naip_ndwi_support_3yr_5m_channelclean.tif"
+out_dir = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/rem/nm_rga_v6_field_valley"

@@ -1,0 +1,47 @@
+# NM Mesilla (HUC8 13030102) FAC-REM — fully scalable / NHD-free inputs.
+#
+# Controlled swap against the NAIP-seeded reference (nm_mesilla_v5_arid):
+# DEM, WBT FAC-threshold streams, and the arid-regime strips/propagation/solver
+# tuning are held FIXED. ONLY the seed + support evidence change, NAIP -> scalable:
+#
+#   seed    : MODIS-JJA NDVI climatology (250 m, MPC) instead of NAIP NDVI (10 m).
+#             Mesilla valley/desert separability AUC 0.875 (NAIP was 0.75). Native
+#             MODIS NDVI sits higher than NAIP, so the sigmoid is recentered between
+#             the class medians (desert ~0.17, valley ~0.28): mid 0.20->0.23.
+#   support : JRC Global Surface Water PERMANENT water (occurrence>=90) instead of
+#             NAIP NDWI channelclean. Permanent thresholding isolates the perennial
+#             mainstem and excludes the flood-irrigation that contaminated NAIP.
+#
+# Streams come from WhiteboxTools flow-accumulation extraction (DEM-only, scalable),
+# NOT NHD flowlines. No per-AOI imagery anywhere in this config.
+#
+# Inputs prebuilt by utils/prep_mesilla_modis_gsw.py.
+# Validate ONLY against NM GWX unconfined/marginal wells + near-channel NHD springs;
+# never against Ma.
+
+profile = "profiles/ruby_fac10_baseline.toml"
+
+[seed]
+ndvi_mid = 0.23
+ndvi_scale = 0.035
+
+[strips]
+max_crossing_strip_m = 1500.0
+naked_fill_m = 300.0
+
+[propagation]
+down_distance_scale_m = 8000.0
+elevation_scale_m = 15.0
+strahler_distance_scale = 1.0
+
+[solver]
+below_bed_offset_m = 1.5
+d_min_off_support_m = 1.0
+
+[paths]
+dem_path = "/data/ssd2/handily/nm/regional/mesilla/dem_10m.tif"
+streams_path = "/data/ssd2/handily/nm/regional/mesilla/streams_regional.fgb"
+fac_path = "/data/ssd2/handily/nm/regional/mesilla/flow_accumulation.tif"
+ndvi_path = "/data/ssd2/handily/nm/regional/mesilla/evidence/scalable/mesilla_modis_jja_ndvi_10m.tif"
+support_path = "/data/ssd2/handily/nm/regional/mesilla/evidence/scalable/mesilla_gsw_permanent_10m.tif"
+out_dir = "/data/ssd2/handily/nm/regional/mesilla/rem/nm_mesilla_modis_gsw"

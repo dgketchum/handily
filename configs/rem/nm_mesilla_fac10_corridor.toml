@@ -1,0 +1,26 @@
+# NM Mesilla FAC10 REM — lateral seed corridor experiment (v6).
+#
+# Identical to nm_mesilla_fac10.toml (v5_arid) in EVERY parameter except the
+# seed-evidence sampling: this run sets seed_corridor_m > 0, so the per-reach
+# NDVI seed quantile is taken over a buffered swath (+/-150 m) instead of the
+# bare centerline. Diagnosis (notes/NM_FAC_REM_EXPANSION_HANDOFF.md): on the
+# v5 run, valley-floor ephemeral-arroyo reaches sampled bare channel (NDVI ~0)
+# and solved spuriously deep despite irrigated fields a few tens of metres off
+# the channel -> a too-deep tail (~28% of valley wells: obs ~8.8 m vs FAC pred
+# ~33 m) that was the bulk of the gap to Ma. The corridor lets those reaches
+# pick up the adjacent floodplain; it is self-limiting (desert uplands have no
+# adjacent green to lift the 0.9-quantile).
+#
+# Inherits v5 wholesale via profile chaining so the ONLY difference vs the v5
+# baseline is the corridor width — the controlled A/B for "does the lateral
+# seed corridor close the gap to Ma." Develop/tune the width against the NWIS
+# wells (the set we exclude from the Ma headline anyway); judge the final
+# apples-to-apples FAC-vs-Ma comparison on the independent non-NWIS wells.
+
+profile = "nm_mesilla_fac10.toml"
+
+[seed]
+seed_corridor_m = 150.0
+
+[paths]
+out_dir = "/data/ssd2/handily/nm/regional/mesilla/rem/nm_mesilla_v6_corridor"
