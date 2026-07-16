@@ -1,0 +1,17 @@
+# FAC REM - MT AOI 0026, Bitterroot 1m pilot L2 rung (notes/ONE_METER_PILOT_PLAN.md).
+# 1m DEM / 1m inflow-injected FAC network / 5m burn (mt_0009_best profile),
+# S2 spring-NDVI + fall-NDWI wetness seed shared across the pilot (10m,
+# sampled by coordinate), sigmoid per the accepted mt_0009_s2 pattern.
+
+profile = "profiles/mt_0009_best.toml"
+
+[paths]
+dem_path = "/data/ssd2/handily/mt/aoi_0026/dem_bounds_1m.tif"
+streams_path = "/data/ssd2/handily/mt/aoi_0026/streams_fac.fgb"
+out_dir = "/data/ssd2/handily/mt/aoi_0026/rem_1m_s2"
+ndvi_path = "/data/ssd2/handily/mt/bitterroot_pilot/s2/s2_wetness_seed_10m.tif"
+
+[seed]
+ndvi_mid = 0.48
+ndvi_scale = 0.12
+ndvi_quantile = 0.9

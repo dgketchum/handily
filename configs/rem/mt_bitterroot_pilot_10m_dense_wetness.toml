@@ -1,0 +1,44 @@
+# Bitterroot pilot (HUC8 17010205) — L1 rung of the 1m resolution ladder
+# (notes/ONE_METER_PILOT_PLAN.md): the accepted best-10m recipe from the
+# Beaverhead subset (dense_s2_slopebase_idw300_wetness chain, flattened)
+# over the 5-AOI pilot box (aoi 20/24/25/26/30 union + 1 km margin).
+#
+# Recipe = dense FAC network (threshold 500, pilot_dense_fac/) + S2
+# spring-NDVI/fall-NDWI wetness seed (mid 0.40 per the 2026-06-13 A/B)
+# + slope-aware base smoothing with idw 300 / post-smooth 30 + naked
+# local anchors 200 m. Support = production JRC GSW permanent (full HUC8,
+# sampled by coordinate). A/B vs L0 = huc8/17010205/rem/17010205_scalable.
+
+profile = "profiles/mt_0009_best.toml"
+
+[paths]
+dem_path = "/data/ssd2/handily/mt/regional/bitterroot_huc8/pilot_dense_fac/dem_10m.tif"
+streams_path = "/data/ssd2/handily/mt/regional/bitterroot_huc8/pilot_dense_fac/streams_regional.fgb"
+fac_path = "/data/ssd2/handily/mt/regional/bitterroot_huc8/pilot_dense_fac/flow_accumulation.tif"
+ndvi_path = "/data/ssd2/handily/mt/bitterroot_pilot/s2/s2_wetness_seed_10m.tif"
+support_path = "/data/ssd2/handily/huc8/17010205/evidence/scalable/17010205_gsw_permanent_10m.tif"
+out_dir = "/data/ssd2/handily/mt/regional/bitterroot_huc8/rem_10m_dense_wetness"
+
+[strips]
+workers = 48
+naked_fill_m = 200.0
+
+[raster]
+burn_res_m = 10.0
+base_fac_snap_cells = 2
+base_smooth_stations = 5
+idw_radius_m = 300.0
+post_smooth_m = 30.0
+
+[sag]
+area_sag_lo_km2 = 25.0
+area_sag_hi_km2 = 250.0
+
+[solver]
+strahler_pin_min = 5
+area_pin_km2 = 250.0
+
+[seed]
+ndvi_mid = 0.40
+ndvi_scale = 0.12
+ndvi_quantile = 0.9

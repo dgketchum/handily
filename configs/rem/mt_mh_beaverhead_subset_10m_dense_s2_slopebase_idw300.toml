@@ -1,0 +1,18 @@
+# Beaverhead subset, dense 10m FAC, S2 NDVI.
+#
+# A/B for steep-headwater pooling diagnosis:
+# - keep the 200m naked local anchors from dense_s2_naked
+# - use the slope-aware base smoothing code path (base_smooth_stations stays 5)
+# - reduce Euclidean IDW reach from 1000m/100m smooth to 300m/30m smooth
+#
+# Goal: preserve broad valley-floor wetness while reducing absolute-elevation
+# IDW blending between perched neighboring headwater channels.
+
+profile = "mt_mh_beaverhead_subset_10m_dense_s2_naked.toml"
+
+[paths]
+out_dir = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/rem_10m_dense_s2_slopebase_idw300"
+
+[raster]
+idw_radius_m = 300.0
+post_smooth_m = 30.0

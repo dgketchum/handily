@@ -1,0 +1,15 @@
+# Beaverhead subset with DENSE stream network — fix-4 experiment from the
+# iteration-2 post-mortem (notes/FAC10_PROGRESS.md): emulate what protects
+# the 1m product (stamp density) by lowering the FAC extraction threshold
+# 5000 -> 500 cells (0.05 km^2, the 1m path's physical initiation area).
+# Network: dense_fac/streams_regional.fgb, 17,908 reaches / 6,362 km
+# (vs 1,754 / 2,344 km at threshold 5000). Everything else inherits the
+# iteration-2 subset setup. Separate out_dir so rem_10m/ (iteration 2)
+# survives for A/B in QGIS.
+
+profile = "mt_missouri_headwaters_10m.toml"
+
+[paths]
+dem_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/dem_10m.tif"
+streams_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/dense_fac/streams_regional.fgb"
+out_dir = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/rem_10m_dense"

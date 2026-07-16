@@ -1,0 +1,12 @@
+# Beaverhead subset, DENSE network, S2 NDVI — adds bounded local rays for
+# stations whose aspect-normal ray finds no stream, or only finds a stream
+# beyond max_crossing_strip_m. Connectors that survive the crossing limit are
+# still kept, so broad valley interreach strips are preserved.
+
+profile = "mt_mh_beaverhead_subset_10m_dense_s2.toml"
+
+[paths]
+out_dir = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/rem_10m_dense_s2_naked"
+
+[strips]
+naked_fill_m = 200.0

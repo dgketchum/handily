@@ -1,0 +1,24 @@
+# FAC10 Beaverhead subset — accepted slopebase_idw300 pipeline, but the head-solve
+# seed swapped from S2 summer NDVI to the S2 spring-NDVI + fall-NDWI wetness index.
+# The 1m AOI 0009 benchmark showed summer NDVI cannot separate the irrigated valley
+# from forested uplands (both ~0.78), pinning ALL heads at the 0.5m floor (measured
+# on this very product: 100% of 6317 km at floor, Spearman head-vs-terrain ~0). The
+# wetness index separates them (spring green-up + fall water retention). Inherits
+# everything (dem/streams/fac/support/raster idw300/sag/solver) from the accepted
+# config; overrides only the seed raster, sigmoid (recentered for the [0,1] index),
+# and out_dir. Clean seed-only A/B vs rem_10m_dense_s2_slopebase_idw300/.
+
+profile = "mt_mh_beaverhead_subset_10m_dense_s2_slopebase_idw300.toml"
+
+[paths]
+ndvi_path = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/evidence/s2/wetness_seed_10m.tif"
+out_dir = "/data/ssd2/handily/mt/regional/missouri_headwaters/subsets/beaverhead_aois/rem_10m_dense_s2_slopebase_idw300_wetness"
+
+# ndvi_mid 0.48 -> 0.40 (2026-06-13): the 0.48 run over-detached at 10m vs the 1m
+# benchmark (rect <1m 6.7% vs 12.4%, valley head ~1.16m vs ~0.65m). Softening the
+# seed midpoint wets the valley/margins back toward the benchmark while genuinely
+# dry uplands (low wetness index) still detach.
+[seed]
+ndvi_mid = 0.40
+ndvi_scale = 0.12
+ndvi_quantile = 0.9
