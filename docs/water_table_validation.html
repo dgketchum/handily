@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>handily — held-out water-table validation</title>
+<style>
+  :root {
+    --paper:#F6F8FA; --paper-2:#EDF1F4; --card:#FFFFFF;
+    --ink:#111A22; --ink-soft:#33434F; --muted:#5A6B78;
+    --line:#D3DAE0; --line-soft:#E2E7EC; --accent:#0E7490; --accent-ink:#0A5468;
+    --handily:#0E7490; --ma:#8A5A00; --jan:#4a3aa7;
+    --win:#1baf7a; --band-gap:#C64F3A; --sev-crit:#B3261E; --sev-mod:#8A5A00; --sev-min:#5A6B78;
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,"Times New Roman",serif;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --measure:72ch; --radius:3px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:#0C1319; --paper-2:#111C24; --card:#14202A;
+      --ink:#E7EDF2; --ink-soft:#C0CDD6; --muted:#8698A4;
+      --line:#26343F; --line-soft:#1D2A33; --accent:#2DAAC6; --accent-ink:#7FD3E4;
+      --handily:#2DAAC6; --ma:#E0B15C; --jan:#9085e9;
+      --win:#199e70; --band-gap:#E0674F; --sev-crit:#F2867E; --sev-mod:#E0B15C; --sev-min:#8698A4;
+    }
+  }
+  :root[data-theme="light"] {
+    --paper:#F6F8FA; --paper-2:#EDF1F4; --card:#FFFFFF; --ink:#111A22; --ink-soft:#33434F;
+    --muted:#5A6B78; --line:#D3DAE0; --line-soft:#E2E7EC; --accent:#0E7490; --accent-ink:#0A5468;
+    --handily:#0E7490; --ma:#8A5A00; --jan:#4a3aa7;
+    --win:#1baf7a; --band-gap:#C64F3A; --sev-crit:#B3261E; --sev-mod:#8A5A00; --sev-min:#5A6B78;
+  }
+  :root[data-theme="dark"] {
+    --paper:#0C1319; --paper-2:#111C24; --card:#14202A; --ink:#E7EDF2; --ink-soft:#C0CDD6;
+    --muted:#8698A4; --line:#26343F; --line-soft:#1D2A33; --accent:#2DAAC6; --accent-ink:#7FD3E4;
+    --handily:#2DAAC6; --ma:#E0B15C; --jan:#9085e9;
+    --win:#199e70; --band-gap:#E0674F; --sev-crit:#F2867E; --sev-mod:#E0B15C; --sev-min:#8698A4;
+  }
+
+  * { box-sizing:border-box; }
+  html { -webkit-text-size-adjust:100%; scroll-behavior:smooth; }
+  body {
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--sans); font-size:17px; line-height:1.62;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+  }
+  .wrap { max-width:1020px; margin:0 auto; padding:0 24px; }
+  .col { max-width:var(--measure); }
+
+  p { margin:0 0 1em; color:var(--ink-soft); }
+  strong { color:var(--ink); font-weight:650; }
+  ul,ol { color:var(--ink-soft); margin:0 0 1em; padding-left:1.3em; }
+  li { margin-bottom:0.45em; }
+
+  .eyebrow {
+    font-family:var(--mono); font-size:0.72rem; letter-spacing:0.16em;
+    text-transform:uppercase; color:var(--accent); margin:0 0 0.9em;
+    display:flex; align-items:center; gap:0.6em;
+  }
+  .eyebrow::before { content:""; width:22px; height:1px; background:var(--accent); opacity:0.6; }
+
+  h1 {
+    font-family:var(--serif); font-weight:600;
+    font-size:clamp(1.9rem,4.6vw,2.7rem); line-height:1.1; letter-spacing:-0.012em;
+    text-wrap:balance; margin:0 0 0.45em; color:var(--ink);
+  }
+  h2 {
+    font-family:var(--serif); font-weight:600;
+    font-size:clamp(1.4rem,2.8vw,1.8rem); line-height:1.15; letter-spacing:-0.008em;
+    text-wrap:balance; margin:0 0 0.5em;
+  }
+  h3 { font-family:var(--sans); font-weight:680; font-size:1.02rem; margin:2em 0 0.55em; }
+  h4 { font-family:var(--sans); font-weight:660; font-size:0.92rem; margin:1.6em 0 0.5em; color:var(--ink); }
+
+  code,.tok {
+    font-family:var(--mono); font-size:0.85em; background:var(--paper-2);
+    border:1px solid var(--line-soft); border-radius:var(--radius);
+    padding:0.08em 0.4em; color:var(--ink); white-space:nowrap;
+  }
+
+  header.hero {
+    border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,var(--paper) 0%,var(--paper-2) 100%);
+    position:relative;
+  }
+  .hero-inner { padding:70px 0 54px; }
+  .hero .abstract { font-size:1.08rem; line-height:1.55; color:var(--ink-soft); max-width:64ch; }
+  .hero-meta {
+    margin-top:2.2em; display:flex; flex-wrap:wrap; gap:12px 38px;
+    font-family:var(--mono); font-size:0.8rem; color:var(--muted);
+  }
+  .hero-meta b { color:var(--ink); font-weight:650; font-variant-numeric:tabular-nums; }
+  .hero-meta span { display:flex; flex-direction:column; gap:2px; }
+  .hero-meta .k { letter-spacing:0.14em; text-transform:uppercase; font-size:0.66rem; opacity:0.75; }
+
+  nav.toc { margin-top:2.4em; font-family:var(--mono); font-size:0.78rem; }
+  nav.toc a { color:var(--accent-ink); text-decoration:none; margin-right:18px; white-space:nowrap; line-height:2; }
+  nav.toc a:hover { text-decoration:underline; }
+
+  .themetoggle {
+    position:absolute; top:20px; right:24px; font-family:var(--mono); font-size:0.68rem;
+    letter-spacing:0.1em; text-transform:uppercase; color:var(--muted);
+    background:var(--card); border:1px solid var(--line); border-radius:20px;
+    padding:5px 13px; cursor:pointer;
+  }
+  .themetoggle:hover { color:var(--ink); border-color:var(--accent); }
+  .themetoggle:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+
+  section { padding:54px 0; border-bottom:1px solid var(--line-soft); }
+  section:last-of-type { border-bottom:0; }
+
+  .note {
+    border-left:2px solid var(--accent); padding:2px 0 2px 18px; margin:1.4em 0;
+    color:var(--ink-soft); font-size:0.97rem;
+  }
+  .note b { color:var(--ink); }
+  .warn { border-left-color:var(--band-gap); }
+
+  .defs { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:12px; margin:1.6em 0 0.5em; }
+  .defcard { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:14px 16px; }
+  .defcard .nm { font-family:var(--mono); font-size:0.78rem; font-weight:600; color:var(--ink); }
+  .defcard .ds { font-size:0.85rem; color:var(--ink-soft); margin-top:5px; line-height:1.45; }
+
+  figure { margin:1.8em 0 0.5em; }
+  figcaption { font-size:0.8rem; color:var(--muted); margin-top:14px; max-width:70ch; }
+  .bars { display:flex; flex-direction:column; gap:11px; margin-top:0.4em; }
+  .bar-row { display:grid; grid-template-columns:120px 1fr 78px; align-items:center; gap:12px; }
+  .bar-label { font-family:var(--mono); font-size:0.8rem; color:var(--ink); text-align:right; overflow:hidden; text-overflow:ellipsis; }
+  .bar-track { height:20px; background:var(--paper-2); border-radius:3px; overflow:hidden; }
+  .bar-fill { height:100%; border-radius:3px; }
+  .bar-val { font-family:var(--mono); font-size:0.78rem; color:var(--muted); text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+
+  .legend { display:flex; flex-wrap:wrap; gap:8px 20px; margin:1.2em 0 0.4em; font-family:var(--mono); font-size:0.74rem; color:var(--ink-soft); }
+  .legend span { display:inline-flex; align-items:center; gap:7px; }
+  .legend i { width:12px; height:12px; border-radius:3px; display:inline-block; }
+
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:8px; overflow:hidden; margin:1.8em 0 0.5em; }
+  .stat { background:var(--card); padding:18px; }
+  .stat .n { font-family:var(--serif); font-size:1.7rem; font-weight:600; line-height:1; color:var(--ink); font-variant-numeric:tabular-nums; }
+  .stat .l { font-size:0.78rem; color:var(--muted); margin-top:8px; line-height:1.35; }
+
+  .tablewrap { overflow-x:auto; margin:1.4em 0 0.5em; border:1px solid var(--line); border-radius:8px; }
+  table { border-collapse:collapse; width:100%; font-size:0.86rem; min-width:640px; }
+  th,td { text-align:left; padding:9px 13px; border-bottom:1px solid var(--line-soft); vertical-align:middle; }
+  th { font-family:var(--mono); font-size:0.68rem; letter-spacing:0.06em; text-transform:uppercase; color:var(--muted); background:var(--paper-2); font-weight:600; position:sticky; top:0; }
+  tbody tr:last-child td { border-bottom:0; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; font-family:var(--mono); font-size:0.8rem; white-space:nowrap; }
+  tr.bandhead td { background:var(--paper-2); font-family:var(--mono); font-size:0.72rem; letter-spacing:0.05em; text-transform:uppercase; color:var(--ink-soft); border-bottom:1px solid var(--line); }
+  tr.bandhead td b { color:var(--ink); }
+  td.pred { font-family:var(--mono); font-size:0.78rem; }
+  td.pred .dot { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:7px; vertical-align:baseline; }
+  td.best { color:var(--win); font-weight:700; }
+
+  footer { padding:38px 0 60px; color:var(--muted); font-size:0.82rem; }
+  footer .col { max-width:var(--measure); }
+  footer code { font-size:0.82em; }
+
+  @media (max-width:640px){
+    body{ font-size:16px; }
+    .bar-row{ grid-template-columns:96px 1fr 66px; }
+    .hero-inner{ padding:52px 0 40px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <button class="themetoggle" id="themebtn" type="button" aria-label="Toggle color theme">theme</button>
+  <div class="wrap hero-inner">
+    <p class="eyebrow">handily · water-table depth · held-out validation · v0.1 beta</p>
+    <div class="col">
+      <h1>Held-out validation of handily depth-to-water estimates</h1>
+      <p class="abstract">A depth-banded accuracy check of <strong>handily</strong>, a CONUS water-table model, against two published national reference products, <strong>Ma</strong> and <strong>Janssen&nbsp;V2</strong>, on identical wells, footprint, and metrics. handily is a version 0.1 beta. It is built from observation-based features and naive physical priors and does not take the output of other groundwater models as input; the two reference products are themselves fitted model outputs. Scoring uses GWX unconfined wells across three regions where handily has been rendered to 10&nbsp;m. handily is held out of its own training wells; the reference products cannot be, so the comparison is conservative for handily.</p>
+    </div>
+    <div class="hero-meta">
+      <span><span class="k">Version</span><b>0.1 beta</b></span>
+      <span><span class="k">Regions</span><b>NM · UCRB · NV</b></span>
+      <span><span class="k">Basins rendered</span><b>178</b></span>
+      <span><span class="k">Wells scored</span><b>48,284</b></span>
+      <span><span class="k">Wells</span><b>GWX unconfined</b></span>
+      <span><span class="k">Excluded</span><b>NWIS · NGWMN</b></span>
+    </div>
+    <nav class="toc">
+      <a href="#handily">1 handily</a>
+      <a href="#approach">2 Approach</a>
+      <a href="#metrics">3 Metrics</a>
+      <a href="#nm">4 Results: New Mexico</a>
+      <a href="#ucrb">5 Results: Upper Colorado</a>
+      <a href="#nv">6 Results: Nevada</a>
+      <a href="#shallow">7 Shallow water table</a>
+      <a href="#summary">8 Summary</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <!-- ================================================= 1 HANDILY -->
+  <section id="handily">
+    <div class="wrap">
+      <div class="col">
+        <p class="eyebrow">1 · handily</p>
+        <h2>What handily is, and what it is compared against</h2>
+        <p>handily estimates <strong>depth to the unconfined water table</strong> (positive down, in meters) across the contiguous United States, rendered here as a 10&nbsp;m grid. It is assembled from observation-based features and naive physical priors: terrain and height-above-nearest-drainage, flow-accumulation drainage structure, climate and recharge covariates, and water-level observations. handily development is focused on <strong>data-leakage-free experimentation</strong> at this early stage: other model outputs (e.g., ParFlow, CONUS MODFLOW) may be helpful later, but the current effort is to make the model as good as possible using only terrain, remote sensing, climate proxies, and well data. Later experiments with data assimilation and pre-training may consume the output of other groundwater models as input. The two reference products used here are, by contrast, fitted statistical models of well observations: <strong>Ma</strong> is a random forest (Ma et&nbsp;al., 2026, <a href="https://doi.org/10.1038/s43247-025-03094-3">doi:10.1038/s43247-025-03094-3</a>) and <strong>Janssen&nbsp;V2</strong> is a gradient-boosted model (Janssen et&nbsp;al., 2024, <a href="https://doi.org/10.1016/j.advwatres.2025.104926">doi:10.1016/j.advwatres.2025.104926</a>).</p>
+        <p>This report is an early baseline for a version 0.1 beta. It has discontinuities, gaps, and places where the inference doesn't make sense, but sharing it early to get feedback is important. This doc reports where the current estimates are and are not useful, on the same wells and metrics for all three products.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================= 2 APPROACH -->
+  <section id="approach">
+    <div class="wrap">
+      <div class="col">
+        <p class="eyebrow">2 · approach</p>
+        <h2>What this validation does</h2>
+        <p>The three depth-to-water predictors are sampled at the same well locations and compared on identical wells and metrics. The design choices below control for leakage and keep the comparison like-for-like.</p>
+
+        <h3>Held-out scoring — the leakage control that matters most</h3>
+        <p>The handily grid you are sampling is <em>final-model inference</em>: the production model was trained on every available well and then rendered everywhere. Sampling that grid at a well the model trained on would measure memorization, not prediction. So handily is scored <strong>only on wells it never saw</strong>: any GWX well whose location matches a training well (to the meter, on the EPSG:5070 grid) is dropped via the model's out-of-fold record before a single metric is computed. This makes handily strictly conservative here.</p>
+        <p class="note warn"><b>An asymmetry to keep in mind:</b> handily can be held out because its training wells are known. Ma's and Janssen's training wells are not known, so they cannot be held out and retain whatever memorization advantage they carry. Ma is trained on a random cell split and its apparent error collapses to a fraction of its true error where its training network is dense, notably on NWIS and NGWMN monitoring wells. Those two sources are therefore <b>excluded</b> from every number in this report. Net effect: the reference products are, if anything, scored on easier terms than handily.</p>
+
+        <h3>Raster sampling across three coordinate systems</h3>
+        <p>Each predictor is sampled at the well's longitude/latitude after reprojecting that point into the raster's own CRS — handily on the CONUS Albers 10&nbsp;m grid, Ma on its Lambert conformal grid, Janssen on geographic degrees. No raster is resampled to a common grid before sampling, which would blur it; the point moves to the pixel instead. A well counts only where <strong>all three predictors return a finite value</strong> (the common footprint), so every row of every table compares like with like on identical wells.</p>
+
+        <h3>Which wells, and how they are grouped</h3>
+        <ul>
+          <li><strong>Unconfined only.</strong> Confined and likely-confined wells measure a pressure surface, not the water table, and are dropped. Only <code>unconfined</code> and <code>unconfined_marginal</code> wells enter the metrics.</li>
+          <li><strong>Depth bands.</strong> Every metric is stratified by observed depth — 0–2 / 2–5 / 5–10 / 10–30 / 30+ m — because a single headline hides the one fact that governs everything: shallow-terrain priors are strong near the surface and saturate with depth.</li>
+          <li><strong>Setting.</strong> Wells are split into valley vs. upland by distance to a mapped stream, so a shallow-precision claim can be read where it is actually used.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================= 3 METRICS -->
+  <section id="metrics">
+    <div class="wrap">
+      <div class="col">
+        <p class="eyebrow">3 · metrics</p>
+        <h2>The metrics</h2>
+        <p>Each region's table reports the full panel so the error structure is visible, not a single summary number. All errors are in meters.</p>
+      </div>
+      <div class="defs">
+        <div class="defcard"><div class="nm">MAD</div><div class="ds">Median absolute residual.</div></div>
+        <div class="defcard"><div class="nm">bias</div><div class="ds">Mean signed residual.</div></div>
+        <div class="defcard"><div class="nm">median residual</div><div class="ds">Median signed residual.</div></div>
+        <div class="defcard"><div class="nm">RMSE</div><div class="ds">Root-mean-square error.</div></div>
+        <div class="defcard"><div class="nm">p95</div><div class="ds">95th-percentile absolute error.</div></div>
+        <div class="defcard"><div class="nm">&gt;10 m / &gt;25 m</div><div class="ds">Fraction of wells beyond that error.</div></div>
+        <div class="defcard"><div class="nm">precision</div><div class="ds">Share of shallow calls that are shallow.</div></div>
+        <div class="defcard"><div class="nm">recall</div><div class="ds">Share of shallow wells called shallow.</div></div>
+      </div>
+      <p class="note"><b>Convention.</b> Residual = predicted − observed; a negative residual means the estimate is shallower than observed. Bias and median residual are shown together: when the mean bias is much larger than the median residual, the error is a skewed tail rather than a uniform offset. In each depth band, the best value in each metric column is shown in <span style="color:var(--win);font-weight:700">bold green</span> — lowest for the error metrics, closest to zero for bias and median residual.</p>
+    </div>
+  </section>
+
+  <!-- ================================================= 4 NM -->
+  <section id="nm">
+    <div class="wrap">
+      <div class="col">
+        <p class="eyebrow">4 · results: new mexico</p>
+        <h2>New Mexico — 77 basins</h2>
+        <p>New Mexico has a deep depth distribution: <strong>42% of the unconfined wells are 30&nbsp;m or deeper</strong>, a regime no terrain-following estimate reaches. That deep fraction dominates the pooled MAD, which is close for handily and Ma (8.98 and 8.84). In the depth bands, handily has the lower MAD below 10&nbsp;m — roughly half Ma's error at 2–5&nbsp;m — and Ma has the lower MAD in the 10–30&nbsp;m band and the 30+&nbsp;m tail.</p>
+      </div>
+      <div class="tablewrap" id="nm-table"></div>
+    </div>
+  </section>
+
+  <!-- ================================================= 5 UCRB -->
+  <section id="ucrb">
+    <div class="wrap">
+      <div class="col">
+        <p class="eyebrow">5 · results: upper colorado</p>
+        <h2>Upper Colorado — 29 basins</h2>
+        <p>The depth distribution here is shallower: only 7% of wells are 30+&nbsp;m. handily has the lower pooled MAD (<strong>2.63 vs Ma 3.91</strong>) and the lower MAD in the 0–2, 2–5, and 5–10&nbsp;m bands. Ma again has the lower MAD in the 10–30&nbsp;m band and the deep tail, the same depth crossover seen in the other regions; with few deep wells present it does not change the pooled result.</p>
+      </div>
+      <div class="tablewrap" id="ucrb-table"></div>
+    </div>
+  </section>
+
+  <!-- ================================================= 6 NV -->
+  <section id="nv">
+    <div class="wrap">
+      <div class="col">
+        <p class="eyebrow">6 · results: nevada</p>
+        <h2>Nevada — 72 basins</h2>
+        <p>Nevada is Great-Basin closed-basin terrain. Ma has the lower pooled MAD (<strong>7.00 vs handily 7.98</strong>). The difference is concentrated in the <strong>10–30&nbsp;m band</strong>, where handily is 11.0 and Ma is 6.3; below 10&nbsp;m handily has the lower MAD in each band (2–5&nbsp;m: 1.91 vs Ma 4.09), and in the 30+&nbsp;m tail Janssen&nbsp;V2 has the lowest MAD of the three. The mid-depth, non-near-stream regime is where the terrain-based estimate is weakest.</p>
+      </div>
+      <div class="tablewrap" id="nv-table"></div>
+    </div>
+  </section>
+
+  <!-- ================================================= 7 SHALLOW -->
+  <section id="shallow">
+    <div class="wrap">
+      <div class="col">
+        <p class="eyebrow">7 · shallow water table</p>
+        <h2>The shallow water table</h2>
+        <p>handily is intended for the shallow, near-stream water table. Treating a depth threshold as a shallow/not-shallow classification, handily and Ma show a consistent trade: <strong>handily has higher recall and lower precision</strong> than Ma. At the &lt;5&nbsp;m threshold in New Mexico, handily recalls 81% of shallow wells at 0.41 precision; Ma recalls 55% at 0.64 precision. The preferred product depends on the relative cost of a missed shallow well versus a false shallow call.</p>
+      </div>
+      <div class="legend">
+        <span><i style="background:var(--handily)"></i> handily</span>
+        <span><i style="background:var(--ma)"></i> Ma</span>
+        <span><i style="background:var(--jan)"></i> Janssen V2</span>
+      </div>
+      <div class="tablewrap" id="shallow-table"></div>
+      <p class="note"><b>Read with the counts.</b> Precision/recall are computed on the valley setting (upland wells number in the low hundreds and don't support a stable rate). <code>n obs</code> is how many wells are truly shallower than the threshold; <code>n pred</code> is how many each predictor calls shallow — handily's larger <code>n pred</code> is the visible source of its higher recall and lower precision.</p>
+    </div>
+  </section>
+
+  <!-- ================================================= 8 SUMMARY -->
+  <section id="summary">
+    <div class="wrap">
+      <div class="col">
+        <p class="eyebrow">8 · summary</p>
+        <h2>Summary</h2>
+        <p>The same depth-dependent pattern holds in all three regions. handily has the lower MAD in every depth band shallower than 10&nbsp;m, generally by roughly a factor of two relative to Ma. Ma has the lower MAD in the 10–30&nbsp;m band in every region. Below is the pooled MAD across the full common footprint; because it mixes all depths, it tracks each region's depth distribution rather than performance at any one depth.</p>
+      </div>
+      <div class="legend">
+        <span><i style="background:var(--handily)"></i> handily</span>
+        <span><i style="background:var(--ma)"></i> Ma</span>
+        <span><i style="background:var(--jan)"></i> Janssen V2</span>
+      </div>
+      <figure id="headline-bars"></figure>
+      <div id="headline-stats"></div>
+      <div class="col">
+        <h3>Limits of these estimates</h3>
+        <ul>
+          <li><strong>The 30+&nbsp;m regime is not resolved by any of the three products.</strong> handily's deep error appears as a large negative bias — estimates shallower than observed — which the MAD understates and the RMSE reflects. A deep regional water-table datum is a physical input the current features do not carry.</li>
+          <li><strong>The 10–30&nbsp;m band is where handily is weakest relative to Ma,</strong> most visibly in the Nevada closed basins. This mid-depth, non-near-stream regime, rather than the deep tail, accounts for the pooled difference there.</li>
+          <li><strong>The comparison is conservative for handily.</strong> handily is held out of its training wells; the reference products are not, and Ma's highest-leakage sources are excluded. The shallow-band results hold under those terms.</li>
+        </ul>
+        <p>In summary, handily is most useful for the shallow, near-stream water table, where it has the lower depth-banded error in all three regions. It is not a deep regional-aquifer model, and this validation does not evaluate it as one.</p>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap col">
+    <p>handily v0.1 beta. Estimate: <code>gnn_conus_monitoring_water_gate_mirror_sigma_w25_prod</code>, rendered to 10&nbsp;m EPSG:5070 over 178 basins (NM 77 · UCRB 29 · NV 72). Reference products: Ma (national DTW, western mosaic) and Janssen V2. Wells: GWX unconfined and unconfined-marginal from <code>wells.geoparquet</code>; NWIS and NGWMN excluded; common footprint only; handily held out of training via <code>gnn_oof_predictions.parquet</code>. Metrics computed by <code>utils/validate_fac_gwx_wells.py</code>. Residual convention: predicted − observed; negative indicates a shallower-than-observed estimate.</p>
+    <p><b>References.</b> Ma, Y. et&nbsp;al. (2026). High resolution US water table depth estimates reveal quantity of accessible groundwater. <em>Communications Earth &amp; Environment.</em> <a href="https://doi.org/10.1038/s43247-025-03094-3">doi:10.1038/s43247-025-03094-3</a>. &nbsp;·&nbsp; Janssen, J., Tootchi, A. &amp; Ameli, A.A. (2024). Tackling water table depth modeling via machine learning: from proxy observations to verifiability. <em>Advances in Water Resources.</em> <a href="https://doi.org/10.1016/j.advwatres.2025.104926">doi:10.1016/j.advwatres.2025.104926</a>.</p>
+    <p>Generated 2026-07-10.</p>
+  </div>
+</footer>
+
+<script>
+const PANEL = {"nm":{"n_window":172000,"n_common":34640,"excluded":["ngwmn","nwis"],"confinement":["unconfined","unconfined_marginal"],"holdout":true,"headline":{"GNN":{"n":34640,"mad_m":8.98275810546875,"bias_m":-15.231260123010637,"median_residual_m":-5.697945800781252,"rmse_m":41.856907395353154,"p90_abs_err_m":57.18062009765625,"p95_abs_err_m":87.69036748046867,"frac_abs_err_gt_10m":0.4746824480369515,"frac_abs_err_gt_25m":0.26215357967667435},"Ma":{"n":34640,"mad_m":8.836244857574464,"bias_m":-4.911815973964602,"median_residual_m":5.41381837138033e-07,"rmse_m":37.579180467443706,"p90_abs_err_m":52.43009444274907,"p95_abs_err_m":75.08011515655508,"frac_abs_err_gt_10m":0.4759237875288684,"frac_abs_err_gt_25m":0.2643187066974596},"Jan_V2":{"n":34640,"mad_m":12.678417300415038,"bias_m":-11.314701270772053,"median_residual_m":-2.7432000000000003,"rmse_m":38.200939804124815,"p90_abs_err_m":50.358621198120126,"p95_abs_err_m":75.81431528886405,"frac_abs_err_gt_10m":0.5758371824480369,"frac_abs_err_gt_25m":0.2807448036951501}},"by_depth_band":{"GNN":{"0-2m":{"n":944,"mad_m":2.0469228515625,"bias_m":4.9807832018441935,"median_residual_m":2.0433923828125,"rmse_m":15.824687021213808,"p90_abs_err_m":6.153431835937501,"p95_abs_err_m":12.40721315429686,"frac_abs_err_gt_10m":0.06038135593220339,"frac_abs_err_gt_25m":0.029661016949152543,"frac_of_wells":0.02725173210161663},"2-5m":{"n":5349,"mad_m":0.8825373046875002,"bias_m":2.0655510663836045,"median_residual_m":0.3256763671874996,"rmse_m":11.19817295346227,"p90_abs_err_m":2.889063718749998,"p95_abs_err_m":6.074566249999995,"frac_abs_err_gt_10m":0.03664236305851561,"frac_abs_err_gt_25m":0.021125444008225837,"frac_of_wells":0.15441685912240186},"5-10m":{"n":4783,"mad_m":2.686782031250001,"bias_m":0.2385854143619519,"median_residual_m":-2.1319916015625004,"rmse_m":12.354698686638608,"p90_abs_err_m":6.285271250000001,"p95_abs_err_m":12.070521582031205,"frac_abs_err_gt_10m":0.05665900062722141,"frac_abs_err_gt_25m":0.0315701442609241,"frac_of_wells":0.13807736720554273},"10-30m":{"n":8870,"mad_m":9.646478613281252,"bias_m":-4.216748019985599,"median_residual_m":-7.778170898437501,"rmse_m":18.97371395221439,"p90_abs_err_m":21.287195605468753,"p95_abs_err_m":25.44992544921872,"frac_abs_err_gt_10m":0.47846674182638105,"frac_abs_err_gt_25m":0.05434047350620068,"frac_of_wells":0.2560623556581986},"30+m":{"n":14694,"mad_m":28.371601757812503,"bias_m":-34.510680669479804,"median_residual_m":-26.456329296875005,"rmse_m":61.65609562312817,"p90_abs_err_m":91.56935751953127,"p95_abs_err_m":135.84785908203122,"frac_abs_err_gt_10m":0.7945419899278617,"frac_abs_err_gt_25m":0.5653327888934259,"frac_of_wells":0.42419168591224016}},"Ma":{"0-2m":{"n":944,"mad_m":3.7208205780029298,"bias_m":8.940090083275749,"median_residual_m":3.7208205780029298,"rmse_m":16.347004067423317,"p90_abs_err_m":23.926201011047368,"p95_abs_err_m":36.588191949462825,"frac_abs_err_gt_10m":0.2701271186440678,"frac_abs_err_gt_25m":0.09322033898305085,"frac_of_wells":0.02725173210161663},"2-5m":{"n":5349,"mad_m":1.814584046936035,"bias_m":6.252313804754081,"median_residual_m":1.440180093383789,"rmse_m":14.426962711194278,"p90_abs_err_m":21.63331040649412,"p95_abs_err_m":33.443266284179685,"frac_abs_err_gt_10m":0.17666853617498599,"frac_abs_err_gt_25m":0.07964105440269209,"frac_of_wells":0.15441685912240186},"5-10m":{"n":4783,"mad_m":3.4362322380065926,"bias_m":8.508262840952424,"median_residual_m":1.748027787780762,"rmse_m":18.828156581168965,"p90_abs_err_m":28.28691043823243,"p95_abs_err_m":42.975309616088865,"frac_abs_err_gt_10m":0.29625757892536064,"frac_abs_err_gt_25m":0.12272632239180431,"frac_of_wells":0.13807736720554273},"10-30m":{"n":8870,"mad_m":7.092188758850099,"bias_m":8.892595005092632,"median_residual_m":2.558034404418944,"rmse_m":22.021693592485104,"p90_abs_err_m":36.88154037597656,"p95_abs_err_m":48.59899822998047,"frac_abs_err_gt_10m":0.3904171364148816,"frac_abs_err_gt_25m":0.16358511837655018,"frac_of_wells":0.2560623556581986},"30+m":{"n":14694,"mad_m":21.79979730834961,"bias_m":-22.567082876127863,"median_residual_m":-13.52196574035645,"rmse_m":53.17963945833852,"p90_abs_err_m":76.93072101135255,"p95_abs_err_m":112.77682979217529,"frac_abs_err_gt_10m":0.7081802096093643,"frac_abs_err_gt_25m":0.4494351435960256,"frac_of_wells":0.42419168591224016}},"Jan_V2":{"0-2m":{"n":944,"mad_m":7.33230032043457,"bias_m":10.590227617482954,"median_residual_m":7.33230032043457,"rmse_m":16.37622259601046,"p90_abs_err_m":26.123517047119158,"p95_abs_err_m":36.4518715478515,"frac_abs_err_gt_10m":0.4163135593220339,"frac_abs_err_gt_25m":0.1059322033898305,"frac_of_wells":0.02725173210161663},"2-5m":{"n":5349,"mad_m":6.586164024353027,"bias_m":8.811521356226512,"median_residual_m":6.586164024353027,"rmse_m":14.80038827561775,"p90_abs_err_m":21.927560051269527,"p95_abs_err_m":30.0557833164062,"frac_abs_err_gt_10m":0.3499719573752103,"frac_abs_err_gt_25m":0.07608898859599925,"frac_of_wells":0.15441685912240186},"5-10m":{"n":4783,"mad_m":7.894290023803711,"bias_m":11.067231144901468,"median_residual_m":7.583223094177246,"rmse_m":19.3128916040411,"p90_abs_err_m":28.393911451416017,"p95_abs_err_m":39.793739127197185,"frac_abs_err_gt_10m":0.4085302111645411,"frac_abs_err_gt_25m":0.12335354380096174,"frac_of_wells":0.13807736720554273},"10-30m":{"n":8870,"mad_m":7.620014451599122,"bias_m":2.7484937366195896,"median_residual_m":0.9635672798156723,"rmse_m":13.867694859105962,"p90_abs_err_m":21.6442756023407,"p95_abs_err_m":28.199793277959767,"frac_abs_err_gt_10m":0.39503945885005637,"frac_abs_err_gt_25m":0.06922209695603157,"frac_of_wells":0.2560623556581986},"30+m":{"n":14694,"mad_m":27.35268785095215,"bias_m":-35.823122406069345,"median_residual_m":-26.980141708374028,"rmse_m":55.72924695525354,"p90_abs_err_m":79.8726580007935,"p95_abs_err_m":113.41929592651347,"frac_abs_err_gt_10m":0.8319041785762896,"frac_abs_err_gt_25m":0.5453926772832448,"frac_of_wells":0.42419168591224016}}},"shallow_pr":{"all":{"GNN":{"<2m":{"precision":0.08781869688385269,"recall":0.06567796610169492,"n_obs_shallow":944,"n_pred_shallow":706},"<5m":{"precision":0.413120854230707,"recall":0.8115366279993643,"n_obs_shallow":6293,"n_pred_shallow":12362},"<10m":{"precision":0.535418726903659,"recall":0.9287648970747562,"n_obs_shallow":11076,"n_pred_shallow":19213}},"Ma":{"<2m":{"precision":0.16573556797020483,"recall":0.1885593220338983,"n_obs_shallow":944,"n_pred_shallow":1074},"<5m":{"precision":0.6427100879655624,"recall":0.5456856825043699,"n_obs_shallow":6293,"n_pred_shallow":5343},"<10m":{"precision":0.8192797301708192,"recall":0.6798483206933911,"n_obs_shallow":11076,"n_pred_shallow":9191}},"Jan_V2":{"<2m":{"precision":0.0827027027027027,"recall":0.1620762711864407,"n_obs_shallow":944,"n_pred_shallow":1850},"<5m":{"precision":0.5451807228915663,"recall":0.2876211663753377,"n_obs_shallow":6293,"n_pred_shallow":3320},"<10m":{"precision":0.6622516556291391,"recall":0.41531238714337304,"n_obs_shallow":11076,"n_pred_shallow":6946}}},"valley":{"GNN":{"<2m":{"precision":0.08702064896755163,"recall":0.06483516483516484,"n_obs_shallow":910,"n_pred_shallow":678},"<5m":{"precision":0.41210690498271646,"recall":0.8219270220279132,"n_obs_shallow":5947,"n_pred_shallow":11861},"<10m":{"precision":0.5440408690282378,"recall":0.9311106840891622,"n_obs_shallow":10408,"n_pred_shallow":17813}},"Ma":{"<2m":{"precision":0.16332378223495703,"recall":0.1879120879120879,"n_obs_shallow":910,"n_pred_shallow":1047},"<5m":{"precision":0.6424715056988602,"recall":0.5402724062552547,"n_obs_shallow":5947,"n_pred_shallow":5001},"<10m":{"precision":0.8163217856312486,"recall":0.67467332820907,"n_obs_shallow":10408,"n_pred_shallow":8602}},"Jan_V2":{"<2m":{"precision":0.08542413381123058,"recall":0.15714285714285714,"n_obs_shallow":910,"n_pred_shallow":1674},"<5m":{"precision":0.5509938090583252,"recall":0.28434504792332266,"n_obs_shallow":5947,"n_pred_shallow":3069},"<10m":{"precision":0.665942253958398,"recall":0.41218293620292085,"n_obs_shallow":10408,"n_pred_shallow":6442}}},"upland":{"GNN":{"<2m":{"precision":0.10714285714285714,"recall":0.08823529411764706,"n_obs_shallow":34,"n_pred_shallow":28},"<5m":{"precision":0.437125748502994,"recall":0.6329479768786127,"n_obs_shallow":346,"n_pred_shallow":501},"<10m":{"precision":0.4257142857142857,"recall":0.8922155688622755,"n_obs_shallow":668,"n_pred_shallow":1400}},"Ma":{"<2m":{"precision":0.25925925925925924,"recall":0.20588235294117646,"n_obs_shallow":34,"n_pred_shallow":27},"<5m":{"precision":0.6461988304093568,"recall":0.638728323699422,"n_obs_shallow":346,"n_pred_shallow":342},"<10m":{"precision":0.8624787775891342,"recall":0.7604790419161677,"n_obs_shallow":668,"n_pred_shallow":589}},"Jan_V2":{"<2m":{"precision":0.056818181818181816,"recall":0.29411764705882354,"n_obs_shallow":34,"n_pred_shallow":176},"<5m":{"precision":0.47410358565737054,"recall":0.3439306358381503,"n_obs_shallow":346,"n_pred_shallow":251},"<10m":{"precision":0.6150793650793651,"recall":0.46407185628742514,"n_obs_shallow":668,"n_pred_shallow":504}}}}},"ucrb":{"n_window":49458,"n_common":5250,"excluded":["ngwmn","nwis"],"confinement":["unconfined","unconfined_marginal"],"holdout":true,"headline":{"GNN":{"n":5250,"mad_m":2.6264354179687492,"bias_m":-3.8199548887501926,"median_residual_m":-0.23310776328125016,"rmse_m":25.894279007839007,"p90_abs_err_m":18.782234765625,"p95_abs_err_m":31.746971798828124,"frac_abs_err_gt_10m":0.19847619047619047,"frac_abs_err_gt_25m":0.06857142857142857},"Ma":{"n":5250,"mad_m":3.9064289902496325,"bias_m":-1.1940455116989415,"median_residual_m":0.3852241004943848,"rmse_m":24.57226399770473,"p90_abs_err_m":18.130322219848647,"p95_abs_err_m":27.656527305684985,"frac_abs_err_gt_10m":0.228,"frac_abs_err_gt_25m":0.05847619047619047},"Jan_V2":{"n":5250,"mad_m":4.883508802209473,"bias_m":-0.7509415536471125,"median_residual_m":-0.17859207164128643,"rmse_m":26.108364264512783,"p90_abs_err_m":26.76721418225099,"p95_abs_err_m":33.77762948154481,"frac_abs_err_gt_10m":0.2906666666666667,"frac_abs_err_gt_25m":0.11657142857142858}},"by_depth_band":{"GNN":{"0-2m":{"n":898,"mad_m":1.516761796875,"bias_m":2.493789283308989,"median_residual_m":1.516761796875,"rmse_m":4.263612885706016,"p90_abs_err_m":4.8756953125,"p95_abs_err_m":7.4162639078125,"frac_abs_err_gt_10m":0.030066815144766147,"frac_abs_err_gt_25m":0.005567928730512249,"frac_of_wells":0.17104761904761906},"2-5m":{"n":1645,"mad_m":0.9924700156250004,"bias_m":1.3331209852544499,"median_residual_m":0.2653904156250002,"rmse_m":5.073341287975081,"p90_abs_err_m":4.108591796875001,"p95_abs_err_m":6.609760781249991,"frac_abs_err_gt_10m":0.03404255319148936,"frac_abs_err_gt_25m":0.0121580547112462,"frac_of_wells":0.31333333333333335},"5-10m":{"n":1128,"mad_m":3.1445026367187503,"bias_m":0.594208069614269,"median_residual_m":-2.0146479687500003,"rmse_m":11.627177852627007,"p90_abs_err_m":7.559800378906252,"p95_abs_err_m":17.137129890624998,"frac_abs_err_gt_10m":0.08244680851063829,"frac_abs_err_gt_25m":0.03280141843971631,"frac_of_wells":0.21485714285714286},"10-30m":{"n":1198,"mad_m":9.43108671875,"bias_m":-6.104796151780489,"median_residual_m":-8.3580443359375,"rmse_m":13.066052679875323,"p90_abs_err_m":19.244300484375,"p95_abs_err_m":22.100948880468746,"frac_abs_err_gt_10m":0.4515859766277129,"frac_abs_err_gt_25m":0.028380634390651086,"frac_of_wells":0.2281904761904762},"30+m":{"n":381,"mad_m":34.953291015625,"bias_m":-46.83435925402999,"median_residual_m":-33.4073426953125,"rmse_m":90.26807486517795,"p90_abs_err_m":84.86187734375001,"p95_abs_err_m":147.11232578125,"frac_abs_err_gt_10m":0.8530183727034121,"frac_abs_err_gt_25m":0.6929133858267716,"frac_of_wells":0.07257142857142856}},"Ma":{"0-2m":{"n":898,"mad_m":1.815276945590772,"bias_m":3.716299013866479,"median_residual_m":1.677899988555908,"rmse_m":6.635578001672312,"p90_abs_err_m":10.816698242187499,"p95_abs_err_m":13.641489327443766,"frac_abs_err_gt_10m":0.11358574610244988,"frac_abs_err_gt_25m":0.008908685968819599,"frac_of_wells":0.17104761904761906},"2-5m":{"n":1645,"mad_m":2.5067999999999997,"bias_m":3.8229440734583315,"median_residual_m":1.5529197906494137,"rmse_m":7.284717248058651,"p90_abs_err_m":11.530371360781261,"p95_abs_err_m":16.023437513688858,"frac_abs_err_gt_10m":0.1209726443768997,"frac_abs_err_gt_25m":0.007902735562310031,"frac_of_wells":0.31333333333333335},"5-10m":{"n":1128,"mad_m":3.3518500328063965,"bias_m":3.4138794170345355,"median_residual_m":0.39126334643554683,"rmse_m":9.796570047899804,"p90_abs_err_m":13.107800234985351,"p95_abs_err_m":19.326199714129984,"frac_abs_err_gt_10m":0.1702127659574468,"frac_abs_err_gt_25m":0.03723404255319149,"frac_of_wells":0.21485714285714286},"10-30m":{"n":1198,"mad_m":7.011200200271608,"bias_m":-3.1032153368951123,"median_residual_m":-4.766149904098512,"rmse_m":12.257850587929585,"p90_abs_err_m":17.933603483172607,"p95_abs_err_m":23.56852167904271,"frac_abs_err_gt_10m":0.327212020033389,"frac_abs_err_gt_25m":0.03923205342237062,"frac_of_wells":0.2281904761904762},"30+m":{"n":381,"mad_m":26.020242141723635,"bias_m":-42.06803795413415,"median_residual_m":-25.296898809814458,"rmse_m":85.03252464549224,"p90_abs_err_m":75.40293206939698,"p95_abs_err_m":129.79315467529298,"frac_abs_err_gt_10m":0.8188976377952756,"frac_abs_err_gt_25m":0.5170603674540682,"frac_of_wells":0.07257142857142856}},"Jan_V2":{"0-2m":{"n":898,"mad_m":1.9156680000000001,"bias_m":4.929153424871458,"median_residual_m":1.8661215988612274,"rmse_m":9.860120254893742,"p90_abs_err_m":15.377997211303741,"p95_abs_err_m":29.333684039743627,"frac_abs_err_gt_10m":0.14810690423162584,"frac_abs_err_gt_25m":0.07126948775055679,"frac_of_wells":0.17104761904761906},"2-5m":{"n":1645,"mad_m":3.048,"bias_m":4.913844904133735,"median_residual_m":0.8350702966918946,"rmse_m":11.715703230491188,"p90_abs_err_m":25.026362437939465,"p95_abs_err_m":30.46261607159754,"frac_abs_err_gt_10m":0.18723404255319148,"frac_abs_err_gt_25m":0.10030395136778116,"frac_of_wells":0.31333333333333335},"5-10m":{"n":1128,"mad_m":5.1397252281188965,"bias_m":3.571546072727818,"median_residual_m":0.24980445289611808,"rmse_m":12.134993096044699,"p90_abs_err_m":18.71877957305912,"p95_abs_err_m":27.725178466175258,"frac_abs_err_gt_10m":0.1773049645390071,"frac_abs_err_gt_25m":0.0726950354609929,"frac_of_wells":0.21485714285714286},"10-30m":{"n":1198,"mad_m":9.306708847229006,"bias_m":-2.7792013163866742,"median_residual_m":-5.180782807312012,"rmse_m":13.655231228696946,"p90_abs_err_m":22.538287777929437,"p95_abs_err_m":26.812815176142767,"frac_abs_err_gt_10m":0.4691151919866444,"frac_abs_err_gt_25m":0.0642737896494157,"frac_of_wells":0.2281904761904762},"30+m":{"n":381,"mad_m":30.08756518554687,"bias_m":-45.01658423225105,"median_residual_m":-29.797362238708494,"rmse_m":86.88330904061392,"p90_abs_err_m":82.61181880822755,"p95_abs_err_m":126.44299334335327,"frac_abs_err_gt_10m":0.847769028871391,"frac_abs_err_gt_25m":0.5879265091863517,"frac_of_wells":0.07257142857142856}}},"shallow_pr":{"all":{"GNN":{"<2m":{"precision":0.31043956043956045,"recall":0.12583518930957685,"n_obs_shallow":898,"n_pred_shallow":364},"<5m":{"precision":0.6609566903684551,"recall":0.804168305151396,"n_obs_shallow":2543,"n_pred_shallow":3094},"<10m":{"precision":0.7628539071347679,"recall":0.9174611822391718,"n_obs_shallow":3671,"n_pred_shallow":4415}},"Ma":{"<2m":{"precision":0.4369918699186992,"recall":0.23942093541202672,"n_obs_shallow":898,"n_pred_shallow":492},"<5m":{"precision":0.7309278350515463,"recall":0.5576091230829728,"n_obs_shallow":2543,"n_pred_shallow":1940},"<10m":{"precision":0.8225951453401259,"recall":0.7477526559520566,"n_obs_shallow":3671,"n_pred_shallow":3337}},"Jan_V2":{"<2m":{"precision":0.25740318906605925,"recall":0.3775055679287305,"n_obs_shallow":898,"n_pred_shallow":1317},"<5m":{"precision":0.6348195329087049,"recall":0.5878883208808494,"n_obs_shallow":2543,"n_pred_shallow":2355},"<10m":{"precision":0.79855028692238,"recall":0.7202397166984473,"n_obs_shallow":3671,"n_pred_shallow":3311}}},"valley":{"GNN":{"<2m":{"precision":0.30532212885154064,"recall":0.12428734321550741,"n_obs_shallow":877,"n_pred_shallow":357},"<5m":{"precision":0.6650132275132276,"recall":0.8108870967741936,"n_obs_shallow":2480,"n_pred_shallow":3024},"<10m":{"precision":0.7731764705882352,"recall":0.9240719910011248,"n_obs_shallow":3556,"n_pred_shallow":4250}},"Ma":{"<2m":{"precision":0.43775933609958506,"recall":0.24059293044469784,"n_obs_shallow":877,"n_pred_shallow":482},"<5m":{"precision":0.7334393216746158,"recall":0.5580645161290323,"n_obs_shallow":2480,"n_pred_shallow":1887},"<10m":{"precision":0.8296089385474861,"recall":0.7516872890888638,"n_obs_shallow":3556,"n_pred_shallow":3222}},"Jan_V2":{"<2m":{"precision":0.2630744849445325,"recall":0.37856328392246297,"n_obs_shallow":877,"n_pred_shallow":1262},"<5m":{"precision":0.6457319770013269,"recall":0.5887096774193549,"n_obs_shallow":2480,"n_pred_shallow":2261},"<10m":{"precision":0.8110161443494777,"recall":0.7204724409448819,"n_obs_shallow":3556,"n_pred_shallow":3159}}},"upland":{"GNN":{"<2m":{"precision":0.5714285714285714,"recall":0.19047619047619047,"n_obs_shallow":21,"n_pred_shallow":7},"<5m":{"precision":0.4857142857142857,"recall":0.5396825396825397,"n_obs_shallow":63,"n_pred_shallow":70},"<10m":{"precision":0.49696969696969695,"recall":0.7130434782608696,"n_obs_shallow":115,"n_pred_shallow":165}},"Ma":{"<2m":{"precision":0.4,"recall":0.19047619047619047,"n_obs_shallow":21,"n_pred_shallow":10},"<5m":{"precision":0.6415094339622641,"recall":0.5396825396825397,"n_obs_shallow":63,"n_pred_shallow":53},"<10m":{"precision":0.6260869565217392,"recall":0.6260869565217392,"n_obs_shallow":115,"n_pred_shallow":115}},"Jan_V2":{"<2m":{"precision":0.12727272727272726,"recall":0.3333333333333333,"n_obs_shallow":21,"n_pred_shallow":55},"<5m":{"precision":0.3723404255319149,"recall":0.5555555555555556,"n_obs_shallow":63,"n_pred_shallow":94},"<10m":{"precision":0.5394736842105263,"recall":0.7130434782608696,"n_obs_shallow":115,"n_pred_shallow":152}}}}},"nv":{"n_window":119080,"n_common":8394,"excluded":["ngwmn","nwis"],"confinement":["unconfined","unconfined_marginal"],"holdout":true,"headline":{"GNN":{"n":8394,"mad_m":7.97817451171875,"bias_m":-2.4397904178911523,"median_residual_m":-1.0462317871093751,"rmse_m":41.90385148191259,"p90_abs_err_m":54.277870386718746,"p95_abs_err_m":84.67493791992186,"frac_abs_err_gt_10m":0.4530617107457708,"frac_abs_err_gt_25m":0.23338098641887062},"Ma":{"n":8394,"mad_m":7.000222955627441,"bias_m":-10.934509133975782,"median_residual_m":-1.100312978744507,"rmse_m":40.76152012413442,"p90_abs_err_m":43.864259474639894,"p95_abs_err_m":75.01438155715942,"frac_abs_err_gt_10m":0.40707648320228734,"frac_abs_err_gt_25m":0.19561591613056944},"Jan_V2":{"n":8394,"mad_m":10.38661978225708,"bias_m":-4.948524692673661,"median_residual_m":1.624841139221191,"rmse_m":38.790013870389544,"p90_abs_err_m":38.05077106567383,"p95_abs_err_m":60.31558587768554,"frac_abs_err_gt_10m":0.5111984751012628,"frac_abs_err_gt_25m":0.1879914224446033}},"by_depth_band":{"GNN":{"0-2m":{"n":422,"mad_m":2.477771826171875,"bias_m":9.03691510998231,"median_residual_m":2.477771826171875,"rmse_m":20.64988492885781,"p90_abs_err_m":24.39091244140625,"p95_abs_err_m":44.965785224609334,"frac_abs_err_gt_10m":0.1943127962085308,"frac_abs_err_gt_25m":0.0971563981042654,"frac_of_wells":0.050274005241839406},"2-5m":{"n":1915,"mad_m":1.9147638671875002,"bias_m":8.953962866311254,"median_residual_m":1.0524105957031251,"rmse_m":25.334975525003607,"p90_abs_err_m":25.55482867187501,"p95_abs_err_m":49.757083144531194,"frac_abs_err_gt_10m":0.18955613577023497,"frac_abs_err_gt_25m":0.10287206266318538,"frac_of_wells":0.2281391470097689},"5-10m":{"n":1579,"mad_m":3.4721919921875006,"bias_m":5.797615036367819,"median_residual_m":-1.6238128906250004,"rmse_m":20.689339913019236,"p90_abs_err_m":24.10673675781251,"p95_abs_err_m":48.628604316406246,"frac_abs_err_gt_10m":0.18366054464851173,"frac_abs_err_gt_25m":0.09816339455351489,"frac_of_wells":0.18811055515844652},"10-30m":{"n":2535,"mad_m":11.0211083984375,"bias_m":4.137342980964804,"median_residual_m":-5.364309705729168,"rmse_m":27.273819808552627,"p90_abs_err_m":35.20130097656249,"p95_abs_err_m":63.762586933593475,"frac_abs_err_gt_10m":0.5479289940828402,"frac_abs_err_gt_25m":0.13530571992110454,"frac_of_wells":0.3020014295925661},"30+m":{"n":1943,"mad_m":31.166064843750007,"bias_m":-31.43727042323597,"median_residual_m":-24.918617968750006,"rmse_m":74.44635346172005,"p90_abs_err_m":106.86703234375001,"p95_abs_err_m":169.16040292968734,"frac_abs_err_gt_10m":0.8641276376737005,"frac_abs_err_gt_25m":0.629439011837365,"frac_of_wells":0.23147486299737907}},"Ma":{"0-2m":{"n":422,"mad_m":5.440457666397094,"bias_m":8.03792142946562,"median_residual_m":5.440457666397094,"rmse_m":12.050350582983372,"p90_abs_err_m":23.134319439697265,"p95_abs_err_m":23.470006964111327,"frac_abs_err_gt_10m":0.25829383886255924,"frac_abs_err_gt_25m":0.02843601895734597,"frac_of_wells":0.050274005241839406},"2-5m":{"n":1915,"mad_m":4.088129889678955,"bias_m":6.847843829450003,"median_residual_m":3.9156365325927736,"rmse_m":13.557047911311924,"p90_abs_err_m":18.37802177734375,"p95_abs_err_m":21.580101357978545,"frac_abs_err_gt_10m":0.23968668407310706,"frac_abs_err_gt_25m":0.04386422976501306,"frac_of_wells":0.2281391470097689},"5-10m":{"n":1579,"mad_m":3.2003999530792235,"bias_m":3.991851825674681,"median_residual_m":1.7618340972900395,"rmse_m":10.191548951506805,"p90_abs_err_m":15.835232633666992,"p95_abs_err_m":20.707745602111792,"frac_abs_err_gt_10m":0.15832805573147563,"frac_abs_err_gt_25m":0.03103229892336922,"frac_of_wells":0.18811055515844652},"10-30m":{"n":2535,"mad_m":6.339840164794921,"bias_m":-2.319294149510099,"median_residual_m":-3.665873736572266,"rmse_m":12.533993347615645,"p90_abs_err_m":17.988125624694824,"p95_abs_err_m":23.52141759033203,"frac_abs_err_gt_10m":0.3128205128205128,"frac_abs_err_gt_25m":0.0398422090729783,"frac_of_wells":0.3020014295925661},"30+m":{"n":1943,"mad_m":36.17839431915284,"bias_m":-55.95142398916942,"median_residual_m":-36.005515617370605,"rmse_m":81.70576631119647,"p90_abs_err_m":120.7007989807129,"p95_abs_err_m":187.74801599731444,"frac_abs_err_gt_10m":0.9294904786412764,"frac_abs_err_gt_25m":0.7184765826042203,"frac_of_wells":0.23147486299737907}},"Jan_V2":{"0-2m":{"n":422,"mad_m":8.90479295349121,"bias_m":11.81564750901037,"median_residual_m":8.90479295349121,"rmse_m":16.489695710328522,"p90_abs_err_m":26.19223780090332,"p95_abs_err_m":36.092584115978994,"frac_abs_err_gt_10m":0.48104265402843605,"frac_abs_err_gt_25m":0.11848341232227488,"frac_of_wells":0.050274005241839406},"2-5m":{"n":1915,"mad_m":6.682119604492188,"bias_m":9.35803192350382,"median_residual_m":6.682119604492188,"rmse_m":14.685153027720188,"p90_abs_err_m":23.061538001708985,"p95_abs_err_m":30.621275825805654,"frac_abs_err_gt_10m":0.393733681462141,"frac_abs_err_gt_25m":0.0783289817232376,"frac_of_wells":0.2281391470097689},"5-10m":{"n":1579,"mad_m":8.052547055053711,"bias_m":8.869874946041127,"median_residual_m":7.3850677246093746,"rmse_m":15.048591232500666,"p90_abs_err_m":23.711247858886722,"p95_abs_err_m":32.701308162231435,"frac_abs_err_gt_10m":0.4129195693476884,"frac_abs_err_gt_25m":0.09309689677010766,"frac_of_wells":0.18811055515844652},"10-30m":{"n":2535,"mad_m":8.783626159667968,"bias_m":3.423458896417979,"median_residual_m":1.6152938247680666,"rmse_m":14.393307914839962,"p90_abs_err_m":23.728980248298644,"p95_abs_err_m":29.002044944457975,"frac_abs_err_gt_10m":0.44733727810650886,"frac_abs_err_gt_25m":0.0863905325443787,"frac_of_wells":0.3020014295925661},"30+m":{"n":1943,"mad_m":26.731522521972657,"bias_m":-44.84238368236408,"median_residual_m":-26.34614322418213,"rmse_m":75.98956687886262,"p90_abs_err_m":108.85551608642575,"p95_abs_err_m":185.06302441067504,"frac_abs_err_gt_10m":0.7967061245496655,"frac_abs_err_gt_25m":0.5208440555841483,"frac_of_wells":0.23147486299737907}}},"shallow_pr":{"all":{"GNN":{"<2m":{"precision":0.19689119170984457,"recall":0.09004739336492891,"n_obs_shallow":422,"n_pred_shallow":193},"<5m":{"precision":0.4763711624698172,"recall":0.590928540864356,"n_obs_shallow":2337,"n_pred_shallow":2899},"<10m":{"precision":0.6565389696169088,"recall":0.7614913176710929,"n_obs_shallow":3916,"n_pred_shallow":4542}},"Ma":{"<2m":{"precision":0.12394957983193278,"recall":0.13981042654028436,"n_obs_shallow":422,"n_pred_shallow":476},"<5m":{"precision":0.601010101010101,"recall":0.35643988018827555,"n_obs_shallow":2337,"n_pred_shallow":1386},"<10m":{"precision":0.6848090982940699,"recall":0.6458120531154239,"n_obs_shallow":3916,"n_pred_shallow":3693}},"Jan_V2":{"<2m":{"precision":0.11188811188811189,"recall":0.15165876777251186,"n_obs_shallow":422,"n_pred_shallow":572},"<5m":{"precision":0.533003300330033,"recall":0.2764227642276423,"n_obs_shallow":2337,"n_pred_shallow":1212},"<10m":{"precision":0.7262895174708819,"recall":0.4458631256384065,"n_obs_shallow":3916,"n_pred_shallow":2404}}},"valley":{"GNN":{"<2m":{"precision":0.20108695652173914,"recall":0.08958837772397095,"n_obs_shallow":413,"n_pred_shallow":184},"<5m":{"precision":0.4799161718477122,"recall":0.6036906854130053,"n_obs_shallow":2276,"n_pred_shallow":2863},"<10m":{"precision":0.6621863799283154,"recall":0.7738219895287958,"n_obs_shallow":3820,"n_pred_shallow":4464}},"Ma":{"<2m":{"precision":0.12366737739872068,"recall":0.14043583535108958,"n_obs_shallow":413,"n_pred_shallow":469},"<5m":{"precision":0.5968819599109132,"recall":0.3532513181019332,"n_obs_shallow":2276,"n_pred_shallow":1347},"<10m":{"precision":0.6887343532684284,"recall":0.6481675392670158,"n_obs_shallow":3820,"n_pred_shallow":3595}},"Jan_V2":{"<2m":{"precision":0.11272727272727273,"recall":0.15012106537530268,"n_obs_shallow":413,"n_pred_shallow":550},"<5m":{"precision":0.5422715627668659,"recall":0.2789982425307557,"n_obs_shallow":2276,"n_pred_shallow":1171},"<10m":{"precision":0.7381567614125754,"recall":0.4486910994764398,"n_obs_shallow":3820,"n_pred_shallow":2322}}},"upland":{"GNN":{"<2m":{"precision":0.1111111111111111,"recall":0.1111111111111111,"n_obs_shallow":9,"n_pred_shallow":9},"<5m":{"precision":0.19444444444444445,"recall":0.11475409836065574,"n_obs_shallow":61,"n_pred_shallow":36},"<10m":{"precision":0.3333333333333333,"recall":0.2708333333333333,"n_obs_shallow":96,"n_pred_shallow":78}},"Ma":{"<2m":{"precision":0.14285714285714285,"recall":0.1111111111111111,"n_obs_shallow":9,"n_pred_shallow":7},"<5m":{"precision":0.7435897435897436,"recall":0.47540983606557374,"n_obs_shallow":61,"n_pred_shallow":39},"<10m":{"precision":0.5408163265306123,"recall":0.5520833333333334,"n_obs_shallow":96,"n_pred_shallow":98}},"Jan_V2":{"<2m":{"precision":0.09090909090909091,"recall":0.2222222222222222,"n_obs_shallow":9,"n_pred_shallow":22},"<5m":{"precision":0.2682926829268293,"recall":0.18032786885245902,"n_obs_shallow":61,"n_pred_shallow":41},"<10m":{"precision":0.3902439024390244,"recall":0.3333333333333333,"n_obs_shallow":96,"n_pred_shallow":82}}}}}};
+
+const REGIONS = [
+  {key:"nm",   name:"New Mexico",    basins:77},
+  {key:"ucrb", name:"Upper Colorado",basins:29},
+  {key:"nv",   name:"Nevada",       basins:72},
+];
+const PREDS = [
+  {key:"GNN",    label:"handily", css:"handily"},
+  {key:"Ma",     label:"Ma",      css:"ma"},
+  {key:"Jan_V2", label:"Janssen V2", css:"jan"},
+];
+const BANDS = ["0-2m","2-5m","5-10m","10-30m","30+m"];
+
+const f1 = x => (x==null||isNaN(x)) ? "—" : x.toFixed(1);
+const f2 = x => (x==null||isNaN(x)) ? "—" : x.toFixed(2);
+const pct = x => (x==null||isNaN(x)) ? "—" : (x*100).toFixed(0)+"%";
+const grp = n => (n==null) ? "—" : n.toLocaleString("en-US");
+
+// ---- headline bars (MAD, scaled to region max) ----
+function headlineBars(){
+  const host = document.getElementById("headline-bars");
+  const parts = [];
+  for(const r of REGIONS){
+    const h = PANEL[r.key].headline;
+    const vals = PREDS.map(p => h[p.key].mad_m);
+    const max = Math.max(...vals);
+    parts.push(`<h3 style="margin:1.4em 0 0.5em">${r.name} <span style="font-family:var(--mono);font-size:0.72rem;color:var(--muted);font-weight:400">· ${grp(PANEL[r.key].n_common)} wells · headline MAD (m)</span></h3><div class="bars">`);
+    for(const p of PREDS){
+      const v = h[p.key].mad_m;
+      const w = Math.max(2, v/max*100);
+      parts.push(`<div class="bar-row"><div class="bar-label">${p.label}</div><div class="bar-track"><div class="bar-fill" style="background:var(--${p.css});width:${w.toFixed(1)}%"></div></div><div class="bar-val">${f2(v)} m</div></div>`);
+    }
+    parts.push(`</div>`);
+  }
+  host.innerHTML = parts.join("");
+}
+
+// ---- headline stat strip (RMSE / >25m) ----
+function headlineStats(){
+  const host = document.getElementById("headline-stats");
+  const parts = [`<div class="stats">`];
+  for(const r of REGIONS){
+    const h = PANEL[r.key].headline.GNN;
+    parts.push(`<div class="stat"><div class="n">${f1(h.rmse_m)}</div><div class="l">${r.name} — handily pooled RMSE (m)</div></div>`);
+  }
+  for(const r of REGIONS){
+    const h = PANEL[r.key].headline.GNN;
+    parts.push(`<div class="stat"><div class="n">${pct(h.frac_abs_err_gt_25m)}</div><div class="l">${r.name} — handily wells with error &gt;25 m</div></div>`);
+  }
+  parts.push(`</div>`);
+  host.innerHTML = parts.join("");
+}
+
+// ---- per-region depth-band panel ----
+function bandTable(rkey){
+  const R = PANEL[rkey];
+  const bd = R.by_depth_band;
+  const cols = ["MAD","bias","med resid","RMSE","p95","&gt;10 m","&gt;25 m","n"];
+  const parts = [`<table><thead><tr><th>band</th><th>predictor</th>`];
+  parts.push(cols.map(c=>`<th class="num">${c}</th>`).join(""));
+  parts.push(`</tr></thead><tbody>`);
+
+  // headline row group
+  addGroup(parts, "all depths", null, R.headline, R.n_common);
+  for(const b of BANDS){
+    const bandBlocks = {};
+    for(const p of PREDS) bandBlocks[p.key] = bd[p.key][b];
+    const frac = bd.GNN[b].frac_of_wells;
+    addGroup(parts, b, frac, bandBlocks, bd.GNN[b].n);
+  }
+  parts.push(`</tbody></table>`);
+  document.getElementById(rkey+"-table").innerHTML = parts.join("");
+}
+
+// per-column best criteria: "min" = lowest value; "absmin" = closest to zero
+const BEST_COLS = [
+  {f:"mad_m",               crit:"min"},
+  {f:"bias_m",              crit:"absmin"},
+  {f:"median_residual_m",   crit:"absmin"},
+  {f:"rmse_m",              crit:"min"},
+  {f:"p95_abs_err_m",       crit:"min"},
+  {f:"frac_abs_err_gt_10m", crit:"min"},
+  {f:"frac_abs_err_gt_25m", crit:"min"},
+];
+
+function bestByCol(blocks){
+  const best = {};
+  for(const c of BEST_COLS){
+    let key=null, bv=Infinity;
+    for(const p of PREDS){
+      const raw = blocks[p.key]?.[c.f];
+      if(raw==null || isNaN(raw)) continue;
+      const v = (c.crit==="absmin") ? Math.abs(raw) : raw;
+      if(v<bv){ bv=v; key=p.key; }
+    }
+    best[c.f] = key;
+  }
+  return best;
+}
+
+function addGroup(parts, bandLabel, frac, blocks, n){
+  const best = bestByCol(blocks);
+  const fracTxt = frac==null ? "" : ` · <b>${pct(frac)}</b> of wells`;
+  parts.push(`<tr class="bandhead"><td colspan="10">${bandLabel}${fracTxt} · n=${grp(n)}</td></tr>`);
+  for(const p of PREDS){
+    const m = blocks[p.key];
+    if(!m){ continue; }
+    const cl = f => (best[f]===p.key) ? "num best" : "num";
+    parts.push(`<tr>`);
+    parts.push(`<td></td>`);
+    parts.push(`<td class="pred"><span class="dot" style="background:var(--${p.css})"></span>${p.label}</td>`);
+    parts.push(`<td class="${cl("mad_m")}">${f2(m.mad_m)}</td>`);
+    parts.push(`<td class="${cl("bias_m")}">${f1(m.bias_m)}</td>`);
+    parts.push(`<td class="${cl("median_residual_m")}">${f1(m.median_residual_m)}</td>`);
+    parts.push(`<td class="${cl("rmse_m")}">${f1(m.rmse_m)}</td>`);
+    parts.push(`<td class="${cl("p95_abs_err_m")}">${f1(m.p95_abs_err_m)}</td>`);
+    parts.push(`<td class="${cl("frac_abs_err_gt_10m")}">${pct(m.frac_abs_err_gt_10m)}</td>`);
+    parts.push(`<td class="${cl("frac_abs_err_gt_25m")}">${pct(m.frac_abs_err_gt_25m)}</td>`);
+    parts.push(`<td class="num">${grp(m.n)}</td>`);
+    parts.push(`</tr>`);
+  }
+}
+
+// ---- shallow precision/recall (valley setting) ----
+function shallowTable(){
+  const thr = ["<2m","<5m","<10m"];
+  const parts = [`<table><thead><tr><th>region</th><th>threshold</th><th>predictor</th><th class="num">precision</th><th class="num">recall</th><th class="num">n obs</th><th class="num">n pred</th></tr></thead><tbody>`];
+  for(const r of REGIONS){
+    const pr = PANEL[r.key].shallow_pr.valley;
+    for(const t of thr){
+      // best recall marker? mark best precision*recall? Just group; bandhead per (region,threshold)
+      parts.push(`<tr class="bandhead"><td colspan="7"><b>${r.name}</b> · shallower than ${t.replace("<","")} · valley</td></tr>`);
+      for(const p of PREDS){
+        const c = pr[p.key][t];
+        parts.push(`<tr><td></td><td></td><td class="pred"><span class="dot" style="background:var(--${p.css})"></span>${p.label}</td><td class="num">${f2(c.precision)}</td><td class="num">${f2(c.recall)}</td><td class="num">${grp(c.n_obs_shallow)}</td><td class="num">${grp(c.n_pred_shallow)}</td></tr>`);
+      }
+    }
+  }
+  parts.push(`</tbody></table>`);
+  document.getElementById("shallow-table").innerHTML = parts.join("");
+}
+
+// ---- theme toggle ----
+(function(){
+  const btn = document.getElementById("themebtn");
+  btn.addEventListener("click", ()=>{
+    const cur = document.documentElement.getAttribute("data-theme");
+    const dark = cur ? cur==="dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.setAttribute("data-theme", dark ? "light" : "dark");
+  });
+})();
+
+headlineBars();
+headlineStats();
+for(const r of REGIONS) bandTable(r.key);
+shallowTable();
+</script>
+
+</body>
+</html>
