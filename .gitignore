@@ -217,3 +217,18 @@ __marimo__/
 /handily_repo*.txt
 /handily_repo.txt
 /nohup.out
+
+# Local working dirs, one-off scripts, run logs, and session-workflow files
+# (all machine-local, keep untracked)
+/cache/
+/scratchpad/
+/scripts/
+/logs/
+/handily.qgz
+/GIS_DATA.txt
+/.codex
+/commands.sh
+/commits.sh
+/CLAUDE.md
+/.claude/
+/notes/
