@@ -12,13 +12,31 @@ rasters under ``/data/ssd2/handily/huc8/{basin}/gnn/{model_name}/``:
   gnn_sigma_100m.tif      fold-median Laplace scale b (m)
   gnn_gate_w_100m.tif     mean gate weights (bands = manifest gate_experts)
   gnn_head_wte_100m.tif   fold-median free-head expert WTE
-  gnn_deep_wte_100m.tif   deep-IDW expert WTE
-  gnn_r_wte_100m.tif      all-well relief-IDW base R
+  gnn_deep_wte_100m.tif   deep prior WTE (crossfit-field interpolation)
+  gnn_r_wte_100m.tif      base R WTE (crossfit-field interpolation)
   gnn_fold_spread_100m.tif p90-p10 of per-fold WTE
+
+R and the deep prior are leak-free by construction (docs/inference_leakage_prevention.md):
+the default interpolates the bundle's ARCHIVED leave-fold-out crossfit feature
+values (relief-kNN-IDW of regional_wte_idw_oof_m / deep_regional_wte_idw_oof_m),
+so no well's own observation can reach its neighborhood, the surface has no
+exclusion-disk seams, and at well locations it reproduces the training features
+exactly (pin error 0.000 m at the 34,503 bundle wells) -- the map is the
+seamless spatial extension of the audited OOF field. All-well IDW of raw obs
+here self-pins R to training labels and prints bulls-eyes into the rendered
+maps (the 2026-07 leakage incident, notes/LEAKAGE_AUDIT.md L1); the calibrated
+leave-radius-out variant (--r-source obs-exclude) is shelved: it matches the
+residual distribution but draws arc/annulus seams where wells cross the
+exclusion-disk edge (notes/SHELVED_LEVERS.md).
 
 Every fold's forward is checked against the gate-mixture identity
 (wte == sum_i w_i * expert_wte_i, <1e-3 m) before anything is written; the
 10 m render (render_gnn_10m.py) then recomposes from these layers exactly.
+After each basin a LEAK GATE compares the coarse DTW sampled at the bundle's
+in-basin wells against the archived OOF predictions: a map that beats its own
+OOF MAD at training wells by more than --leak-gate-frac AND departs from the
+OOF predictions per-well (median |map-oof| > --leak-gate-track-m) fails the
+run; a ratio trip that still tracks OOF passes as "pass_ratio_tripped".
 
 ``--oof-check`` runs the bundle's own wells through the persisted checkpoints
 and compares against the archived OOF predictions -- the end-to-end round-trip
@@ -47,6 +65,7 @@ import rasterio
 import torch
 from rasterio.features import rasterize
 from rasterio.transform import from_origin
+from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_conus_graph_inputs import (  # noqa: E402
@@ -57,7 +76,6 @@ from build_conus_graph_inputs import (  # noqa: E402
     attach_lateral_attrs,
     build_lateral_edges,
     deep_well_mask,
-    idw_at_points,
     sample_gridmet,
     sample_relief_etrm,
     sample_terrain_multiscale,
@@ -125,6 +143,65 @@ def well_pool(qn: pd.DataFrame) -> pd.DataFrame:
             len(qn),
         )
     return qn[~water].reset_index(drop=True)
+
+
+def idw_exclude_at_points(
+    pool_coords: np.ndarray,
+    pool_val: np.ndarray,
+    pool_xy: np.ndarray,
+    query_coords: np.ndarray,
+    query_xy: np.ndarray,
+    k: int,
+    power: float,
+    exclude_m: float,
+    chunk: int = 250_000,
+) -> np.ndarray:
+    """Leave-radius-out kNN IDW: the inference counterpart of ``crossfit_idw``.
+
+    Wells inside a horizontal disk of ``exclude_m`` around each query point are
+    excluded from its neighbor set; ranking and inverse-distance weights run on
+    ``pool_coords``/``query_coords`` (relief-lifted or plain, per the trained
+    contract), while the exclusion disk is horizontal (``*_xy``) because the
+    training-time fold exclusion removed a horizontal HUC12 cluster. Candidates
+    are over-queried (k+96, doubling adaptively for dense clusters) and the
+    first k survivors per query are kept -- exactly "k nearest of the allowed
+    pool". ``exclude_m=0`` reproduces ``idw_at_points`` output.
+    """
+    tree = cKDTree(pool_coords)
+    n_pool = len(pool_val)
+    out = np.full(len(query_coords), np.nan)
+    for c0 in range(0, len(query_coords), chunk):
+        c1 = min(c0 + chunk, len(query_coords))
+        todo = np.arange(c0, c1)
+        kk = min(n_pool, k + 96)
+        while len(todo):
+            dist, idx = tree.query(query_coords[todo], k=kk)
+            if kk == 1:
+                dist, idx = dist[:, None], idx[:, None]
+            dx = pool_xy[idx, 0] - query_xy[todo, None, 0]
+            dy = pool_xy[idx, 1] - query_xy[todo, None, 1]
+            keep = (dx * dx + dy * dy) >= exclude_m * exclude_m
+            n_keep = keep.sum(1)
+            enough = n_keep >= min(k, n_pool)
+            if kk >= n_pool:
+                enough = n_keep > 0  # renormalize over whatever survives
+                if not enough.all():
+                    raise SystemExit(
+                        f"idw_exclude_at_points: {int((~enough).sum())} query "
+                        f"points have NO wells outside the {exclude_m:.0f} m "
+                        "exclusion disk"
+                    )
+            used = keep & (np.cumsum(keep, axis=1) <= k)
+            w = np.where(used, 1.0 / np.maximum(dist, 1.0) ** power, 0.0)
+            num = (w * pool_val[idx]).sum(1)
+            den = w.sum(1)
+            rows = np.where(enough)[0]
+            out[todo[rows]] = num[rows] / den[rows]
+            todo = todo[~enough]
+            if kk >= n_pool:
+                break
+            kk = min(n_pool, kk * 2)
+    return out
 
 
 def snapped_window(bounds: tuple, res: float) -> tuple:
@@ -503,6 +580,91 @@ def scatter(
     return out
 
 
+def leak_gate(
+    basin: str,
+    dtw_grid: np.ndarray,
+    transform,
+    oof: pd.DataFrame,
+    frac: float,
+    min_wells: int,
+    track_tol_m: float,
+) -> dict:
+    """Fail loud if the coarse map beats its own OOF at training wells.
+
+    Samples the basin DTW grid at the bundle's in-window wells and compares
+    MAD(map - obs) against MAD(oof_pred - obs) from the archived
+    gnn_oof_predictions.parquet. A leak-free map sits near the OOF error
+    (fold-median ensembling buys a little; the 2026-07 all-well-IDW leak bought
+    ~5x). Failure requires BOTH signals: map MAD < frac * OOF MAD AND the map
+    departing from the OOF predictions per-well (median |map - oof| >
+    track_tol_m). The second condition is the leak signature proper — labels
+    pull the map off the model's honest predictions toward obs (5.29 m in the
+    2026-07 incident vs ~0.55 m for clean maps). The MAD ratio alone
+    false-positives on small bimodal panels where fold-median ensembling beats
+    the single held-out checkpoint in the high-spread deep regime (13040100:
+    ratio 0.41 with R pinned to 0.010 m and zero obs-collapsed wells). A ratio
+    trip that tracks OOF passes with status "pass_ratio_tripped" for review.
+    Returns the gate panel for infer_run.json.
+    """
+    x = oof["x5070"].to_numpy("float64")
+    y = oof["y5070"].to_numpy("float64")
+    c = np.floor((x - transform.c) / RES).astype("int64")
+    r = np.floor((transform.f - y) / RES).astype("int64")
+    h, w = dtw_grid.shape
+    inb = (r >= 0) & (r < h) & (c >= 0) & (c < w)
+    obs = oof["obs_dtw_m"].to_numpy("float64")
+    pred = oof["gnn_dtw_m"].to_numpy("float64")
+    map_dtw = np.full(len(oof), np.nan)
+    map_dtw[inb] = dtw_grid[r[inb], c[inb]]
+    fin = np.isfinite(map_dtw) & np.isfinite(obs) & np.isfinite(pred)
+    n = int(fin.sum())
+    if n < min_wells:
+        log.info("%s: leak gate skipped (%d in-basin wells < %d)", basin, n, min_wells)
+        return {"n_wells": n, "status": "skipped"}
+    mad_map = float(np.median(np.abs(map_dtw[fin] - obs[fin])))
+    mad_oof = float(np.median(np.abs(pred[fin] - obs[fin])))
+    gap = float(np.median(np.abs(map_dtw[fin] - pred[fin])))
+    panel = {
+        "n_wells": n,
+        "mad_map_vs_obs_m": mad_map,
+        "mad_oof_vs_obs_m": mad_oof,
+        "median_abs_map_minus_oof_m": gap,
+        "fail_frac": frac,
+        "track_tol_m": track_tol_m,
+        "status": "pass",
+    }
+    log.info(
+        "%s: leak gate n=%d, map MAD %.2f m vs OOF MAD %.2f m, |map-oof| median %.2f m",
+        basin,
+        n,
+        mad_map,
+        mad_oof,
+        gap,
+    )
+    if mad_map < frac * mad_oof:
+        if gap > track_tol_m:
+            raise SystemExit(
+                f"{basin}: LEAK GATE FAILED -- map MAD {mad_map:.2f} m beats OOF MAD "
+                f"{mad_oof:.2f} m at training wells by more than {frac:.2f}x and the "
+                f"map departs from the OOF predictions (|map-oof| median {gap:.2f} m "
+                f"> {track_tol_m:.2f} m): training labels are reaching the lattice "
+                "features; docs/inference_leakage_prevention.md"
+            )
+        panel["status"] = "pass_ratio_tripped"
+        log.warning(
+            "%s: leak gate MAD ratio tripped (%.2f < %.2f x %.2f m) but map tracks "
+            "OOF (|map-oof| median %.2f m <= %.2f m) -- ensemble-variance false "
+            "positive, passing for review",
+            basin,
+            mad_map,
+            frac,
+            mad_oof,
+            gap,
+            track_tol_m,
+        )
+    return panel
+
+
 def infer_basin(
     basin: str,
     models: dict,
@@ -514,6 +676,7 @@ def infer_basin(
     args,
     device: str,
     water_xy: np.ndarray | None = None,
+    oof: pd.DataFrame | None = None,
 ) -> None:
     man = models["manifest"]
     out_dir = HUC8_ROOT / basin / "gnn" / args.model_name
@@ -539,25 +702,50 @@ def infer_basin(
     log.info("%s: %d lattice cells (%dx%d window)", basin, n, width, height)
     qxy = np.c_[qx, qy]
 
-    # R: all-well relief-IDW WTE (inference-time counterpart of the crossfit prior)
+    # R + deep prior, leak-free. Default "crossfit": plain relief-kNN-IDW
+    # interpolation of the ARCHIVED leave-fold-out crossfit feature values --
+    # never a well's own obs, no exclusion disk (so no seams), and exact at
+    # well locations (pin error 0.000 m; |R - obs| median/p90 5.03/30.42 m ==
+    # archived, on the 34,503 bundle wells). "obs-exclude" is the shelved
+    # leave-radius-out lever on raw obs (calibrated 3.5/4.5 km disks):
+    # distribution-matched but draws arc seams where wells cross the disk
+    # edge, with smooth annuli around extreme-residual wells.
     vw = float(bman["r_relief_vw"])
     k, p = int(bman["idw_k"]), float(bman["idw_power"])
-    r_wte = idw_at_points(
-        _relief_coords(wells["xy"], wells["z"], vw),
-        wells["wte"],
-        _relief_coords(qxy, z_surf, vw),
-        k,
-        p,
-    )
-    # deep expert: deep-pool IDW head, no relief lift (training contract)
-    dd = bman["deep_datum"]
-    deep_wte = idw_at_points(
-        wells["xy"][wells["deep"]],
-        wells["wte"][wells["deep"]],
-        qxy,
-        int(dd["idw_k_deep"]),
-        p,
-    )
+    q_co = _relief_coords(qxy, z_surf, vw)
+    pool_co = _relief_coords(wells["xy"], wells["z"], vw)
+    if args.r_source == "crossfit":
+        # deep uses the same k as R: this interpolates the archived per-well
+        # deep-feature field (defined at every well), not a re-estimate from
+        # the deep pool, so idw_k_deep does not apply.
+        r_wte = idw_exclude_at_points(
+            pool_co, wells["r_cross"], wells["xy"], q_co, qxy, k, p, 0.0
+        )
+        deep_wte = idw_exclude_at_points(
+            pool_co, wells["deep_cross"], wells["xy"], q_co, qxy, k, p, 0.0
+        )
+    else:
+        r_wte = idw_exclude_at_points(
+            pool_co,
+            wells["wte"],
+            wells["xy"],
+            q_co,
+            qxy,
+            k,
+            p,
+            args.r_exclude_km * 1000.0,
+        )
+        dd = bman["deep_datum"]
+        deep_wte = idw_exclude_at_points(
+            _relief_coords(wells["xy"][wells["deep"]], wells["z"][wells["deep"]], vw),
+            wells["wte"][wells["deep"]],
+            wells["xy"][wells["deep"]],
+            q_co,
+            qxy,
+            int(dd["idw_k_deep"]),
+            p,
+            args.deep_exclude_km * 1000.0,
+        )
     fac_dtw = sample_fac_rem(qx, qy)
     base = z_surf - r_wte
     anchors_all = build_anchors(
@@ -666,6 +854,17 @@ def infer_basin(
         float(np.median(dtw)),
         100 * neg,
     )
+    gate_panel = None
+    if oof is not None:
+        gate_panel = leak_gate(
+            basin,
+            scatter(dtw, rows, cols, height, width),
+            transform,
+            oof,
+            args.leak_gate_frac,
+            args.leak_gate_min_wells,
+            args.leak_gate_track_m,
+        )
     tags = {
         "wells": "monitoring_only",
         "bundle": Path(man["graph_dir"]).name,
@@ -710,6 +909,10 @@ def infer_basin(
                 "window": [width, height],
                 "pct_negative_dtw": neg,
                 "mixture_identity_tol_m": MIX_TOL_M,
+                "r_source": args.r_source,
+                "r_exclude_km": args.r_exclude_km,
+                "deep_exclude_km": args.deep_exclude_km,
+                "leak_gate": gate_panel,
                 **tags,
             },
             indent=2,
@@ -751,6 +954,46 @@ def main() -> None:
     ap.add_argument(
         "--overwrite", action="store_true", help="re-run basins with existing output"
     )
+    ap.add_argument(
+        "--r-source",
+        choices=("crossfit", "obs-exclude"),
+        default="crossfit",
+        help="lattice R/deep prior: interpolate the archived leave-fold-out "
+        "crossfit feature values (default; exact at wells, seam-free), or "
+        "leave-radius-out IDW of raw obs (shelved lever; arc seams at the "
+        "exclusion-disk edge)",
+    )
+    ap.add_argument(
+        "--r-exclude-km",
+        type=float,
+        default=3.5,
+        help="--r-source obs-exclude only: leave-radius-out disk for lattice "
+        "R; calibrated to the archived crossfit residual distribution "
+        "(LEAKAGE_AUDIT.md remediation)",
+    )
+    ap.add_argument(
+        "--deep-exclude-km",
+        type=float,
+        default=4.5,
+        help="--r-source obs-exclude only: leave-radius-out disk for the "
+        "deep-pool IDW (sparser pool, larger calibrated radius)",
+    )
+    ap.add_argument(
+        "--leak-gate-frac",
+        type=float,
+        default=0.5,
+        help="fail a basin whose map MAD at training wells beats the archived "
+        "OOF MAD by more than this fraction",
+    )
+    ap.add_argument("--leak-gate-min-wells", type=int, default=20)
+    ap.add_argument(
+        "--leak-gate-track-m",
+        type=float,
+        default=2.0,
+        help="second gate signal: fail only if median |map - oof| at training "
+        "wells also exceeds this (m); a ratio trip that tracks OOF passes as "
+        "pass_ratio_tripped (ensemble-variance false positive)",
+    )
     args = ap.parse_args()
     args.model_dir = Path(args.model_dir)
     args.model_name = args.model_dir.name
@@ -768,6 +1011,7 @@ def main() -> None:
     gdir = Path(man["graph_dir"])
     bman = json.loads((gdir / "graph_manifest.json").read_text())
     qn = well_pool(pd.read_parquet(gdir / "query_nodes.parquet"))
+    oof = well_pool(pd.read_parquet(args.model_dir / "gnn_oof_predictions.parquet"))
     water_xy = None
     if man["flags"].get("water_features"):
         blocks = pd.read_parquet(gdir / WATER_BLOCKS_PARQUET)
@@ -780,6 +1024,8 @@ def main() -> None:
         "xy": qn[["x5070", "y5070"]].to_numpy("float64"),
         "z": qn[man["surface_elev_col"]].to_numpy("float64"),
         "wte": qn[man["obs_wte_col"]].to_numpy("float64"),
+        "r_cross": qn["regional_wte_idw_oof_m"].to_numpy("float64"),
+        "deep_cross": qn["deep_regional_wte_idw_oof_m"].to_numpy("float64"),
         "deep": deep_well_mask(
             qn,
             float(bman["deep_datum"]["quantile"]),
@@ -787,6 +1033,12 @@ def main() -> None:
             int(bman["deep_datum"]["min_per_unit"]),
         ),
     }
+    for c in ("r_cross", "deep_cross"):
+        if not np.isfinite(wells[c]).all():
+            raise SystemExit(
+                f"bundle crossfit column behind wells[{c!r}] has non-finite "
+                "values -- crossfit interpolation needs the full archived field"
+            )
     log.info(
         "wells: %d (bundle %s), deep pool %d", len(qn), gdir.name, wells["deep"].sum()
     )
@@ -830,6 +1082,7 @@ def main() -> None:
             args,
             args.device,
             water_xy=water_xy,
+            oof=oof,
         )
         done += 1
     log.info("inference complete: %d basins run, %d skipped (existing)", done, skipped)

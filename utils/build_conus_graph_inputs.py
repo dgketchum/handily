@@ -617,6 +617,16 @@ def sample_drilled_depth(
     bracket the same local table) never inform its own feature; inference
     lattices pass neither (a lattice cell is not a well) and take the plain
     kNN fast path.
+
+    The RADIUS is the guard; the id clause is a supplement that is currently
+    INERT (2026-07 audit: 0/34,503 training wells share a canonical_id with any
+    pool record -- the same physical well carries different ids in monitoring
+    vs construction datasets -- while 88.5% have a same-site pool record <1 m
+    away under a different id). Never set ``self_exclude_m`` below the
+    monitoring/construction geocoding jitter (~100 m today, with a 100-300 m
+    residual tail): the <1 m self-records would re-enter with dominating IDW
+    weight and the feature would collapse to the well's own construction depth
+    (docs/inference_leakage_prevention.md rule 5).
     """
     pool = pd.read_parquet(points_path)
     pxy = pool[["x5070", "y5070"]].to_numpy("float64")

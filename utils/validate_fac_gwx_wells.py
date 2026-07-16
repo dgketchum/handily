@@ -43,6 +43,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import rasterio
+from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gwx_wells import (  # noqa: E402
@@ -87,10 +88,21 @@ def main() -> None:
     p.add_argument(
         "--holdout-oof",
         default=None,
-        help="OOF predictions parquet (x5070/y5070). Wells co-located with a "
-        "training well (exact 1 m 5070 key) are DROPPED, giving the fair "
-        "spatial-holdout sub-panel for an inference mosaic the model saw part of "
-        "at training. Applied AFTER confinement/source screening.",
+        help="OOF predictions parquet (x5070/y5070). Wells within "
+        "--holdout-buffer-km of ANY training well are DROPPED (spatially "
+        "buffered holdout, docs/inference_leakage_prevention.md rule 3), and "
+        "metrics gain a train_dist stratification. Applied AFTER "
+        "confinement/source screening.",
+    )
+    p.add_argument(
+        "--holdout-buffer-km",
+        type=float,
+        default=3.5,
+        help="exclusion radius around training wells; default = the calibrated "
+        "leave-radius-out support of the inference R (infer_conus_gnn.py). A "
+        "coordinate-only match (the pre-2026-07 behavior) left 'held-out' wells "
+        "inside training-well interpolation support — pass 0 only for that "
+        "diagnostic, never for a fairness claim.",
     )
     p.add_argument("--exclude-sources", default="nwis,ngwmn")
     p.add_argument(
@@ -133,21 +145,18 @@ def main() -> None:
 
     if args.holdout_oof:
         oof = pd.read_parquet(args.holdout_oof, columns=["x5070", "y5070"])
-
-        def _key(x, y):
-            xi = np.round(np.asarray(x, "float64")).astype("int64")
-            yi = np.round(np.asarray(y, "float64")).astype("int64")
-            return np.char.add(np.char.add(xi.astype(str), "_"), yi.astype(str))
-
-        train_keys = set(_key(oof["x5070"].to_numpy(), oof["y5070"].to_numpy()))
-        wk = _key(wells["x5070"].to_numpy(), wells["y5070"].to_numpy())
-        keep = ~pd.Series(wk, index=wells.index).isin(train_keys).to_numpy()
+        tree = cKDTree(oof[["x5070", "y5070"]].to_numpy("float64"))
+        d_train, _ = tree.query(wells[["x5070", "y5070"]].to_numpy("float64"), k=1)
+        wells["dist_train_well_m"] = d_train
+        keep = d_train >= args.holdout_buffer_km * 1000.0
         n0 = len(wells)
         wells = wells.loc[keep].copy()
         log.info(
-            "holdout: dropped %d/%d wells co-located with a training well -> %d held-out",
+            "holdout: dropped %d/%d wells within %.1f km of a training well -> "
+            "%d held-out",
             n0 - len(wells),
             n0,
+            args.holdout_buffer_km,
             len(wells),
         )
 
@@ -227,6 +236,21 @@ def main() -> None:
             lab = f"{lo / 1000:g}-{hi / 1000:g}km" if hi < 1e9 else f"{lo / 1000:g}+km"
             emit("sw_dist", lab, (swd >= lo) & (swd < hi))
 
+    # Distance to the nearest training well (km): residual training influence
+    # must be visible, not averaged away (inference_leakage_prevention.md rule 3).
+    if args.holdout_oof:
+        dtr = cw["dist_train_well_m"].to_numpy()
+        for lo, hi in (
+            (0, 1_000),
+            (1_000, 2_000),
+            (2_000, 3_500),
+            (3_500, 5_000),
+            (5_000, 10_000),
+            (10_000, 1e9),
+        ):
+            lab = f"{lo / 1000:g}-{hi / 1000:g}km" if hi < 1e9 else f"{lo / 1000:g}+km"
+            emit("train_dist", lab, (dtr >= lo) & (dtr < hi))
+
     summary = pd.DataFrame(rows)
     summary_path = out_dir / "score_summary.csv"
     summary.to_csv(summary_path, index=False)
@@ -282,6 +306,7 @@ def main() -> None:
         "setting",
         "dist_stream_m",
         *(["sw_dist_m"] if args.surface_water else []),
+        *(["dist_train_well_m"] if args.holdout_oof else []),
         *[f"pred_{label}" for label in preds],
         *[f"resid_{label}" for label in preds],
         "geometry",
@@ -296,6 +321,7 @@ def main() -> None:
         "included_sources": sorted(include),
         "confinement_classes": list(conf),
         "holdout_oof": args.holdout_oof,
+        "holdout_buffer_km": args.holdout_buffer_km if args.holdout_oof else None,
         "n_window": int(len(wells)),
         "n_common_footprint": int(len(cw)),
         "predictors": preds,
@@ -317,6 +343,8 @@ def main() -> None:
     console_groups = ["all", "setting", "well_class", "fac_dist_stream"]
     if args.surface_water:
         console_groups.append("sw_dist")
+    if args.holdout_oof:
+        console_groups.append("train_dist")
     for gt in console_groups:
         sl = summary[summary["group_type"] == gt]
         for g in sl["group"].unique():
