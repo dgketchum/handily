@@ -35,7 +35,7 @@ from handily.regional_fac import clip_streams_to_fac_watershed
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("reclip_pilot_fac_watershed")
 
-ROOT = Path("/data/ssd2/handily/scalable_fac_rem")
+ROOT = Path("/data/ssd2/handily/huc8")
 BASINS = [
     "nm_rio_grande_abq",
     "nv_upper_humboldt",
