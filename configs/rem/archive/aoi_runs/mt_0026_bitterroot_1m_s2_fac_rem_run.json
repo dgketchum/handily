@@ -1,0 +1,107 @@
+{
+  "command": "python -m handily.rem_fac",
+  "config_path": "/home/dgketchum/code/handily/configs/rem/mt_0026_bitterroot_s2.toml",
+  "diagnostics": {
+    "heads": {
+      "count": 2824,
+      "head_depth_max_m": 59.216654037445096,
+      "head_depth_mean_m": 13.00666560012061,
+      "head_depth_min_m": 0.5007975498201631,
+      "runtime_s": 8.883152277674526
+    },
+    "idw_fill": {
+      "coverage_fraction": 0.7400700193817864,
+      "pixels_filled": 10224091,
+      "pixels_total": 13815032,
+      "runtime_s": 23.702700566034764
+    },
+    "sparse_burn": {
+      "coverage_fraction": 0.22741481887265988,
+      "pixels_burned": 3141743,
+      "pixels_total": 13815032,
+      "runtime_s": 2.9511682861484587
+    },
+    "streams": {
+      "count": 2824
+    },
+    "strips": {
+      "count": 62076,
+      "count_before_filter": 67113,
+      "edge": 1356,
+      "interreach": 42624,
+      "naked": 0,
+      "removed_long_crossing": 5037
+    }
+  },
+  "effective_config": {
+    "paths": {
+      "dem_path": "/data/ssd2/handily/mt/aoi_0026/dem_bounds_1m.tif",
+      "fac_path": null,
+      "naip_path": null,
+      "ndvi_path": "/data/ssd2/handily/mt/bitterroot_pilot/s2/s2_wetness_seed_10m.tif",
+      "out_dir": "/data/ssd2/handily/mt/aoi_0026/rem_1m_s2",
+      "streams_path": "/data/ssd2/handily/mt/aoi_0026/streams_fac.fgb",
+      "support_path": null
+    },
+    "propagation": {
+      "distance_scale_m": 4000.0,
+      "down_distance_scale_m": 20000.0,
+      "elevation_scale_m": 25.0,
+      "strahler_distance_scale": 0.5
+    },
+    "raster": {
+      "base_fac_snap_cells": 0,
+      "base_smooth_stations": 0,
+      "burn_res_m": 5.0,
+      "idw_power": 2.0,
+      "idw_radius_m": 1000.0,
+      "post_smooth_m": 100.0
+    },
+    "sag": {
+      "alpha_d": 0.75,
+      "alpha_z": 1.0,
+      "area_sag_hi_km2": 500.0,
+      "area_sag_lo_km2": 50.0,
+      "gamma": 2.0,
+      "rmax_max_m": 60.0,
+      "rmax_min_m": 2.0
+    },
+    "seed": {
+      "ndvi_mid": 0.48,
+      "ndvi_quantile": 0.9,
+      "ndvi_scale": 0.12,
+      "seed_corridor_m": 0.0,
+      "seed_from_nhd_class": false,
+      "support_override": 1.0
+    },
+    "solver": {
+      "area_pin_km2": null,
+      "below_bed_offset_m": 0.0,
+      "d_min_off_support_m": 0.5,
+      "max_hydraulic_slope": 0.05,
+      "max_iter": 500,
+      "neighbor_length_floor_m": 200.0,
+      "smoothness_weight": 1.0,
+      "strahler_pin_min": null,
+      "support_fraction_threshold": 0.25,
+      "target_weight_base": 2.0,
+      "tol": 0.01,
+      "zero_weight_base": 2.0
+    },
+    "strips": {
+      "coarse_res_m": 20.0,
+      "halo_n": 12,
+      "max_crossing_strip_m": 800.0,
+      "min_hit_dist_m": 5.0,
+      "min_strahler": 0,
+      "naked_fill_m": 0.0,
+      "smooth_sigma_m": 500.0,
+      "station_spacing_m": 50.0,
+      "tangent_step_m": 10.0,
+      "workers": 24,
+      "write_strip_debug": true
+    }
+  },
+  "profile_path": "/home/dgketchum/code/handily/configs/rem/profiles/mt_0009_best.toml",
+  "schema_version": 1
+}

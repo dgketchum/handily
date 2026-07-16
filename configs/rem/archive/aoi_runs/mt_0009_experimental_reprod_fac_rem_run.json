@@ -1,0 +1,92 @@
+{
+  "command": "python -m handily.rem_fac",
+  "config_path": "/home/dgketchum/code/handily/configs/rem/mt_0009_reprod.toml",
+  "diagnostics": {
+    "heads": {
+      "count": 7448,
+      "head_depth_max_m": 59.749512800318826,
+      "head_depth_mean_m": 12.626743199739899,
+      "head_depth_min_m": 0.5,
+      "runtime_s": 57.757518296013586
+    },
+    "idw_fill": {
+      "coverage_fraction": 0.7478098171749605,
+      "pixels_filled": 10419638,
+      "pixels_total": 13933540,
+      "runtime_s": 20.483404633938335
+    },
+    "sparse_burn": {
+      "coverage_fraction": 0.25233896052259513,
+      "pixels_burned": 3515975,
+      "pixels_total": 13933540,
+      "runtime_s": 12.984164837980643
+    },
+    "streams": {
+      "count": 7448
+    },
+    "strips": {
+      "count": 86403,
+      "count_before_filter": 93396,
+      "edge": 5165,
+      "interreach": 62254,
+      "removed_long_crossing": 6993
+    }
+  },
+  "effective_config": {
+    "paths": {
+      "dem_path": "/data/ssd2/handily/mt/aoi_0009/dem_bounds_1m.tif",
+      "naip_path": "/data/ssd2/handily/mt/aoi_0009/naip/ortho_1-1_hc_s_mt001_2021_1.tif",
+      "out_dir": "/data/ssd2/handily/mt/aoi_0009/experimental_reprod",
+      "streams_path": "/data/ssd2/handily/mt/aoi_0009/streams_fac.fgb",
+      "support_path": null
+    },
+    "propagation": {
+      "distance_scale_m": 4000.0,
+      "elevation_scale_m": 25.0,
+      "strahler_distance_scale": 0.5
+    },
+    "raster": {
+      "burn_res_m": 5.0,
+      "idw_power": 2.0,
+      "idw_radius_m": 1000.0,
+      "post_smooth_m": 100.0
+    },
+    "sag": {
+      "alpha_d": 0.75,
+      "alpha_z": 1.0,
+      "gamma": 2.0,
+      "rmax_max_m": 60.0,
+      "rmax_min_m": 2.0
+    },
+    "seed": {
+      "ndvi_mid": 0.2,
+      "ndvi_quantile": 0.9,
+      "ndvi_scale": 0.06,
+      "support_override": 1.0
+    },
+    "solver": {
+      "d_min_off_support_m": 0.5,
+      "max_hydraulic_slope": 0.05,
+      "max_iter": 500,
+      "neighbor_length_floor_m": 200.0,
+      "smoothness_weight": 1.0,
+      "support_fraction_threshold": 0.25,
+      "target_weight_base": 2.0,
+      "tol": 0.01,
+      "zero_weight_base": 2.0
+    },
+    "strips": {
+      "coarse_res_m": 20.0,
+      "halo_n": 12,
+      "max_crossing_strip_m": 800.0,
+      "min_hit_dist_m": 5.0,
+      "min_strahler": 0,
+      "smooth_sigma_m": 500.0,
+      "station_spacing_m": 50.0,
+      "tangent_step_m": 10.0,
+      "workers": 24
+    }
+  },
+  "profile_path": "/home/dgketchum/code/handily/configs/rem/profiles/mt_0009_best.toml",
+  "schema_version": 1
+}
