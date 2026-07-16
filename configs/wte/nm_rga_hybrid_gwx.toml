@@ -1,0 +1,52 @@
+# NM Rio Grande-Albuquerque hybrid WTE, GWX-well re-validation.
+#
+# Same pipeline as nm_rga_hybrid_v0 but fed the large independent GWX well set
+# (14,737 unconfined incl NWIS in the CV training pool) instead of the thin NM
+# label parquet. FAC + regional prior + physical/climate covariates -> DTW via
+# the leak-free nested-CV residual fusion. zell_sanford / fan stay sampled into
+# the table but are blocked from the feature set (DISALLOWED_RESIDUAL_FEATURES):
+# physically-driven prior, not a stack of other WT products. Ma benchmark-only.
+# IDW regional base (dense RBF doesn't scale to ~14k wells). Scored on the
+# independent non-NWIS wells by utils/score_fusion_gwx.py.
+
+[paths]
+root = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque"
+dem = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/dem_10m.tif"
+wells = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/evidence/gwx/gwx_wte_labels.parquet"
+springs = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/evidence/springs/nhd_springs_45800.fgb"
+streams = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/streams_regional.fgb"
+heads = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/rem/nm_rga_v5_arid_full/fac_channel_heads.fgb"
+fac_dtw = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/rem/nm_rga_v5_arid_full/fac_head_depth_rem_10m.tif"
+flow_accumulation = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/flow_accumulation.tif"
+ma_benchmark = "/nas/gwx/wtd_states/wtd_new_mexico.tif"
+out_dir = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/hybrid/gwx/v0"
+
+[climate]
+gridmet_dir = "/mnt/mco_nas1/shared/gridmet"
+
+[covariates]
+zell_sanford_dtw = "/nas/gwx/studies/analysis_ready/zell_sanford_2020_dtw/zell_sanford_2020_dtw_5070.tif"
+fan_dtw = "/nas/gwx/studies/analysis_ready/fan_2013_wtd/fan_2013_wtd_conus_5070_posdown.tif"
+reitz_effective_recharge = "/nas/gwx/studies/analysis_ready/reitz_2017_recharge/reitz_effective_recharge_0013_5070.tif"
+reitz_total_recharge = "/nas/gwx/studies/analysis_ready/reitz_2017_recharge/reitz_total_recharge_0013_5070.tif"
+reitz_et = "/nas/gwx/studies/analysis_ready/reitz_2017_et/reitz_et_0013_5070.tif"
+wolock_bfi = "/nas/gwx/studies/analysis_ready/wolock_2003_bfi/wolock_2003_bfi_5070.tif"
+ssurgo_wtdep = "/nas/gwx/studies/analysis_ready/ssurgo_wtdep/ssurgo_wtdep_min_cm_90m_5070.tif"
+
+[covariate_table]
+out = "/data/ssd2/handily/nm/regional/rio_grande_albuquerque/hybrid/gwx/covariates/wte_points.parquet"
+include_springs = false
+distance_strahler_floors = [1, 5, 7]
+relief_radius_m = 300.0
+block_sizes_m = [10000, 20000, 50000]
+
+[regional_prior]
+methods = ["idw_k64_p2", "idw_k32_p2"]
+group_col = "block_20km"
+residual_model = true
+
+# Reach-state features for the GNN graph bundle (build_wte_graph_inputs.py --config).
+# NHD-HR flowlines give per-reach perenniality/canal class via FCode snap.
+[reach_state]
+nhd_flowlines = "/nas/boundaries/wbd/NHD_H_New_Mexico_State_Shape/Shape/NHDFlowline_filtered.fgb"
+mainstem_strahler = 5
