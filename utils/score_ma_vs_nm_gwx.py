@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import textwrap
 from pathlib import Path
 
 import matplotlib
@@ -49,10 +50,17 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from pyproj import Transformer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gwx_wells import GWX_INDEX, WT_CLASSES, load_window_wells, sample_raster  # noqa: E402
+from gwx_wells import (  # noqa: E402
+    GWX_INDEX,
+    WT_CLASSES,
+    load_window_wells,
+    nearest_distance,
+    sample_raster,
+)
 
 FT_PER_M = 1.0 / 0.3048
 PHREATOPHYTE_FT = 15.0 * FT_PER_M  # 15 m saturated-zone reach -> ~49.2 ft
@@ -60,6 +68,11 @@ ZOOMS = (250.0, 50.0)  # inset obs-depth ceilings (ft)
 # USGS-affiliated sources (Ma/Janssen training) -> "NWIS" side; everything else
 # is the independent non-NWIS NM-state population.
 NWIS_SOURCES = {"nwis", "ngwmn"}
+# Distance-to-nearest-assimilated-monitoring-well bands (km). Same physical well
+# can carry different ids across datasets (geocoding jitter ~100-300 m), so
+# id-based exclusion is insufficient: near-field skill = assimilation, far-field
+# skill = generalization (see notes/BENCHMARK_INTERCOMPARISON.md §2).
+DIST_BANDS_KM = ((0.0, 0.5), (0.5, 2.0), (2.0, 5.0), (5.0, 1e9))
 
 
 def panel_stats(obs: np.ndarray, pred: np.ndarray) -> dict:
@@ -77,6 +90,22 @@ def panel_stats(obs: np.ndarray, pred: np.ndarray) -> dict:
         "rmse_ft": float(np.sqrt(np.mean(r**2))),
         "corr": float(np.corrcoef(o, p)[0, 1]) if o.size > 2 else float("nan"),
     }
+
+
+def distance_band_stats(wells) -> dict:
+    """Per-panel panel_stats banded by distance to nearest monitoring anchor (km)."""
+    out = {}
+    for key in ("nwis", "non_nwis"):
+        sub = wells[wells["panel"] == key]
+        bands = {}
+        for lo, hi in DIST_BANDS_KM:
+            d = sub["dist_to_monitoring_km"].to_numpy()
+            m = (d >= lo) & (d < hi)
+            b = sub[m]
+            label = f"{lo:g}-{hi:g}km" if hi < 1e9 else f"{lo:g}+km"
+            bands[label] = panel_stats(b["obs_ft"].to_numpy(), b["pred_ft"].to_numpy())
+        out[key] = bands
+    return out
 
 
 # Per-source point styling for the non-NWIS panel. nm_ose dominates (~33k wells)
@@ -111,11 +140,15 @@ def src_name(code: str) -> str:
     return SOURCE_NAMES.get(code, code)
 
 
-def _scatter(ax, sub, lim, title, *, point_size, color_by_source):
+def _scatter(
+    ax, sub, lim, title, *, point_size, color_by_source, phreatophyte=PHREATOPHYTE_FT
+):
     """Scatter ``sub`` (obs_ft/pred_ft/source) with 1:1 + phreatophyte guides.
 
     With ``color_by_source`` the dominant source is drawn first (bottom layer)
-    and sparse sources on top, each carrying a legend label.
+    and sparse sources on top, each carrying a legend label. ``phreatophyte``
+    positions the guide lines in axis units (default feet; pass 15.0 for
+    meter-axis callers — the columns/lim are unit-agnostic).
     """
     if color_by_source:
         for src in sub["source"].value_counts().index:  # dominant first -> bottom
@@ -140,9 +173,9 @@ def _scatter(ax, sub, lim, title, *, point_size, color_by_source):
             edgecolors="none",
         )
     ax.plot([0, lim], [0, lim], color="black", lw=1.2, zorder=6, label="1:1")
-    ax.axvline(PHREATOPHYTE_FT, color="#c05621", lw=1.0, ls="--", zorder=5)
+    ax.axvline(phreatophyte, color="#c05621", lw=1.0, ls="--", zorder=5)
     ax.axhline(
-        PHREATOPHYTE_FT,
+        phreatophyte,
         color="#c05621",
         lw=1.0,
         ls="--",
@@ -157,11 +190,13 @@ def _scatter(ax, sub, lim, title, *, point_size, color_by_source):
 
 
 def _stats_text(st: dict, source_note: str) -> str:
+    # Wrap the note so the box stays narrow and clear of the upper-right inset.
+    note = textwrap.fill(source_note, width=42)
     return (
         f"n = {st['n']:,}\n"
         f"bias = {st['bias_ft']:.1f} ft   RMSE = {st['rmse_ft']:.1f} ft\n"
         f"r = {st['corr']:.2f}\n"
-        f"({source_note})"
+        f"({note})"
     )
 
 
@@ -226,12 +261,15 @@ def draw_panel(ax, sub, title, source_note, main_lim, color_by_source, product_l
     return {"all": st_all, "zooms": zoom_stats, "lim_ft": lim}
 
 
-def build_figure(wells, non_nwis_note, out_path, max_obs_ft, suptitle, product_label):
+def build_figure(
+    wells, non_nwis_note, out_path, max_obs_ft, suptitle, product_label, nwis_note=None
+):
     """Two-panel NWIS / non-NWIS figure for `wells`; returns its report dict."""
+    nwis_note = nwis_note or f"USGS NWIS / NGWMN — {product_label} training-adjacent"
     panels = {
         "nwis": (
             f"{product_label} WTD vs USGS NWIS wells (NM, unconfined)",
-            f"USGS NWIS / NGWMN — {product_label} training-adjacent",
+            nwis_note,
         ),
         "non_nwis": (
             f"{product_label} WTD vs non-NWIS NM-state wells (unconfined)",
@@ -291,6 +329,30 @@ def main() -> None:
         default="tx_twdb",
         help="Comma-list of sources to drop entirely (default: tx_twdb).",
     )
+    ap.add_argument(
+        "--drop-well-class",
+        default="",
+        help="Comma-list of well_class values to drop (default: none). "
+        "'monitoring' -> out-of-sample for handily across every panel.",
+    )
+    ap.add_argument(
+        "--require-finite",
+        action="append",
+        default=None,
+        help="Raster path(s) that must ALL be finite at a well (repeatable or "
+        "comma-list). Enforces an identical well set across products.",
+    )
+    ap.add_argument(
+        "--monitoring-anchors",
+        default=None,
+        help="Parquet of assimilated monitoring wells (x5070/y5070, "
+        "is_water_pseudo). Adds dist_to_monitoring_km + distance-band panels.",
+    )
+    ap.add_argument(
+        "--nwis-note",
+        default=None,
+        help="Override the NWIS-panel annotation (exposure caveat per product).",
+    )
     # NM lon/lat extent (Ma raster footprint); Ma-finite filter does the real clip.
     ap.add_argument("--lon-min", type=float, default=-110.2)
     ap.add_argument("--lon-max", type=float, default=-102.4)
@@ -310,10 +372,36 @@ def main() -> None:
 
     # All sources, unconfined+marginal, dtw present, within the NM bbox.
     wells = load_window_wells(args.gwx_index, bbox, WT_CLASSES, set(), set())
+
+    # --drop-well-class: identical filter across products keeps the common
+    # footprint. Dropping 'monitoring' makes every panel out-of-sample for
+    # handily (which assimilates monitoring-class wells only).
+    drop_classes = {c for c in args.drop_well_class.split(",") if c}
+    well_class_drop_counts = {
+        c: int((wells["well_class"] == c).sum()) for c in sorted(drop_classes)
+    }
+    if drop_classes:
+        wells = wells[~wells["well_class"].isin(drop_classes)].copy()
+
     # The Ma NM tile is state-clipped, so a finite sample defines "in NM"; the
     # continental Janssen raster has no such clip, hence the separate mask.
     nm = sample_raster(args.nm_mask, wells["longitude"], wells["latitude"])
     wells = wells[np.isfinite(nm)].copy()
+
+    # --require-finite: keep only wells finite in EVERY listed raster so the well
+    # set is identical across products (common footprint across all three).
+    require_finite = []
+    for item in args.require_finite or []:
+        require_finite.extend(p for p in item.split(",") if p)
+    require_finite_n = {"before": int(len(wells))}
+    if require_finite:
+        finite_all = np.ones(len(wells), dtype=bool)
+        for rp in require_finite:
+            v = sample_raster(rp, wells["longitude"], wells["latitude"])
+            finite_all &= np.isfinite(v)
+        wells = wells[finite_all].copy()
+    require_finite_n["after"] = int(len(wells))
+
     wells["pred_dtw_m"] = sample_raster(
         args.pred, wells["longitude"], wells["latitude"]
     )
@@ -327,6 +415,18 @@ def main() -> None:
         wells = wells[~wells["source"].isin(drop)].copy()
     wells["panel"] = np.where(wells["source"].isin(NWIS_SOURCES), "nwis", "non_nwis")
 
+    # --monitoring-anchors: distance to nearest assimilated monitoring well (km).
+    # Drop the ~35k water-stage pseudo rows (is_water_pseudo) -> real wells only.
+    n_monitoring_anchors = 0
+    if args.monitoring_anchors:
+        adf = pd.read_parquet(
+            args.monitoring_anchors, columns=["x5070", "y5070", "is_water_pseudo"]
+        )
+        adf = adf[~adf["is_water_pseudo"].astype(bool)]
+        n_monitoring_anchors = int(len(adf))
+        anchor_xy = np.c_[adf["x5070"].to_numpy(), adf["y5070"].to_numpy()]
+        wells["dist_to_monitoring_km"] = nearest_distance(wells, anchor_xy) / 1000.0
+
     base = (
         "Shallow Groundwater Subsidies — New Mexico "
         f"({args.product_label} WTD vs GWX unconfined wells, "
@@ -336,20 +436,33 @@ def main() -> None:
     # (left NWIS panel is identical in both).
     fig_with = out_dir / f"{args.tag}_vs_nm_gwx_nwis_split_with_nmose.png"
     fig_without = out_dir / f"{args.tag}_vs_nm_gwx_nwis_split_without_nmose.png"
+    population = (
+        "GWX national v2 classifier, confinement_class in "
+        "{unconfined, unconfined_marginal}; nm_ose IS counted unconfined "
+        "(~33.5k of the non-NWIS panel). DISTINCT from the hand-assigned "
+        "consolidated layer (build_nm_validation_layer.py), which holds OSE "
+        "out as 'unknown' screening (~839-well headline). 'non-NWIS' here is "
+        "not proven-independent of Ma."
+    )
+    if drop_classes:
+        population += (
+            f" well_class dropped: {sorted(drop_classes)} "
+            f"(counts {well_class_drop_counts}) -> out-of-sample for handily "
+            f"(monitoring-trained) across every panel."
+        )
     report = {
         "product_label": args.product_label,
-        "population": (
-            "GWX national v2 classifier, confinement_class in "
-            "{unconfined, unconfined_marginal}; nm_ose IS counted unconfined "
-            "(~33.5k of the non-NWIS panel). DISTINCT from the hand-assigned "
-            "consolidated layer (build_nm_validation_layer.py), which holds OSE "
-            "out as 'unknown' screening (~839-well headline). 'non-NWIS' here is "
-            "not proven-independent of Ma."
-        ),
+        "population": population,
         "pred_raster": args.pred,
         "nm_mask_raster": args.nm_mask,
         "gwx_index": args.gwx_index,
         "dropped_sources": sorted(drop),
+        "dropped_well_classes": sorted(drop_classes),
+        "well_class_drop_counts": well_class_drop_counts,
+        "require_finite_rasters": require_finite,
+        "require_finite_n": require_finite_n,
+        "monitoring_anchors": args.monitoring_anchors,
+        "n_monitoring_anchors": n_monitoring_anchors,
         "variants": {
             "with_nmose": build_figure(
                 wells,
@@ -358,6 +471,7 @@ def main() -> None:
                 args.max_obs_ft,
                 base + ", with NM OSE)",
                 args.product_label,
+                nwis_note=args.nwis_note,
             ),
             "without_nmose": build_figure(
                 wells[wells["source"] != "nm_ose"],
@@ -366,13 +480,18 @@ def main() -> None:
                 args.max_obs_ft,
                 base + ", no NM OSE)",
                 args.product_label,
+                nwis_note=args.nwis_note,
             ),
         },
     }
+    if args.monitoring_anchors:
+        report["distance_bands_km"] = [list(b) for b in DIST_BANDS_KM]
+        report["distance_band_stats"] = distance_band_stats(wells)
 
     keep = [
         "source",
         "panel",
+        "canonical_id",
         "confinement_class",
         "confinement_source",
         "well_class",
@@ -384,8 +503,10 @@ def main() -> None:
         "resid_ft",
         "longitude",
         "latitude",
-        "geometry",
     ]
+    if "dist_to_monitoring_km" in wells.columns:
+        keep.append("dist_to_monitoring_km")
+    keep.append("geometry")
     wells[keep].to_file(
         out_dir / f"{args.tag}_vs_nm_gwx_wells.fgb", driver="FlatGeobuf"
     )

@@ -75,6 +75,7 @@ def load_window_wells(
         "well_use",
         "obs_count",
         "is_active",
+        "canonical_id",
     ]
     df = pd.read_parquet(index_path, columns=cols)
     tr = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
@@ -145,6 +146,19 @@ def surface_water_distance(
         )
     qxy = np.c_[wells["x5070"].to_numpy(), wells["y5070"].to_numpy()]
     return cKDTree(np.c_[xs, ys]).query(qxy)[0]
+
+
+def nearest_distance(wells: gpd.GeoDataFrame, anchor_xy: np.ndarray) -> np.ndarray:
+    """k-NN distance (m) from each well to the nearest anchor point.
+
+    ``anchor_xy`` is an (N, 2) array of EPSG:5070 coordinates. Wells must carry
+    x5070/y5070 (set by ``load_window_wells``). Empty anchors -> all-NaN.
+    """
+    anchor_xy = np.asarray(anchor_xy, dtype="float64")
+    if anchor_xy.size == 0:
+        return np.full(len(wells), np.nan)
+    qxy = np.c_[wells["x5070"].to_numpy(), wells["y5070"].to_numpy()]
+    return cKDTree(anchor_xy).query(qxy)[0]
 
 
 SHALLOW_THRESHOLDS = (2.0, 5.0, 10.0)
