@@ -1,0 +1,13 @@
+# FAC REM - MT AOI 0009, NAIP seed on CURRENT code (clean seed-only A/B baseline
+# for mt_0009_s2.toml). Identical pipeline to the S2 run; only the seed differs
+# (single-date NAIP NDVI via naip_path vs the S2 wetness index). The on-disk
+# experimental_full/reprod were built with older head-solve code (no down-prop),
+# so they confound seed with code; this isolates the seed. NOT a deliverable.
+
+profile = "profiles/mt_0009_best.toml"
+
+[paths]
+dem_path = "/data/ssd2/handily/mt/aoi_0009/dem_bounds_1m.tif"
+streams_path = "/data/ssd2/handily/mt/aoi_0009/streams_fac.fgb"
+out_dir = "/data/ssd2/handily/mt/aoi_0009/experimental_naip_v2"
+naip_path = "/data/ssd2/handily/mt/aoi_0009/naip/ortho_1-1_hc_s_mt001_2021_1.tif"

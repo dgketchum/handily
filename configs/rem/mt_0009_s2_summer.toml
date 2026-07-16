@@ -1,0 +1,18 @@
+# FAC REM - MT AOI 0009, S2 SUMMER-NDVI seed (clean A/B control for
+# mt_0009_s2.toml). Identical pipeline and sigmoid; only the seed raster differs:
+# summer NDVI alone (full-coverage 10 m, minmax to [0,1]) vs the spring-NDVI +
+# fall-NDWI wetness index. Isolates the seasonal evidence choice from coverage
+# and code (both seeds are full-coverage S2 on current code). NOT a deliverable.
+
+profile = "profiles/mt_0009_best.toml"
+
+[paths]
+dem_path = "/data/ssd2/handily/mt/aoi_0009/dem_bounds_1m.tif"
+streams_path = "/data/ssd2/handily/mt/aoi_0009/streams_fac.fgb"
+out_dir = "/data/ssd2/handily/mt/aoi_0009/experimental_s2_summer"
+ndvi_path = "/data/ssd2/handily/mt/aoi_0009/s2_summer_ndvi_seed_10m.tif"
+
+[seed]
+ndvi_mid = 0.48
+ndvi_scale = 0.12
+ndvi_quantile = 0.9

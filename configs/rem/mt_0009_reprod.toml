@@ -1,0 +1,7 @@
+profile = "profiles/mt_0009_best.toml"
+
+[paths]
+dem_path = "/data/ssd2/handily/mt/aoi_0009/dem_bounds_1m.tif"
+streams_path = "/data/ssd2/handily/mt/aoi_0009/streams_fac.fgb"
+out_dir = "/data/ssd2/handily/mt/aoi_0009/experimental_reprod"
+naip_path = "/data/ssd2/handily/mt/aoi_0009/naip/ortho_1-1_hc_s_mt001_2021_1.tif"

@@ -1,0 +1,23 @@
+# FAC REM - MT AOI 0009, S2 seasonal wetness seed
+#
+# Replaces the single-date NAIP NDVI seed (mt_0009.toml) with a combined
+# Sentinel-2 wetness index (spring NDVI + fall NDWI; built by
+# utils/build_s2_wetness_seed.py). Single-date summer NDVI cannot separate the
+# irrigated Big Hole valley floor from the forested uplands (both read ~0.77),
+# leaving the head solve surficial (everything seeded wet, uplands pinned at the
+# 0.5 m floor). The seasonal index separates them (rank-AUC 0.89), detaching the
+# dry upland draws while keeping the valley wet.
+
+profile = "profiles/mt_0009_best.toml"
+
+[paths]
+dem_path = "/data/ssd2/handily/mt/aoi_0009/dem_bounds_1m.tif"
+streams_path = "/data/ssd2/handily/mt/aoi_0009/streams_fac.fgb"
+out_dir = "/data/ssd2/handily/mt/aoi_0009/experimental_s2"
+ndvi_path = "/data/ssd2/handily/mt/aoi_0009/s2_wetness_seed_10m.tif"
+
+[seed]
+# Sigmoid recentered for the [0,1] combined wetness index (not raw NDVI).
+ndvi_mid = 0.48
+ndvi_scale = 0.12
+ndvi_quantile = 0.9
