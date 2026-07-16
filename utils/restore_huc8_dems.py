@@ -23,6 +23,8 @@ import sys
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
+import rasterio
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from handily import regional_fac  # noqa: E402
@@ -68,6 +70,23 @@ def restore_one(basin: str, halo_m: float, tiles_dir: Path) -> Path:
         target_crs_epsg=5070,
         buffer_m=halo_m,
     )
+    # Guard against a silent all-nodata restore (tiles downloaded but the mosaic
+    # landed nothing over the basin -- e.g. a transient fetch that returned empty
+    # tiles). Such a DEM renders every 10 m cell to nodata (render masks on a
+    # finite dem10) yet would otherwise be reported as a successful restore and
+    # block re-restore. Fail loudly and drop the bad file instead.
+    with rasterio.open(dem_path) as src:
+        oh, ow = max(1, src.height // 20), max(1, src.width // 20)
+        a = src.read(1, out_shape=(oh, ow))
+        nd = src.nodata
+        valid = np.isfinite(a) & ((a != nd) if nd is not None else True)
+    frac = float(valid.mean())
+    if frac < 0.001:
+        dem_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"restored DEM is {100 * frac:.3f}% valid (all-nodata); "
+            f"tiles={len(tiles)} bbox={bbox_wgs84}"
+        )
     return dem_path
 
 
