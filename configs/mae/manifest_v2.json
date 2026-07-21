@@ -1,0 +1,221 @@
+{
+  "dem": "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif",
+  "channels": [
+    {
+      "name": "dem_rel",
+      "path": "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif",
+      "transform": "dem_rel"
+    },
+    {
+      "name": "slope_deg",
+      "path": "/data/ssd2/handily/conus/covariates/slope_deg.tif"
+    },
+    {
+      "name": "tri_100m",
+      "path": "/data/ssd2/handily/conus/covariates/tri_100m.tif"
+    },
+    {
+      "name": "twi_100m",
+      "path": "/nas/handily/covariates/terrain/twi.tif"
+    },
+    {
+      "name": "twi_500m",
+      "path": "/nas/handily/covariates/terrain/twi_500m.tif"
+    },
+    {
+      "name": "twi_2km",
+      "path": "/nas/handily/covariates/terrain/twi_2km.tif"
+    },
+    {
+      "name": "twi_5km",
+      "path": "/nas/handily/covariates/terrain/twi_5km.tif"
+    },
+    {
+      "name": "twi_10km",
+      "path": "/nas/handily/covariates/terrain/twi_10km.tif"
+    },
+    {
+      "name": "tpi_500m",
+      "path": "/nas/handily/covariates/terrain/tpi_500m.tif"
+    },
+    {
+      "name": "tpi_2km",
+      "path": "/nas/handily/covariates/terrain/tpi_2km.tif"
+    },
+    {
+      "name": "tpi_5km",
+      "path": "/nas/handily/covariates/terrain/tpi_5km.tif"
+    },
+    {
+      "name": "tpi_10km",
+      "path": "/nas/handily/covariates/terrain/tpi_10km.tif"
+    },
+    {
+      "name": "haf_500m",
+      "path": "/nas/handily/covariates/terrain/haf_500m.tif"
+    },
+    {
+      "name": "haf_2km",
+      "path": "/nas/handily/covariates/terrain/haf_2km.tif"
+    },
+    {
+      "name": "haf_5km",
+      "path": "/nas/handily/covariates/terrain/haf_5km.tif"
+    },
+    {
+      "name": "haf_10km",
+      "path": "/nas/handily/covariates/terrain/haf_10km.tif"
+    },
+    {
+      "name": "plan_curvature",
+      "path": "/nas/handily/covariates/terrain/plan_curvature.tif"
+    },
+    {
+      "name": "profile_curvature",
+      "path": "/nas/handily/covariates/terrain/profile_curvature.tif"
+    },
+    {
+      "name": "eastness",
+      "path": "/nas/handily/covariates/terrain/eastness.tif"
+    },
+    {
+      "name": "northness",
+      "path": "/nas/handily/covariates/terrain/northness.tif"
+    },
+    {
+      "name": "dist_to_stream_m",
+      "path": "/data/ssd2/handily/conus/covariates/dist_to_stream_m.tif"
+    },
+    {
+      "name": "bfi",
+      "path": "/nas/handily/covariates/hydrography/bfi.tif"
+    },
+    {
+      "name": "drainage_density_2km",
+      "path": "/nas/handily/covariates/hydrography/drainage_density_2km.tif"
+    },
+    {
+      "name": "perm_logk_m2",
+      "path": "/nas/handily/covariates/geology/permeability_logk_x100.tif",
+      "transform": 0.01
+    },
+    {
+      "name": "porosity_frac",
+      "path": "/nas/handily/covariates/geology/porosity_x100.tif",
+      "transform": 0.01
+    },
+    {
+      "name": "sediment_thickness_avg_m",
+      "path": "/nas/handily/covariates/geology/sediment_thickness_avg_m.tif"
+    },
+    {
+      "name": "sediment_thickness_basinfill_m",
+      "path": "/nas/handily/covariates/geology/sediment_thickness_basinfill_m.tif"
+    },
+    {
+      "name": "depth_to_bedrock_abs_m",
+      "path": "/nas/handily/covariates/geology/depth_to_bedrock_abs_cm.tif",
+      "transform": 0.01
+    },
+    {
+      "name": "gw_withdrawal_density",
+      "path": "/nas/handily/covariates/anthropogenic/gw_withdrawal_density.tif"
+    },
+    {
+      "name": "etrm_recharge_mm_yr",
+      "path": "/nas/handily/covariates/mae_v2_100m/etrm_recharge_mm_yr.tif"
+    },
+    {
+      "name": "etrm_eta_mm_yr",
+      "path": "/nas/handily/covariates/mae_v2_100m/etrm_eta_mm_yr.tif"
+    },
+    {
+      "name": "aridity_index",
+      "path": "/nas/handily/covariates/mae_v2_100m/aridity_index.tif"
+    },
+    {
+      "name": "prism_ppt_mm",
+      "path": "/nas/handily/covariates/mae_v2_100m/prism_ppt_mm.tif"
+    },
+    {
+      "name": "prism_tmean_c",
+      "path": "/nas/handily/covariates/mae_v2_100m/prism_tmean_c.tif"
+    },
+    {
+      "name": "prism_tmax_c",
+      "path": "/nas/handily/covariates/mae_v2_100m/prism_tmax_c.tif"
+    },
+    {
+      "name": "prism_tmin_c",
+      "path": "/nas/handily/covariates/mae_v2_100m/prism_tmin_c.tif"
+    },
+    {
+      "name": "prism_tdmean_c",
+      "path": "/nas/handily/covariates/mae_v2_100m/prism_tdmean_c.tif"
+    },
+    {
+      "name": "prism_vpdmin_hpa",
+      "path": "/nas/handily/covariates/mae_v2_100m/prism_vpdmin_hpa.tif"
+    },
+    {
+      "name": "prism_vpdmax_hpa",
+      "path": "/nas/handily/covariates/mae_v2_100m/prism_vpdmax_hpa.tif"
+    },
+    {
+      "name": "prism_soltotal_mj",
+      "path": "/nas/handily/covariates/mae_v2_100m/prism_soltotal_mj.tif"
+    },
+    {
+      "name": "prism_solclear_mj",
+      "path": "/nas/handily/covariates/mae_v2_100m/prism_solclear_mj.tif"
+    },
+    {
+      "name": "prism_soltrans",
+      "path": "/nas/handily/covariates/mae_v2_100m/prism_soltrans.tif"
+    },
+    {
+      "name": "prism_solslope_mj",
+      "path": "/nas/handily/covariates/mae_v2_100m/prism_solslope_mj.tif"
+    },
+    {
+      "name": "lst_ndvi_p0",
+      "path": "/nas/handily/covariates/mae_v2_100m/lst_ndvi_p0.tif"
+    },
+    {
+      "name": "lst_ndvi_p1",
+      "path": "/nas/handily/covariates/mae_v2_100m/lst_ndvi_p1.tif"
+    },
+    {
+      "name": "lst_ndvi_p2",
+      "path": "/nas/handily/covariates/mae_v2_100m/lst_ndvi_p2.tif"
+    },
+    {
+      "name": "lst_ndvi_p3",
+      "path": "/nas/handily/covariates/mae_v2_100m/lst_ndvi_p3.tif"
+    },
+    {
+      "name": "lst_ndvi_p4",
+      "path": "/nas/handily/covariates/mae_v2_100m/lst_ndvi_p4.tif"
+    },
+    {
+      "name": "lst_ndvi_amp",
+      "path": "/nas/handily/covariates/mae_v2_100m/lst_ndvi_amp.tif"
+    },
+    {
+      "name": "lst_ndmi_p2",
+      "path": "/nas/handily/covariates/mae_v2_100m/lst_ndmi_p2.tif"
+    },
+    {
+      "name": "lst_mndwi_p2",
+      "path": "/nas/handily/covariates/mae_v2_100m/lst_mndwi_p2.tif"
+    },
+    {
+      "name": "lst_b10_p2_k",
+      "path": "/nas/handily/covariates/mae_v2_100m/lst_b10_p2_k.tif"
+    },
+    {
+      "name": "lst_b10_amp_k",
+      "path": "/nas/handily/covariates/mae_v2_100m/lst_b10_amp_k.tif"
+    }
+  ]
+}
