@@ -285,6 +285,7 @@ QUERY_DIAGNOSTIC_COLS = [
     "cv_unit",
     "block_40km",
     "is_water_pseudo",  # water-stage pseudo-row flag (False for every real well)
+    "is_shore_pseudo",  # E6 land-side shoreline ring pseudo-row flag (False otherwise)
 ]
 # GWX observation metadata carried on query nodes (diagnostics, NEVER features):
 # period-of-record, observation count, and construction depths. These feed the
@@ -487,6 +488,35 @@ def assign_folds(unit: np.ndarray, folds: int, seed: int) -> np.ndarray:
     rng = np.random.RandomState(seed)
     fold_of = {h: i % folds for i, h in enumerate(rng.permutation(uh))}
     return np.array([fold_of[h] for h in unit], dtype="int64")
+
+
+def pin_folds(unit: np.ndarray, fold_map: dict, folds: int) -> tuple[np.ndarray, int]:
+    """Fold per whole spatial unit pinned to an EXTERNAL (unit -> fold) map, so a
+    superset build reproduces a prior build's exact fold partition instead of
+    re-permuting it (``assign_folds`` reshuffles when the unit set grows).
+
+    Every unit present in ``fold_map`` inherits its mapped fold (whole-unit, so
+    block integrity is preserved and pre-existing wells keep their fold verbatim).
+    A unit ABSENT from the map (a genuinely new spatial block) gets a deterministic
+    stable-hash fold (sha1 of the unit string, salt-free across processes), keeping
+    the whole unit in one fold. Returns (folds, n_new_units) — the count of units
+    not found in the map, logged/reported by the caller.
+    """
+    import hashlib
+
+    n_new = 0
+    out = np.empty(len(unit), dtype="int64")
+    seen_new: set = set()
+    for i, u in enumerate(unit):
+        if u in fold_map:
+            out[i] = fold_map[u]
+        else:
+            h = int(hashlib.sha1(str(u).encode()).hexdigest(), 16) % folds
+            out[i] = h
+            if u not in seen_new:
+                seen_new.add(u)
+                n_new += 1
+    return out, n_new
 
 
 def spatial_block_ids(x: np.ndarray, y: np.ndarray, block_km: float) -> np.ndarray:
@@ -2059,6 +2089,39 @@ def build_water_rows(
     return df
 
 
+def build_shore_rows(points_path: str) -> pd.DataFrame:
+    """E6 land-side shoreline ring pseudo-observation rows.
+
+    Mirror of build_water_rows but for LAND cells just outside perennial natural
+    lakes (built + dosed by build_shoreline_points.py: HUC8, within-100km-of-well,
+    per-HUC8 cap 50 already applied). mean_dtw = 0 (the water table meets the ground
+    at the shore); z_surf/wte_obs are filled by the main flow's shared DEM sampling
+    like any query row. Flagged is_shore_pseudo / well_class=shore_pseudo.
+    """
+    pts = pd.read_parquet(points_path)
+    for c in ("x5070", "y5070", "huc8"):
+        if c not in pts.columns:
+            raise SystemExit(f"--shoreline-points missing column {c}: {points_path}")
+    df = pd.DataFrame(
+        {
+            "x5070": pts["x5070"].to_numpy("float64"),
+            "y5070": pts["y5070"].to_numpy("float64"),
+            "huc8": pts["huc8"].astype(str).to_numpy(object),
+        }
+    )
+    df["canonical_id"] = [f"shore_{i:07d}" for i in range(len(df))]
+    df["source"] = "SHORELINE_RING"
+    df["well_class"] = "shore_pseudo"
+    df["is_nwis"] = False
+    df["is_water_pseudo"] = False
+    df["is_shore_pseudo"] = True
+    df["huc4"] = df["huc8"].str[:4]
+    df["huc2"] = df["huc8"].str[:2]
+    df["mean_dtw"] = 0.0  # the free surface: DTW = 0 at the shoreline
+    df["hand_m"] = np.nan
+    return df
+
+
 def build_anchor_query_edges(
     axy: np.ndarray, qxy: np.ndarray, knn: int, max_dist_m: float
 ) -> pd.DataFrame:
@@ -2256,6 +2319,15 @@ def main() -> None:
     )
     ap.add_argument("--block-size-m", type=float, default=40000.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--fold-map",
+        default=None,
+        help="parquet with columns (cv_unit, cv_fold) pinning each spatial unit to "
+        "a fixed fold, reproducing a prior build's partition instead of re-permuting "
+        "it. Units present inherit their mapped fold verbatim (pre-existing wells keep "
+        "their exact fold); units absent get a deterministic stable-hash fold. Used to "
+        "keep a superset bundle (e.g. + shoreline rows) fold-comparable to its parent.",
+    )
     # Deep regional aquifer datum (built from the deepest-quartile wells only).
     ap.add_argument("--deep-quantile", type=float, default=0.75)
     ap.add_argument("--deep-unit", choices=["huc6", "huc4"], default="huc6")
@@ -2359,6 +2431,16 @@ def main() -> None:
         help="drop water blocks farther than this from every well before the FAC "
         "probe (keeps the registry sampling cheap; open water with no wells in "
         "reach carries no learnable context anyway)",
+    )
+    ap.add_argument(
+        "--shoreline-points",
+        default=None,
+        help="(wte_residual only) E6 land-side shoreline ring pseudo-label points "
+        "(parquet from build_shoreline_points.py: x5070/y5070/huc8/z_surf, dose already "
+        "applied). Injected as query rows EXACTLY like --water-pseudo-labels but flagged "
+        "is_shore_pseudo / well_class=shore_pseudo: full query-feature build + edges, "
+        "mean_dtw=0 (water table meets ground at the shore), masked out of every "
+        "cross-fit prior pool (labels-never-priors), never scored. Off = no-op.",
     )
     ap.add_argument(
         "--fac-rem-feature",
@@ -2729,8 +2811,10 @@ def main() -> None:
     # lateral edges, and anchors treat them uniformly. They are kept OUT of every
     # cross-fit prior pool below (labels, never prior sources).
     wells["is_water_pseudo"] = False
+    wells["is_shore_pseudo"] = False
     water_blocks = None
     water_meta = None
+    shore_meta = None
     if args.water_features or args.water_pseudo_labels:
         if args.target != TARGET_WTE_RESIDUAL:
             raise SystemExit(
@@ -2794,6 +2878,33 @@ def main() -> None:
         water_meta["max_well_dist_km"] = args.water_max_well_dist_km
         wells = pd.concat([wells, wrows], ignore_index=True)
 
+    # --- E6 land-side shoreline ring pseudo-rows (labels-never-priors) ---------
+    # Same injection point + discipline as water pseudo-rows: joined AFTER the
+    # population/footprint filters, BEFORE folds/priors/features/edges, so every
+    # downstream stage treats them uniformly. Dose (HUC8/within-100km/cap 50) is
+    # applied upstream in build_shoreline_points.py.
+    if args.shoreline_points:
+        if args.target != TARGET_WTE_RESIDUAL:
+            raise SystemExit("--shoreline-points is wte_residual-only")
+        srows = build_shore_rows(args.shoreline_points)
+        log.info(
+            "shoreline rows: %d pseudo-observations (%d HUC8s) from %s",
+            len(srows),
+            int(srows["huc8"].nunique()),
+            args.shoreline_points,
+        )
+        shore_meta = {
+            "points_parquet": args.shoreline_points,
+            "n_pseudo_rows": int(len(srows)),
+            "leakage_note": "land-side shoreline ring cells (perennial LakePond only, "
+            "per-segment GSW>=90, land occ<50); mean_dtw=0, masked out of every "
+            "cross-fit prior pool + excluded from trainer/scorer metrics; never scored",
+        }
+        wells = pd.concat([wells, srows], ignore_index=True)
+    # Normalize the pseudo flags: a concat that unioned columns can leave the flag
+    # NaN on rows from a frame that predated it (e.g. water rows w.r.t. is_shore_pseudo).
+    wells["is_shore_pseudo"] = wells["is_shore_pseudo"].fillna(False).astype(bool)
+
     wells["query_node_idx"] = np.arange(len(wells), dtype="int64")
 
     # CV folds (HUC12-blocked by default) + within-train val blocks (40 km).
@@ -2806,7 +2917,21 @@ def main() -> None:
     else:  # huc4 (legacy)
         cv_unit = wells["huc4"].to_numpy().astype(str)
     wells["cv_unit"] = cv_unit
-    wells["cv_fold"] = assign_folds(cv_unit, args.folds, args.seed)
+    if args.fold_map:
+        fm = pd.read_parquet(args.fold_map)
+        fold_map = dict(
+            zip(fm["cv_unit"].astype(str), fm["cv_fold"].astype("int64"), strict=True)
+        )
+        folds_arr, n_new_units = pin_folds(cv_unit.astype(str), fold_map, args.folds)
+        wells["cv_fold"] = folds_arr
+        log.info(
+            "fold-map pin: %d units total, %d NEW units (not in %s) -> stable-hash fold",
+            int(pd.unique(cv_unit).size),
+            n_new_units,
+            args.fold_map,
+        )
+    else:
+        wells["cv_fold"] = assign_folds(cv_unit, args.folds, args.seed)
     bx = (wx // args.block_size_m).astype("int64")
     by = (wy // args.block_size_m).astype("int64")
     wells["block_40km"] = np.char.add(np.char.add(bx.astype(str), "_"), by.astype(str))
@@ -2820,9 +2945,9 @@ def main() -> None:
     )
 
     # Leak-free regional IDW-DTW prior, cross-fit on the GNN's HUC4 folds.
-    # real_pool masks water pseudo-rows out of EVERY prior's neighbor set (labels,
-    # never prior sources); priors still predict AT the water rows.
-    real_pool = (~wells["is_water_pseudo"]).to_numpy(bool)
+    # real_pool masks water AND shore pseudo-rows out of EVERY prior's neighbor set
+    # (labels, never prior sources); priors still predict AT the pseudo rows.
+    real_pool = (~wells["is_water_pseudo"] & ~wells["is_shore_pseudo"]).to_numpy(bool)
     xy = wells[["x5070", "y5070"]].to_numpy("float64")
     dtw = wells["mean_dtw"].to_numpy("float64")
     fold = wells["cv_fold"].to_numpy()
@@ -4352,6 +4477,7 @@ def main() -> None:
         "zell_sanford": zell_sanford_block,
         "dupuit_hang": dupuit_hang_block,
         "water": water_meta,
+        "shore": shore_meta,
         "ds_datum": ds_datum_block,
         "mainstem_read": mainstem_read_block,
         "wet_propagation": wet_propagation_block,
