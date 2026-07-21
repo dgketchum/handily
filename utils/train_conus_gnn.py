@@ -54,6 +54,7 @@ HANG_DTW_COL = DUPUIT_FEATURE_COLS[0]
 # Head-space target modes (WTE elevation OR residual-over-R): both reconstruct DTW
 # as `base - native` and carry obs_wte/z_surf; dtw_residual reconstructs `base + native`.
 HEAD_SPACE_MODES = (TARGET_WTE, TARGET_WTE_RESIDUAL)
+from build_analog_edges import analog_fold_keep  # noqa: E402
 from train_wte_gnn import (  # noqa: E402
     WTEGraphNet,
     apply_stats,
@@ -252,11 +253,17 @@ def train_fold(
     sample_w_t=None,
     pair_idx=None,
     pair_w=0.0,
+    ordinal_y_t=None,
+    ts_prior_t=None,
 ):
     """Train one fold; early-stop on val DTW-MAD; return native_hat over all queries.
 
     ``sample_w_t`` (full-length, optional) re-weights the per-well training loss
     (depth-aware loss weighting) so the shallow band is not swamped by deep wells.
+    ``ordinal_y_t`` (full-length (N, n_thresh) float, optional) adds the WP5 ordinal
+    BCE term at ``args.ordinal_weight`` on the same train rows/weights.
+    ``ts_prior_t`` (full-length float in (0,1), optional; --two-surface only) is the
+    privileged P(phreatic) assignment prior for the WP2 membership BCE term.
     """
     opt = torch.optim.Adam(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -291,6 +298,43 @@ def train_fold(
             nll = torch.abs(out[tr_t] - y_std[tr_t]) * torch.exp(-lb) + lb
             loss = (nll * w_tr).sum() / w_tr.sum() if weighted else nll.mean()
             pred_point = out
+        elif getattr(args, "two_surface", False):
+            # WP2 mixture Laplace NLL: -log[pi*Lap(y;hp,bp) + (1-pi)*Lap(y;hr,br)]
+            # via logsumexp (the log 2 constant is dropped from BOTH components).
+            # Soft responsibilities let each well pull only the component that
+            # explains it -- the mechanism the plan's separated-estimand argument
+            # needs and the single-surface loss cannot express.
+            ts = model.ts_out
+            ll_p = -(
+                torch.abs(ts["hp"][tr_t] - y_std[tr_t]) * torch.exp(-ts["lbp"][tr_t])
+                + ts["lbp"][tr_t]
+            )
+            ll_r = -(
+                torch.abs(ts["hr"][tr_t] - y_std[tr_t]) * torch.exp(-ts["lbr"][tr_t])
+                + ts["lbr"][tr_t]
+            )
+            m_tr = ts["m"][tr_t]
+            row = -torch.logsumexp(
+                torch.stack(
+                    [
+                        nn.functional.logsigmoid(m_tr) + ll_p,
+                        nn.functional.logsigmoid(-m_tr) + ll_r,
+                    ]
+                ),
+                dim=0,
+            )
+            if ts_prior_t is not None:
+                # privileged assignment: confidence-scaled BCE toward the
+                # construction-metadata prior a. conf = |2a-1| makes neutral
+                # priors (a=0.5, e.g. unmatched wells) impose exactly nothing;
+                # the prior enters ONLY through the loss, never as a feature.
+                a = ts_prior_t[tr_t]
+                bce = nn.functional.binary_cross_entropy_with_logits(
+                    m_tr, a, reduction="none"
+                )
+                row = row + args.assign_weight * (2.0 * a - 1.0).abs() * bce
+            loss = (row * w_tr).sum() / w_tr.sum() if weighted else row.mean()
+            pred_point = out
         else:
             hl = huber(out[tr_t], y_std[tr_t])
             loss = (hl * w_tr).sum() / w_tr.sum() if weighted else hl
@@ -305,6 +349,15 @@ def train_fold(
             dp = pred_point[pair_idx[0]] - pred_point[pair_idx[1]]
             dy = y_std[pair_idx[0]] - y_std[pair_idx[1]]
             loss = loss + pair_w * nn.functional.huber_loss(dp, dy, delta=pair_delta)
+        if ordinal_y_t is not None and model.ordinal_logits is not None:
+            # WP5 ordinal BCE, mean over thresholds then the SAME per-row weighting
+            # as the point loss (water pseudo-rows enter as shallow evidence at
+            # their water_label_weight).
+            bce = nn.functional.binary_cross_entropy_with_logits(
+                model.ordinal_logits[tr_t], ordinal_y_t[tr_t], reduction="none"
+            ).mean(dim=1)
+            obce = (bce * w_tr).sum() / w_tr.sum() if weighted else bce.mean()
+            loss = loss + args.ordinal_weight * obce
         loss.backward()
         opt.step()
         model.eval()
@@ -494,6 +547,66 @@ def main() -> None:
         "no water rows.",
     )
     p.add_argument(
+        "--shore-label-weight",
+        type=float,
+        default=0.0,
+        help="E6: loss weight for land-side shoreline ring pseudo-rows (is_shore_pseudo, "
+        "bundles built with --shoreline-points). Applied LAST (after depth/confidence/"
+        "water/swl paths) exactly like --water-label-weight: shore ids have no "
+        "confinement label so --min-confidence must not zero them. 0.0 = loss-inert but "
+        "still OOF-predicted (isolates the query-writeback node-pool effect from the "
+        "label effect). Ignored / no-op when the bundle has no is_shore_pseudo column.",
+    )
+    p.add_argument(
+        "--glr-labels",
+        default=None,
+        help="GLR: per-fold cross-fit gaining/losing-reach screen parquet for the E6 "
+        "shore rows (utils/build_glr_labels.py; cell_id + glr_pass_fold_0..N + "
+        "glr_pass_full). When set, each shore row's weight in fold f is "
+        "--glr-label-weight if its glr_pass_fold_{f} bit is set else 0 -- a PER-FOLD "
+        "inclusion mask replacing the global --shore-label-weight (which must stay 0.0). "
+        "The screen consults observed WTE, so it is cross-fit by fold exactly like R "
+        "(fold f's mask uses only cv_fold!=f training wells); glr_pass_full is diagnostic "
+        "only and NEVER weights a CV fold. Every is_shore_pseudo row must be covered "
+        "(fail-loud). Off => byte-identical to the --shore-label-weight path. See "
+        "notes/plans/GLR_PLAN.md and docs/inference_leakage_prevention.md.",
+    )
+    p.add_argument(
+        "--glr-label-weight",
+        type=float,
+        default=0.0,
+        help="GLR loss weight for shore rows that PASS the per-fold screen (0.0 = "
+        "loss-inert flag-off). Ignored without --glr-labels.",
+    )
+    p.add_argument(
+        "--swl-labels",
+        default=None,
+        help="E4: standalone additive parquet of driller static-water-level (SWL) "
+        "AUXILIARY training-label query nodes (is_swl_aux=True, built by "
+        "build_swl_labels.py). The base bundle is NOT modified. When set, the rows are "
+        "appended to query_nodes and their lateral edges to lateral_edges before any "
+        "array derivation, flow into `real=~water&~swl` (excluded from every "
+        "standardization fit + val/test metric + scorer panel), get a neutral "
+        "standardized-mean MAE embedding, and are weighted by --swl-label-weight. "
+        "Absent = byte-identical to the pre-E4 baseline.",
+    )
+    p.add_argument(
+        "--swl-lateral-edges",
+        default=None,
+        help="E4: SWL aux lateral-edges parquet (query_node_idx local 0..n-1, offset "
+        "onto the base frame on append). Defaults to the --swl-labels path with "
+        "'_labels'->'_lateral_edges'.",
+    )
+    p.add_argument(
+        "--swl-label-weight",
+        type=float,
+        default=0.25,
+        help="E4: loss weight for SWL aux label rows (is_swl_aux). Applied LAST (after "
+        "depth/confidence/water paths) exactly like --water-label-weight: SWL ids have "
+        "no confidence label so --min-confidence must not zero them. Ignored without "
+        "--swl-labels.",
+    )
+    p.add_argument(
         "--confidence-table",
         default="/data/ssd2/handily/conus/wte_gnn/confidence_by_canonical.parquet",
         help="parquet keyed by canonical_id with confinement_confidence (deduped); "
@@ -517,6 +630,60 @@ def main() -> None:
         "|err|/b + log b (per-well b), and OOF gnn_sigma_m enables selective "
         "shallow calls (trust predictions only where sigma is small). "
         "Exclusive with --pinball",
+    )
+    p.add_argument(
+        "--ordinal-head",
+        action="store_true",
+        help="WP5 monotone ordinal shallow head: P(DTW<2m) <= P(DTW<5m) <= P(DTW<10m) "
+        "from a shared deepness score + ordered cutpoints (nested by construction, "
+        "NOT a threshold on the regression surface). Trained jointly (BCE at "
+        "--ordinal-weight) on the same rows/weights as the point loss (water pseudo-"
+        "rows count as shallow evidence); OOF p_dtw_lt_{2,5,10}m columns. Composes "
+        "with every arm; the point/sigma losses and early-stop criterion are unchanged",
+    )
+    p.add_argument(
+        "--ordinal-weight",
+        type=float,
+        default=0.3,
+        help="weight of the ordinal BCE term added to the point loss",
+    )
+    p.add_argument(
+        "--ordinal-thresholds",
+        type=str,
+        default="2,5,10",
+        help="comma-separated DTW class thresholds in meters (ascending)",
+    )
+    p.add_argument(
+        "--two-surface",
+        action="store_true",
+        help="WP2 latent two-surface mixture: phreatic + regional component heads, "
+        "each ANCHORED on a different physical prior (phreatic: FAC where present "
+        "else terrain-mirror; regional: deep-well IDW datum, absent -> R itself) so "
+        "component labels cannot swap (plan 7.3 identifiability). Loss = Laplace "
+        "mixture NLL over per-component scales + a confidence-scaled BCE tying the "
+        "membership head to the privileged construction-metadata prior "
+        "(--two-surface-priors; used ONLY in the loss, never as a query feature). "
+        "OOF ts_pi_phreatic / ts_native_{p,r} / ts_sigma_{p,r}_m columns. Head-space "
+        "targets only; exclusive with --prior-gate/--fac-*/--pinball/--sigma-head",
+    )
+    p.add_argument(
+        "--two-surface-priors",
+        type=str,
+        default="/data/ssd2/handily/conus/wte_gnn/v02/wp2/assignment_priors.parquet",
+        help="privileged P(phreatic) prior parquet keyed by canonical_id "
+        "(build_two_surface_priors.py); unmatched wells fall back to 0.5 (inert)",
+    )
+    p.add_argument(
+        "--assign-prior-col",
+        type=str,
+        default="p_phreatic_construction",
+        help="column of --two-surface-priors used as the privileged prior",
+    )
+    p.add_argument(
+        "--assign-weight",
+        type=float,
+        default=0.3,
+        help="weight of the confidence-scaled BCE(membership, privileged prior) term",
     )
     p.add_argument(
         "--prior-gate",
@@ -613,6 +780,17 @@ def main() -> None:
         "point covariates.",
     )
     p.add_argument(
+        "--mae-embeddings",
+        default=None,
+        help="path to a mae_embeddings_<arm>_allq.parquet (utils/extract_mae_embeddings.py "
+        "--all-query-nodes) keyed by query_node_idx; its mae_* columns ride in as an "
+        "ADDITIVE per-query head slot (a self-supervised, target-blind neighborhood "
+        "embedding, encoded then concatenated to the head input, composing with the "
+        "gate/mirror/sigma arms). MUST cover EVERY query node -- a missing embedding is "
+        "an extraction-scope bug, not data to impute, so the trainer fails loud. Off => "
+        "byte-identical to baseline. See notes/MAE_NEIGHBORHOOD_EMBEDDING.md.",
+    )
+    p.add_argument(
         "--query-writeback",
         action="store_true",
         help="(Phase 6C) add the query->reach write-back conv: well context is written onto "
@@ -620,6 +798,17 @@ def main() -> None:
         "so it mixes 2 hops outward and returns via the lateral/portfolio reads -- the "
         "mechanism-matched lever for the coherent <500m patch bias (well<->well communication "
         "through shared reaches). No rebuild (reuses lateral_edges). See notes/GNN_PHASE6_PLAN.md 6C.",
+    )
+    p.add_argument(
+        "--analog-edges",
+        default=None,
+        help="(E3) path to an analog_edges.parquet (utils/build_analog_edges.py): kNN "
+        "edges in the AEF+MAE embedding space from each well to its <=k NONLOCAL analog "
+        "wells (different HUC4, >= min-dist km). Adds an ADDITIVE segment-softmax read "
+        "slot that imports each analog's fold-standardized observed residual. Fold-safe "
+        "by construction: edges whose SOURCE well is in the held-out fold are dropped "
+        "from that fold's forward (a test well never reads a test-fold label). Off => "
+        "byte-identical to baseline. See notes/E3_ANALOG_EDGES.md.",
     )
     # --- anti-compression pair loss (item 4): regularize the LOCAL WTE gradient -----
     p.add_argument(
@@ -717,6 +906,43 @@ def main() -> None:
         .reset_index(drop=True)
     )
     le = pd.read_parquet(gdir / "lateral_edges.parquet")
+
+    # --- E4: append SWL auxiliary training labels (additive; base bundle untouched) ---
+    # SWL rows carry local query_node_idx 0..n_aux-1; offset them onto the base frame
+    # and offset their lateral edges likewise, then let the invariants below validate
+    # the combined frame. Absent --swl-labels this block is a no-op (byte-identical).
+    swl_appended = 0
+    if args.swl_labels:
+        base_n = len(qn)
+        sqn = (
+            pd.read_parquet(args.swl_labels)
+            .sort_values("query_node_idx")
+            .reset_index(drop=True)
+        )
+        sle_path = args.swl_lateral_edges or args.swl_labels.replace(
+            "_labels.parquet", "_lateral_edges.parquet"
+        )
+        sle = pd.read_parquet(sle_path)
+        if "is_swl_aux" not in qn.columns:
+            qn["is_swl_aux"] = False
+        for c in set(qn.columns) - set(sqn.columns):
+            sqn[c] = np.nan
+        sqn = sqn[qn.columns].copy()
+        sqn["is_swl_aux"] = True
+        sqn["query_node_idx"] = np.arange(base_n, base_n + len(sqn), dtype="int64")
+        sle = sle.copy()
+        sle["query_node_idx"] = sle["query_node_idx"].to_numpy("int64") + base_n
+        qn = pd.concat([qn, sqn], ignore_index=True)
+        le = pd.concat([le[sle.columns], sle], ignore_index=True)
+        swl_appended = len(sqn)
+        log.info(
+            "E4 SWL aux labels: %d appended (weight %.2f); base=%d -> total=%d",
+            swl_appended,
+            args.swl_label_weight,
+            base_n,
+            len(qn),
+        )
+
     assert (rn["reach_node_idx"].to_numpy() == np.arange(len(rn))).all()
     assert (qn["query_node_idx"].to_numpy() == np.arange(len(qn))).all()
 
@@ -727,7 +953,29 @@ def main() -> None:
         if "is_water_pseudo" in qn.columns
         else np.zeros(len(qn), bool)
     )
-    real = ~water
+    # E4 SWL aux rows are auxiliary labels too: never a fit source, never a metric.
+    swl = (
+        qn["is_swl_aux"].to_numpy(bool)
+        if "is_swl_aux" in qn.columns
+        else np.zeros(len(qn), bool)
+    )
+    # E6 land-side shoreline ring pseudo-rows: same discipline as water pseudo-rows
+    # (never a fit source, never a metric). Default-False for bundles predating
+    # --shoreline-points, so flag-off training is byte-identical.
+    shore = (
+        qn["is_shore_pseudo"].to_numpy(bool)
+        if "is_shore_pseudo" in qn.columns
+        else np.zeros(len(qn), bool)
+    )
+    real = ~water & ~swl & ~shore
+    if shore.any():
+        log.info(
+            "shore pseudo-rows: %d/%d query rows (label weight %.2f; excluded from "
+            "val/test metrics + standardization fits)",
+            int(shore.sum()),
+            len(qn),
+            args.shore_label_weight,
+        )
     if water.any():
         log.info(
             "water pseudo-rows: %d/%d query rows (label weight %.2f; excluded from "
@@ -735,6 +983,76 @@ def main() -> None:
             int(water.sum()),
             len(qn),
             args.water_label_weight,
+        )
+
+    # --- GLR: per-fold cross-fit shore-label inclusion mask ---------------------------
+    # A shore row's fold-f training weight becomes --glr-label-weight iff its
+    # glr_pass_fold_{f} bit is set (else 0), replacing the global --shore-label-weight.
+    # The screen consults observed WTE, so fold f's mask is derived ONLY from cv_fold!=f
+    # training wells (build_glr_labels.py) -- leak-free by the crossfit-R contract. The
+    # join is on the canonical 100 m EPSG:5070 lattice cell id (the same grid the shore
+    # rows were snapped to); every is_shore_pseudo row must carry a GLR bit (fail-loud).
+    glr_active = bool(args.glr_labels)
+    glr_pass_by_fold = None
+    glr_meta = None
+    if glr_active:
+        if not shore.any():
+            raise SystemExit(
+                "--glr-labels set but the bundle has no is_shore_pseudo rows "
+                "(rebuild with build_conus_graph_inputs.py --shoreline-points)"
+            )
+        glr = pd.read_parquet(args.glr_labels)
+        lat_x0, lat_y0, lat_res = -2540000.0, 3258000.0, 100.0
+
+        def _cell_id(x, y):
+            col = np.floor((x - lat_x0) / lat_res).astype("int64")
+            row = np.floor((lat_y0 - y) / lat_res).astype("int64")
+            return col * 100_000_000 + row
+
+        qn_cid = _cell_id(
+            qn["x5070"].to_numpy("float64"), qn["y5070"].to_numpy("float64")
+        )
+        fold_vals = sorted(int(f) for f in qn[fold_col].unique())
+        glr_row = pd.Series(
+            np.arange(len(glr), dtype="int64"), index=glr["cell_id"].to_numpy("int64")
+        )
+        if glr_row.index.duplicated().any():
+            raise SystemExit("--glr-labels has duplicate cell_id (join not 1:1)")
+        shore_gpos = glr_row.reindex(qn_cid[shore]).to_numpy()
+        if np.isnan(shore_gpos).any():
+            raise SystemExit(
+                f"{int(np.isnan(shore_gpos).sum())} of {int(shore.sum())} shore rows "
+                "have no GLR label (cell_id join gap -- extraction-scope bug, not data "
+                "to impute); every is_shore_pseudo row must be covered"
+            )
+        shore_rows = shore_gpos.astype("int64")
+        glr_pass_by_fold = {}
+        for f in fold_vals:
+            col = glr[f"glr_pass_fold_{f}"].to_numpy(bool)
+            passf = np.zeros(len(qn), bool)
+            passf[shore] = col[shore_rows]
+            glr_pass_by_fold[f] = passf
+        per_fold_pass = {f: int(glr_pass_by_fold[f].sum()) for f in fold_vals}
+        glr_meta = {
+            "labels_path": args.glr_labels,
+            "label_weight": float(args.glr_label_weight),
+            "n_shore_rows": int(shore.sum()),
+            "per_fold_shore_pass": per_fold_pass,
+            "n_pass_full": int(glr["glr_pass_full"].to_numpy(bool).sum()),
+        }
+        if args.shore_label_weight != 0.0:
+            log.warning(
+                "--glr-labels overrides --shore-label-weight per fold; the global "
+                "--shore-label-weight=%.2f is ignored for shore rows",
+                args.shore_label_weight,
+            )
+        log.info(
+            "GLR active: %d shore rows, pass-weight %.2f; per-fold PASS counts %s "
+            "(cross-fit leave-one-fold-out; glr_pass_full=%d diagnostic only)",
+            int(shore.sum()),
+            args.glr_label_weight,
+            per_fold_pass,
+            glr_meta["n_pass_full"],
         )
 
     # --- mainstem-read edges (item 2): one query->datum read edge per covered well ----
@@ -1006,6 +1324,157 @@ def main() -> None:
             sc_x_t.shape[1],
             sc_ea_t.shape[1],
         )
+    # MAE neighborhood-embedding tensor: a per-query, target-blind vector standardized
+    # ONCE globally (z-score) -- like reach_x/sc_x it is a target-blind constant, so a
+    # global fit is train-blind by construction. Rides in as an ADDITIVE per-query head
+    # slot. It MUST cover every query node: the forward runs over ALL query nodes, and a
+    # missing embedding is an extraction-scope bug (e.g. water pseudo-rows omitted), NOT
+    # data to impute -- so we fail loud and point at --all-query-nodes.
+    f_mae = None
+    if args.mae_embeddings:
+        mae_df = pd.read_parquet(args.mae_embeddings)
+        if "query_node_idx" not in mae_df.columns:
+            raise SystemExit(
+                f"--mae-embeddings {args.mae_embeddings} lacks query_node_idx"
+            )
+        if mae_df["query_node_idx"].duplicated().any():
+            raise SystemExit(
+                f"--mae-embeddings {args.mae_embeddings} has duplicate query_node_idx"
+            )
+        mae_cols = [c for c in mae_df.columns if c.startswith("mae_")]
+        if not mae_cols:
+            raise SystemExit(
+                f"--mae-embeddings {args.mae_embeddings} has no mae_* columns"
+            )
+        mae_df = mae_df.set_index("query_node_idx")
+        qidx = qn["query_node_idx"].to_numpy()
+        if args.swl_labels and swl.any():
+            # E4: real embedding for base rows; a neutral (standardized-mean = 0)
+            # embedding for SWL aux rows. Extracting real AEF+MAE neighborhood reads
+            # for the aux points is the pre-registered follow-on IF an arm shows signal;
+            # a weight-0.1-0.25 aux label's value is its target + query features + graph
+            # context, not its own raster neighborhood read. Stats are fit on the base
+            # (non-aux) rows only, so real-well embeddings are unperturbed.
+            base_q = qidx[~swl]
+            missing = np.setdiff1d(base_q, mae_df.index.to_numpy())
+            if len(missing):
+                raise SystemExit(
+                    f"--mae-embeddings covers {len(mae_df)} nodes; {len(missing)} base "
+                    "query nodes have NO embedding -- re-extract with --all-query-nodes."
+                )
+            base_emb = mae_df.loc[base_q, mae_cols].to_numpy("float64")
+            if not np.isfinite(base_emb).all():
+                raise SystemExit("--mae-embeddings has non-finite values; investigate.")
+            emb = np.empty((len(qn), len(mae_cols)), "float64")
+            emb[~swl] = base_emb
+            emb[swl] = base_emb.mean(0, keepdims=True)  # -> standardizes to 0
+            mae_ord = pd.DataFrame(emb, columns=mae_cols)
+            mae_stats = fit_stats(
+                mae_ord.loc[~swl].reset_index(drop=True), mae_cols, None
+            )
+            mae_x_t = torch.as_tensor(
+                apply_stats(mae_ord, mae_stats), dtype=torch.float32, device=device
+            )
+        else:
+            missing = np.setdiff1d(qidx, mae_df.index.to_numpy())
+            if len(missing):
+                raise SystemExit(
+                    f"--mae-embeddings covers {len(mae_df)}/{len(qn)} query nodes; "
+                    f"{len(missing)} have NO embedding (likely water pseudo-rows). The "
+                    "forward runs over every query node -- re-extract with "
+                    "extract_mae_embeddings.py --all-query-nodes (missing rows must NOT "
+                    "be imputed)."
+                )
+            mae_ord = mae_df.loc[qidx, mae_cols].reset_index(drop=True)
+            if not np.isfinite(mae_ord.to_numpy()).all():
+                raise SystemExit(
+                    "--mae-embeddings has non-finite values; investigate before use "
+                    "(embeddings must be finite everywhere)"
+                )
+            mae_x_t = torch.as_tensor(
+                apply_stats(mae_ord, fit_stats(mae_ord, mae_cols, None)),
+                dtype=torch.float32,
+                device=device,
+            )
+        graph_tensors["mae_x"] = mae_x_t
+        f_mae = mae_x_t.shape[1]
+        log.info(
+            "MAE embeddings ON: %s (%d query nodes x %d dims, global z-score)",
+            args.mae_embeddings,
+            mae_x_t.shape[0],
+            f_mae,
+        )
+    # --- analog edges (E3): nonlocal embedding-similarity well->well read ----------
+    # Edge INDEX + edge ATTRS are target-blind constants (built + standardized once); the
+    # per-edge SOURCE-FOLD is carried so the fold loop can drop edges whose source is in
+    # the held-out fold (leak-free). The per-node SOURCE VALUE (fold-standardized target)
+    # is built per fold in the loop -- it is the only fold-dependent piece.
+    f_analog = None
+    analog_src_t = analog_dst_t = analog_ea_t = analog_src_fold = None
+    if args.analog_edges:
+        ae = pd.read_parquet(args.analog_edges)
+        need = {"query_node_idx", "src_query_node_idx", "src_cv_fold"}
+        if not need.issubset(ae.columns):
+            raise SystemExit(
+                f"--analog-edges {args.analog_edges} missing {need - set(ae.columns)}"
+            )
+        ae_cols = ["cos_dist", "geo_dist_km", "rel_elev_m"]
+        if not set(ae_cols).issubset(ae.columns):
+            raise SystemExit(
+                f"--analog-edges {args.analog_edges} missing edge-feature cols {ae_cols}"
+            )
+        dst = ae["query_node_idx"].to_numpy("int64")
+        src = ae["src_query_node_idx"].to_numpy("int64")
+        if (
+            dst.max() >= len(qn)
+            or src.max() >= len(qn)
+            or min(dst.min(), src.min()) < 0
+        ):
+            raise SystemExit("--analog-edges references out-of-range query_node_idx")
+        if (dst == src).any():
+            raise SystemExit("--analog-edges has self-edges (source == dest)")
+        # sources must be real wells (they carry the observed residual payload); a
+        # water-pseudo source would import a stage pseudo-label, not a well observation.
+        if water[src].any():
+            raise SystemExit(
+                f"{int(water[src].sum())} analog edges source from water-pseudo nodes; "
+                "rebuild with build_analog_edges.py (real-well sources only)"
+            )
+        ae_ea_np = apply_stats(ae, fit_stats(ae, ae_cols, None))
+        if not np.isfinite(ae_ea_np).all():
+            raise SystemExit("--analog-edges has non-finite edge features")
+        analog_src_t = torch.as_tensor(src, dtype=torch.long, device=device)
+        analog_dst_t = torch.as_tensor(dst, dtype=torch.long, device=device)
+        analog_ea_t = torch.as_tensor(ae_ea_np, dtype=torch.float32, device=device)
+        analog_src_fold = ae["src_cv_fold"].to_numpy("int64")
+        f_analog = analog_ea_t.shape[1]
+        deg = pd.Series(dst).value_counts()
+        log.info(
+            "analog edges ON: %s (%d edges, %d dest wells, mean degree %.1f, %d edge "
+            "features, fold-masked per fold)",
+            args.analog_edges,
+            len(ae),
+            deg.size,
+            float(deg.mean()),
+            f_analog,
+        )
+
+    def analog_feat(fold: int | None, y_c: float, y_s: float) -> dict:
+        """Per-fold analog tensors: edges with source NOT in ``fold`` (leak-free), and the
+        per-node source value = fold-standardized target. ``fold=None`` keeps every edge
+        (memory-probe sizing only). Empty dict when analog edges are off."""
+        if f_analog is None:
+            return {}
+        keep = torch.as_tensor(
+            analog_fold_keep(analog_src_fold, fold), dtype=torch.bool, device=device
+        )
+        val = torch.as_tensor((target - y_c) / y_s, dtype=torch.float32, device=device)
+        return {
+            "analog_ei": torch.stack([analog_src_t[keep], analog_dst_t[keep]]),
+            "analog_ea": analog_ea_t[keep],
+            "analog_src_val": val,
+        }
+
     # query->reach write-back (6C): reversed lateral edges (query src -> reach dst), reusing
     # lat_ea unchanged (same attrs, opposite direction). No new file / no prune change.
     if args.query_writeback:
@@ -1194,6 +1663,7 @@ def main() -> None:
     fac_gate = args.fac_gate
     fac_lambda = args.fac_lambda
     prior_gate = args.prior_gate
+    two_surface = args.two_surface
     fac_raw = fac_present = fac_pred_dtw = None
     deep_raw = deep_present = deep_pred_dtw = deep_anchor_col = None
     if fac_gate and not fac_skip:
@@ -1208,12 +1678,27 @@ def main() -> None:
         raise SystemExit("--fac-lambda/--prior-gate are exclusive with --pinball")
     if args.sigma_head and args.pinball:
         raise SystemExit("--sigma-head is exclusive with --pinball")
-    use_fac_anchor = fac_skip or fac_lambda or prior_gate
+    if two_surface and (
+        prior_gate or fac_skip or fac_gate or fac_lambda or args.pinball
+    ):
+        # the two-component mixture REPLACES every other output mixture/anchor path.
+        raise SystemExit(
+            "--two-surface is exclusive with --prior-gate/--fac-*/--pinball"
+        )
+    if two_surface and args.sigma_head:
+        # the mixture already carries per-component Laplace scales; a third
+        # point-scale head would double-count the NLL.
+        raise SystemExit("--two-surface is exclusive with --sigma-head")
+    use_fac_anchor = fac_skip or fac_lambda or prior_gate or two_surface
     if use_fac_anchor:
         flag = (
             "--fac-skip"
             if fac_skip
-            else ("--fac-lambda" if fac_lambda else "--prior-gate")
+            else (
+                "--fac-lambda"
+                if fac_lambda
+                else ("--two-surface" if two_surface else "--prior-gate")
+            )
         )
         if target_mode == TARGET_WTE_RESIDUAL:
             fac_base_col = FAC_REM_WTE_ANOM_COL  # (z_surf - fac_rem_dtw) - R
@@ -1242,9 +1727,10 @@ def main() -> None:
             # The gate/lambda keys on this to release the anchor where FAC predicts
             # deep (the saturation regime).
             fac_pred_dtw = np.where(fac_present, base - fac_raw, np.nan)
-    if prior_gate:
+    if prior_gate or two_surface:
         # Deep expert: crossfit regional-deep well IDW, the only prior that wins the
-        # 30+m band. Same head-space convention as the FAC anchor.
+        # 30+m band. Same head-space convention as the FAC anchor. The two-surface
+        # arm anchors its REGIONAL component on it.
         deep_anchor_col = (
             DEEP_REGIONAL_WTE_ANOM_COL
             if target_mode == TARGET_WTE_RESIDUAL
@@ -1265,12 +1751,13 @@ def main() -> None:
             100.0 * deep_present.mean(),
         )
     mirror_raw = mirror_present = mirror_pred_dtw = None
-    if args.mirror_anchor:
-        if not prior_gate:
-            raise SystemExit("--mirror-anchor requires --prior-gate")
+    if args.mirror_anchor and not prior_gate:
+        raise SystemExit("--mirror-anchor requires --prior-gate")
+    if args.mirror_anchor or two_surface:
         # Terrain-mirror expert: WTE = z_surf - d, i.e. head-space anomaly = base - d
         # (base is z_surf - R in wte_residual mode, z_surf in wte mode -- both work).
-        # Its own predicted DTW is the constant d. Well-free + target-blind.
+        # Its own predicted DTW is the constant d. Well-free + target-blind. The
+        # two-surface arm falls back to it as the PHREATIC anchor where FAC is absent.
         mirror_raw = base - args.mirror_depth_m
         mirror_present = np.isfinite(mirror_raw)
         mirror_pred_dtw = np.where(mirror_present, args.mirror_depth_m, np.nan)
@@ -1424,6 +1911,44 @@ def main() -> None:
             args.water_label_weight,
         )
 
+    # E4 SWL aux weight LAST (mirrors the water path): aux ids carry no confinence
+    # label, so --min-confidence must not zero them; obs_dtw>0 would mis-weight them
+    # on the depth path. Loss-inert at 0.0 but still OOF-predicted.
+    if args.swl_labels and swl.any():
+        w_np = (
+            sample_w_t.detach().cpu().numpy().astype("float64")
+            if sample_w_t is not None
+            else np.ones(len(qn), "float64")
+        )
+        w_np[swl] = args.swl_label_weight
+        sample_w_t = torch.as_tensor(
+            w_np.astype("float32"), dtype=torch.float32, device=device
+        )
+        log.info(
+            "SWL aux label weight: %d rows -> %.2f (post depth/confidence/water paths)",
+            int(swl.sum()),
+            args.swl_label_weight,
+        )
+
+    # E6 shoreline ring weight LAST (mirrors the water/swl paths): shore ids carry no
+    # confinement label so --min-confidence must not zero them; obs_dtw=0 would
+    # max-weight them on the depth path. Loss-inert at 0.0 but still OOF-predicted.
+    if shore.any():
+        w_np = (
+            sample_w_t.detach().cpu().numpy().astype("float64")
+            if sample_w_t is not None
+            else np.ones(len(qn), "float64")
+        )
+        w_np[shore] = args.shore_label_weight
+        sample_w_t = torch.as_tensor(
+            w_np.astype("float32"), dtype=torch.float32, device=device
+        )
+        log.info(
+            "shore label weight: %d rows -> %.2f (post depth/confidence/water/swl paths)",
+            int(shore.sum()),
+            args.shore_label_weight,
+        )
+
     f_ch, f_lat = ch_ea.shape[1], lat_ea.shape[1]
     f_ms = ms_ea.shape[1] if use_ms else None  # width incl. missingness flags
     f_pf = pf_ea.shape[1] if use_pf else None  # portfolio edge-attr width (6B)
@@ -1433,6 +1958,79 @@ def main() -> None:
     gate_oof = np.full(len(qn), np.nan) if fac_gate else None
     lambda_oof = np.full(len(qn), np.nan) if fac_lambda else None
     sigma_oof = np.full(len(qn), np.nan) if args.sigma_head else None
+    # WP5 ordinal head: class labels from observed DTW (water pseudo-rows are DTW=0
+    # shallow positives); thresholds in meters, ascending.
+    ord_thresh, ordinal_oof, ordinal_y_t = None, None, None
+    if args.ordinal_head:
+        ord_thresh = np.array(
+            [float(t) for t in args.ordinal_thresholds.split(",")], dtype="float64"
+        )
+        if not (np.diff(ord_thresh) > 0).all():
+            raise SystemExit("--ordinal-thresholds must be strictly ascending")
+        if not np.isfinite(obs_dtw).all():
+            raise SystemExit(
+                f"{int((~np.isfinite(obs_dtw)).sum())} non-finite obs_dtw rows; "
+                "ordinal labels require finite observed DTW everywhere"
+            )
+        ordinal_oof = np.full((len(qn), len(ord_thresh)), np.nan)
+        ordinal_y_t = torch.as_tensor(
+            (obs_dtw[:, None] < ord_thresh[None, :]).astype("float32"), device=device
+        )
+    # WP2 two-surface: privileged P(phreatic) assignment priors, loss-only (never a
+    # query feature). Unmatched wells fall back to 0.5, which the confidence-scaled
+    # BCE makes exactly inert; water pseudo-rows are open-water surface expressions,
+    # phreatic by construction.
+    ts_prior_t = None
+    ts_pi_oof = ts_p_oof = ts_r_oof = ts_bp_oof = ts_br_oof = None
+    ts_prior_meta = None
+    if two_surface:
+        pri = pd.read_parquet(args.two_surface_priors)
+        if args.assign_prior_col not in pri.columns:
+            raise SystemExit(
+                f"--assign-prior-col {args.assign_prior_col!r} not in "
+                f"{args.two_surface_priors} (has: {sorted(pri.columns)})"
+            )
+        pri = pri.drop_duplicates("canonical_id")
+        pv = pri[args.assign_prior_col].to_numpy("float64")
+        if np.isfinite(pv).any() and (np.nanmin(pv) < 0.0 or np.nanmax(pv) > 1.0):
+            raise SystemExit(
+                f"{args.assign_prior_col} outside [0,1]; not a probability"
+            )
+        a_pri = (
+            qn["canonical_id"]
+            .map(pri.set_index("canonical_id")[args.assign_prior_col])
+            .astype("float64")
+            .to_numpy()
+        )
+        n_match = int((np.isfinite(a_pri) & real).sum())
+        a_pri = np.where(np.isfinite(a_pri), a_pri, 0.5)
+        a_pri[water] = 0.98
+        a_pri[shore] = 0.98  # shoreline rings are phreatic (DTW=0) like water rows
+        ts_prior_meta = {
+            "priors_path": args.two_surface_priors,
+            "prior_col": args.assign_prior_col,
+            "assign_weight": args.assign_weight,
+            "n_real_matched": n_match,
+            "n_real": int(real.sum()),
+            "n_water_at_098": int(water.sum()),
+        }
+        log.info(
+            "--two-surface ON: assignment prior %s (%d/%d real wells matched, "
+            "unmatched -> 0.5 neutral; %d water rows -> 0.98); lambda_assign=%.2f",
+            args.assign_prior_col,
+            n_match,
+            int(real.sum()),
+            int(water.sum()),
+            args.assign_weight,
+        )
+        ts_prior_t = torch.as_tensor(
+            np.clip(a_pri, 0.01, 0.99).astype("float32"), device=device
+        )
+        ts_pi_oof = np.full(len(qn), np.nan)
+        ts_p_oof = np.full(len(qn), np.nan)
+        ts_r_oof = np.full(len(qn), np.nan)
+        ts_bp_oof = np.full(len(qn), np.nan)
+        ts_br_oof = np.full(len(qn), np.nan)
     gate_experts = None
     if prior_gate:
         # expert order must match the model's mixture; the head is always LAST.
@@ -1492,12 +2090,16 @@ def main() -> None:
             f_pf=f_pf,
             f_sc_node=f_sc_node,
             f_sc_edge=f_sc_edge,
+            f_mae=f_mae,
+            f_analog=f_analog,
             writeback=args.query_writeback,
             pinball=args.pinball,
             fac_skip=fac_skip,
             fac_gate=fac_gate,
             fac_lambda=fac_lambda,
             sigma=args.sigma_head,
+            ordinal=args.ordinal_head,
+            two_surface=two_surface,
             prior_gate=prior_gate,
             mirror_anchor=args.mirror_anchor,
             hang_anchor=args.hang_anchor,
@@ -1509,6 +2111,7 @@ def main() -> None:
         probe_feat = {**graph_tensors, "query_x": probe_x}
         yc0 = float(np.median(target))
         ys0 = float(1.4826 * np.median(np.abs(target - yc0)) or 1.0)
+        probe_feat |= analog_feat(None, yc0, ys0)  # full edge set (sizing only)
         if use_fac_anchor:
             if fac_pred_dtw is not None:
                 pc0 = float(np.nanmedian(fac_pred_dtw))
@@ -1518,7 +2121,7 @@ def main() -> None:
                 )
             else:
                 probe_feat |= _fac_feat(fac_raw, fac_present, yc0, ys0, device)
-        if prior_gate:
+        if prior_gate or two_surface:
             dc0 = float(np.nanmedian(deep_pred_dtw))
             ds0 = float(1.4826 * np.nanmedian(np.abs(deep_pred_dtw - dc0)) or 1.0)
             probe_feat |= _fac_feat(
@@ -1532,7 +2135,7 @@ def main() -> None:
                 ds0,
                 prefix="deep",
             )
-        if args.mirror_anchor:
+        if args.mirror_anchor or two_surface:
             # mirror_pred_dtw is the constant d -> its standardized signal is 0
             # everywhere (centered on itself); the informative tensor is mirror_base.
             probe_feat |= _fac_feat(
@@ -1599,8 +2202,9 @@ def main() -> None:
             radius_m=args.pair_radius_m,
             k=args.pair_k,
         )
-        if water.any() and len(all_pairs):
-            # pair loss compares label differences at full weight -- wells only.
+        if (water.any() or shore.any()) and len(all_pairs):
+            # pair loss compares label differences at full weight -- real wells only
+            # (real excludes water + shore + swl pseudo-rows).
             all_pairs = all_pairs[real[all_pairs[:, 0]] & real[all_pairs[:, 1]]]
         log.info(
             "anti-compression pair loss ON: lambda=%.2f radius=%.0fm k=%d -> "
@@ -1611,6 +2215,17 @@ def main() -> None:
             len(all_pairs),
         )
 
+    # GLR: base weight vector (post depth/confidence/water/swl/shore paths) that the
+    # per-fold shore mask overrides. Shore rows sit at --shore-label-weight here (0.0);
+    # in fold f the passing shore rows are lifted to --glr-label-weight below.
+    glr_base_w = None
+    if glr_active:
+        glr_base_w = (
+            sample_w_t.detach().cpu().numpy().astype("float32")
+            if sample_w_t is not None
+            else np.ones(len(qn), "float32")
+        )
+
     for f in folds:
         test = qn[fold_col].to_numpy() == f
         trainval = ~test
@@ -1618,6 +2233,17 @@ def main() -> None:
         va &= real  # early stop on wells only; water val-block rows fall to train
         tr = trainval & ~va
         trr = tr & real  # standardization/anchor fits on real wells only
+        # GLR: this fold's shore-label weight vector -- passing shore rows (cross-fit on
+        # cv_fold!=f training wells) get --glr-label-weight, the rest stay 0. Shore rows
+        # whose own cv_fold==f are already held out of `tr` (in `test`), so the weight
+        # only bites the shore rows fold f actually trains on.
+        sample_w_fold_t = sample_w_t
+        if glr_active:
+            w_fold = glr_base_w.copy()
+            w_fold[glr_pass_by_fold[int(f)]] = args.glr_label_weight
+            sample_w_fold_t = torch.as_tensor(
+                w_fold, dtype=torch.float32, device=device
+            )
         pair_idx = None
         if all_pairs is not None and len(all_pairs):
             both_tr = tr[all_pairs[:, 0]] & tr[all_pairs[:, 1]]
@@ -1636,6 +2262,9 @@ def main() -> None:
             (target - y_c) / y_s, dtype=torch.float32, device=device
         )
         feat = {**graph_tensors, "query_x": query_x}
+        # analog edges with source in the held-out fold f are dropped (leak-free), and
+        # the source value is standardized in this fold's target space.
+        feat |= analog_feat(f, y_c, y_s)
         # anchor pred-dtw standardization stats, hoisted so --save-models can persist
         # them for any flag combination (None where the anchor is off).
         pc = ps = dc = ds = hc = hs = None
@@ -1649,7 +2278,7 @@ def main() -> None:
                 )
             else:
                 feat |= _fac_feat(fac_raw, fac_present, y_c, y_s, device)
-        if prior_gate:
+        if prior_gate or two_surface:
             trd = trr & deep_present
             dc = float(np.median(deep_pred_dtw[trd]))
             ds = float(1.4826 * np.median(np.abs(deep_pred_dtw[trd] - dc)) or 1.0)
@@ -1664,7 +2293,7 @@ def main() -> None:
                 ds,
                 prefix="deep",
             )
-        if args.mirror_anchor:
+        if args.mirror_anchor or two_surface:
             feat |= _fac_feat(
                 mirror_raw,
                 mirror_present,
@@ -1716,12 +2345,16 @@ def main() -> None:
             f_pf=f_pf,
             f_sc_node=f_sc_node,
             f_sc_edge=f_sc_edge,
+            f_mae=f_mae,
+            f_analog=f_analog,
             writeback=args.query_writeback,
             pinball=args.pinball,
             fac_skip=fac_skip,
             fac_gate=fac_gate,
             fac_lambda=fac_lambda,
             sigma=args.sigma_head,
+            ordinal=args.ordinal_head,
+            two_surface=two_surface,
             prior_gate=prior_gate,
             mirror_anchor=args.mirror_anchor,
             hang_anchor=args.hang_anchor,
@@ -1742,9 +2375,11 @@ def main() -> None:
             eff_tau,
             args,
             device,
-            sample_w_t,
+            sample_w_fold_t,
             pair_idx=pair_idx,
             pair_w=pair_w,
+            ordinal_y_t=ordinal_y_t,
+            ts_prior_t=ts_prior_t,
         )
         if fac_gate and model.last_fac_gate is not None:
             # last_fac_gate is from train_fold's final full-batch forward (all queries).
@@ -1757,9 +2392,25 @@ def main() -> None:
             sigma_oof[test] = (
                 np.exp(model.sigma_log_b.detach().cpu().numpy().reshape(-1)[test]) * y_s
             )
+        if args.ordinal_head and model.ordinal_logits is not None:
+            # nested shallow-class probabilities from the final full-batch forward.
+            ordinal_oof[test] = (
+                torch.sigmoid(model.ordinal_logits.detach()).cpu().numpy()[test]
+            )
         if prior_gate and model.last_prior_gate is not None:
             # per-well softmax weights (fac/deep/head) from the final full-batch forward.
             prior_gate_oof[test] = model.last_prior_gate.cpu().numpy()[test]
+        if two_surface and model.ts_out is not None:
+            # mixture internals from the final full-batch forward, de-standardized:
+            # component means in native target units (m), Laplace scales in meters.
+            ts = {
+                k: v.detach().cpu().numpy().reshape(-1) for k, v in model.ts_out.items()
+            }
+            ts_pi_oof[test] = 1.0 / (1.0 + np.exp(-ts["m"][test]))
+            ts_p_oof[test] = ts["hp"][test] * y_s + y_c
+            ts_r_oof[test] = ts["hr"][test] * y_s + y_c
+            ts_bp_oof[test] = np.exp(ts["lbp"][test]) * y_s
+            ts_br_oof[test] = np.exp(ts["lbr"][test]) * y_s
         if learned_aquifer and model.last_aquifer_gate is not None:
             # per-query sigmoid gate from the final full-batch forward (all queries).
             aquifer_gate_oof[test] = (
@@ -1819,7 +2470,7 @@ def main() -> None:
                     "deep_stats": {"dc": dc, "ds": ds},
                     "mirror_stats": (
                         {"c": float(args.mirror_depth_m), "s": 1.0}
-                        if args.mirror_anchor
+                        if (args.mirror_anchor or two_surface)
                         else None
                     ),
                     "hang_stats": ({"hc": hc, "hs": hs} if args.hang_anchor else None),
@@ -1905,6 +2556,8 @@ def main() -> None:
                         ),
                         "water_label_weight": float(args.water_label_weight),
                         "water_pseudo_rows": int(water.sum()),
+                        "shore_label_weight": float(args.shore_label_weight),
+                        "shore_pseudo_rows": int(shore.sum()),
                     },
                     "gate_experts": gate_experts,
                     "fac_anchor_col": fac_base_col if use_fac_anchor else None,
@@ -1982,6 +2635,23 @@ def main() -> None:
             msg,
         )
 
+    if two_surface:
+        # Mechanism read: pi (P(phreatic)) should sit HIGH shallow and FALL with
+        # depth toward the regional component; pi flat ~1 or ~0 everywhere is the
+        # component-collapse failure mode the WP2 gate checks.
+        bands = [(0, 2), (2, 5), (5, 10), (10, 30), (30, np.inf)]
+        msg = "; ".join(
+            f"{lo}-{hi if hi != np.inf else '+'}m "
+            f"pi={np.nanmean(ts_pi_oof[m]):.2f}/"
+            f"bp={np.nanmedian(ts_bp_oof[m]):.2f}m/"
+            f"br={np.nanmedian(ts_br_oof[m]):.2f}m(n={int(m.sum())})"
+            for lo, hi in bands
+            if (m := (obs_dtw >= lo) & (obs_dtw < hi) & real).any()
+        )
+        log.info(
+            "two-surface mean OOF pi + median component scales by obs-depth: %s", msg
+        )
+
     if learned_aquifer:
         # The aquifer correction should OPEN (gate->1) where the regional substrate
         # carries signal; log the OOF gate by observed-depth band as the first read on
@@ -2026,6 +2696,43 @@ def main() -> None:
                 "water OOF gate weights (mean): %s",
                 " ".join(f"{k}={v:.2f}" for k, v in water_panel["gate_w_mean"].items()),
             )
+        if two_surface:
+            # water rows should route phreatic; a low mean here is the collapse tell.
+            water_panel["ts_pi_phreatic_mean"] = float(np.nanmean(ts_pi_oof[water]))
+            log.info(
+                "water OOF two-surface pi_phreatic mean=%.2f",
+                water_panel["ts_pi_phreatic_mean"],
+            )
+    # E6 shore panel: the generalize-to-unseen-shoreline readout -- |pred DTW| on shore
+    # rows in their held-out folds (truth is 0 at the shore). Mirrors the water panel.
+    shore_panel = None
+    if shore.any():
+        sd = np.abs(gnn_dtw[shore])
+        shore_panel = {
+            "n": int(shore.sum()),
+            "abs_dtw_median_m": float(np.nanmedian(sd)),
+            "abs_dtw_p90_m": float(np.nanpercentile(sd, 90)),
+            "frac_within_0p5m": float(np.nanmean(sd <= 0.5)),
+            "frac_within_1m": float(np.nanmean(sd <= 1.0)),
+        }
+        log.info(
+            "shore OOF panel: n=%d |DTW| median=%.2f m p90=%.2f m "
+            "frac<=0.5m=%.2f frac<=1m=%.2f",
+            shore_panel["n"],
+            shore_panel["abs_dtw_median_m"],
+            shore_panel["abs_dtw_p90_m"],
+            shore_panel["frac_within_0p5m"],
+            shore_panel["frac_within_1m"],
+        )
+        if prior_gate:
+            shore_panel["gate_w_mean"] = {
+                nm: float(np.nanmean(prior_gate_oof[shore, j]))
+                for j, nm in enumerate(gate_experts)
+            }
+            log.info(
+                "shore OOF gate weights (mean): %s",
+                " ".join(f"{k}={v:.2f}" for k, v in shore_panel["gate_w_mean"].items()),
+            )
     # Common scoring columns (DTW + the named regional/deep DTW priors + benchmarks),
     # so the scorer's predictor set is identical across modes.
     out_cols = {
@@ -2038,22 +2745,40 @@ def main() -> None:
         "cv_fold": qn[fold_col].to_numpy(),
         "obs_dtw_m": obs_dtw,
         "is_water_pseudo": water,
+        "is_shore_pseudo": shore,
         "regional_idw_dtw_oof_m": qn["regional_idw_dtw_oof_m"].to_numpy(),
         "regional_deep_idw_dtw_oof_m": qn["regional_deep_idw_dtw_oof_m"].to_numpy(),
         "janssen_dtw_m": qn["janssen_dtw"].to_numpy(),
         "hand_m": qn["hand_m"].to_numpy(),
         "gnn_dtw_m": gnn_dtw,
     }
+    if args.swl_labels:
+        # E4 diagnostic: aux rows never join the frozen panel (canonical_id absent),
+        # but flag them so any downstream read can exclude them explicitly.
+        out_cols["is_swl_aux"] = swl
     if fac_gate:
         out_cols["fac_gate_c"] = gate_oof  # learned anchor confidence (diagnostic)
     if fac_lambda:
         out_cols["fac_lambda"] = lambda_oof  # convex FAC blend weight (zone map)
     if args.sigma_head:
         out_cols["gnn_sigma_m"] = sigma_oof  # per-well Laplace scale (meters)
+    if args.ordinal_head:
+        # WP5 nested shallow-class probabilities P(DTW < t), dimensionless 0-1.
+        for j, t in enumerate(ord_thresh):
+            out_cols[f"p_dtw_lt_{t:g}m"] = ordinal_oof[:, j]
     if prior_gate:
         # regime-map deliverable: which expert carries each well OOF.
         for j, nm in enumerate(gate_experts):
             out_cols[f"gate_w_{nm}"] = prior_gate_oof[:, j]
+    if two_surface:
+        # WP2 deliverables: membership (dimensionless 0-1) + per-component means
+        # (native target units, m) + per-component Laplace scales (m). In
+        # wte_residual mode a component's DTW is z_surf - (R + ts_native_*_m).
+        out_cols["ts_pi_phreatic"] = ts_pi_oof
+        out_cols["ts_native_p_m"] = ts_p_oof
+        out_cols["ts_native_r_m"] = ts_r_oof
+        out_cols["ts_sigma_p_m"] = ts_bp_oof
+        out_cols["ts_sigma_r_m"] = ts_br_oof
     if learned_aquifer:
         out_cols["aquifer_gate"] = aquifer_gate_oof  # per-query aquifer-branch gate
     identity_max = None
@@ -2180,11 +2905,43 @@ def main() -> None:
             if args.sigma_head
             else None,
         },
+        "ordinal_head": {
+            "enabled": bool(args.ordinal_head),
+            "thresholds_m": ord_thresh.tolist() if args.ordinal_head else None,
+            "weight": float(args.ordinal_weight) if args.ordinal_head else None,
+            "median_oof_p_by_threshold": (
+                {
+                    f"{t:g}m": float(np.nanmedian(ordinal_oof[real, j]))
+                    for j, t in enumerate(ord_thresh)
+                }
+                if args.ordinal_head
+                else None
+            ),
+        },
         "water": {
             "n_pseudo_rows": int(water.sum()),
             "label_weight": float(args.water_label_weight),
             "bundle_block": man.get("water"),
             "oof_panel": water_panel,
+        },
+        "shore": {
+            "n_pseudo_rows": int(shore.sum()),
+            "label_weight": float(args.shore_label_weight),
+            "bundle_block": man.get("shore"),
+            "oof_panel": shore_panel,
+        },
+        "glr": {
+            "enabled": glr_active,
+            "labels_path": args.glr_labels,
+            "label_weight": float(args.glr_label_weight),
+            "crossfit_note": (
+                "per-fold shore-label inclusion mask; fold f uses only cv_fold!=f "
+                "training wells (leave-one-fold-out, like R); glr_pass_full is "
+                "diagnostic/deployment only and never weights a CV fold"
+            )
+            if glr_active
+            else None,
+            **(glr_meta or {}),
         },
         "prior_gate": {
             "enabled": bool(prior_gate),
@@ -2204,6 +2961,28 @@ def main() -> None:
             }
             if prior_gate
             else None,
+        },
+        "two_surface": {
+            "enabled": bool(two_surface),
+            "priors": ts_prior_meta,
+            "fac_anchor_col": fac_base_col if two_surface else None,
+            "deep_anchor_col": deep_anchor_col if two_surface else None,
+            "mirror_depth_m": args.mirror_depth_m if two_surface else None,
+            # anti-collapse diagnostics: pi is the OOF P(phreatic) on real wells;
+            # a component used <5% globally fails the WP2 collapse gate.
+            "mean_oof_pi_phreatic": (
+                float(np.nanmean(ts_pi_oof[real])) if two_surface else None
+            ),
+            "mean_oof_pi_by_depth_band": (
+                {
+                    f"{lo:g}-{hi:g}m": float(
+                        np.nanmean(ts_pi_oof[real & (obs_dtw >= lo) & (obs_dtw < hi)])
+                    )
+                    for lo, hi in [(0, 2), (2, 5), (5, 10), (10, 30), (30, np.inf)]
+                }
+                if two_surface
+                else None
+            ),
         },
         "aquifer": {
             "enabled": bool(use_aquifer),
@@ -2274,6 +3053,18 @@ def main() -> None:
             "f_sc_edge": int(f_sc_edge) if use_sc else None,
         },
         "query_writeback": {"enabled": bool(args.query_writeback)},
+        "mae_embeddings": {
+            "enabled": bool(args.mae_embeddings),
+            "path": args.mae_embeddings if args.mae_embeddings else None,
+            "f_mae": int(f_mae) if f_mae is not None else None,
+        },
+        "analog_edges": {
+            "enabled": bool(args.analog_edges),
+            "path": args.analog_edges if args.analog_edges else None,
+            "f_analog": int(f_analog) if f_analog is not None else None,
+            "n_edges": int(analog_src_t.numel()) if f_analog is not None else None,
+            "fold_masked": bool(args.analog_edges),
+        },
         "target_mode": target_mode,
         "native_prediction_col": man.get(
             "native_prediction_col",

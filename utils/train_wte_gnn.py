@@ -310,12 +310,17 @@ class WTEGraphNet(nn.Module):
         f_pf: int | None = None,
         f_sc_node: int | None = None,
         f_sc_edge: int | None = None,
+        f_mae: int | None = None,
+        f_analog: int | None = None,
         writeback: bool = False,
         pinball: bool = False,
         fac_skip: bool = False,
         fac_gate: bool = False,
         fac_lambda: bool = False,
         sigma: bool = False,
+        ordinal: bool = False,
+        n_ordinal: int = 3,
+        two_surface: bool = False,
         prior_gate: bool = False,
         mirror_anchor: bool = False,
         hang_anchor: bool = False,
@@ -347,6 +352,17 @@ class WTEGraphNet(nn.Module):
             )
         if prior_gate and pinball:
             raise ValueError("prior_gate with the pinball head is not supported")
+        if two_surface and (prior_gate or fac_skip or fac_gate or fac_lambda):
+            # the two-surface mixture is its own output structure over the anchors;
+            # combining with another anchor pathway would double-count the priors.
+            raise ValueError(
+                "two_surface is exclusive with prior_gate/fac_skip/fac_gate/fac_lambda"
+            )
+        if two_surface and pinball:
+            raise ValueError("two_surface with the pinball head is not supported")
+        if two_surface and sigma:
+            # the mixture already carries per-component Laplace scales.
+            raise ValueError("two_surface is exclusive with the sigma head")
         if mirror_anchor and not prior_gate:
             # the mirror is an EXPERT of the gate, not a standalone anchor pathway.
             raise ValueError("mirror_anchor requires prior_gate")
@@ -359,6 +375,8 @@ class WTEGraphNet(nn.Module):
         if (f_sc_node is None) != (f_sc_edge is None):
             raise ValueError("f_sc_node and f_sc_edge must be set together")
         self.has_sc = f_sc_node is not None
+        self.has_mae = f_mae is not None
+        self.has_analog = f_analog is not None
         self.writeback = writeback
         if self.has_ms and self.has_anchor:
             # anchors are off in prod; keep the head bookkeeping ([q, ctx_reach, ctx_*])
@@ -380,6 +398,8 @@ class WTEGraphNet(nn.Module):
         self.fac_gate = fac_gate
         self.fac_lambda = fac_lambda
         self.sigma = sigma
+        self.ordinal = ordinal
+        self.two_surface = two_surface
         self.prior_gate = prior_gate
         self.mirror_anchor = mirror_anchor
         self.hang_anchor = hang_anchor
@@ -396,6 +416,13 @@ class WTEGraphNet(nn.Module):
         # so the trainer's NLL can backprop through it (unlike the detached last_* QA
         # captures above).
         self.sigma_log_b: torch.Tensor | None = None
+        # monotone ordinal shallow-class logits (N, n_ordinal) from the LAST forward,
+        # kept WITH grad so the trainer's BCE can backprop through them.
+        self.ordinal_logits: torch.Tensor | None = None
+        # two-surface mixture internals from the LAST forward (component means hp/hr,
+        # log-scales lbp/lbr, membership logit m; all std target units), kept WITH
+        # grad so the trainer's mixture NLL + assignment BCE can backprop.
+        self.ts_out: dict[str, torch.Tensor] | None = None
         # Regional-aquifer substrate (Phase 1): an OPTIONAL gated residual correction
         # branch over the proven stream/FAC-residual head, never a wider head. "off"
         # / "fixed_stream" make it an EXACT no-op (the branch is short-circuited so no
@@ -494,6 +521,37 @@ class WTEGraphNet(nn.Module):
                 hidden, hidden, f_sc_edge, hidden, dropout=dropout
             )
             head_in += hidden  # [.., ctx_sc]
+        if self.has_mae:
+            # MAE neighborhood embedding (self-supervised, target-blind): a per-query
+            # mean-pooled ViT-MAE encoder vector over the query's multi-scale covariate
+            # neighborhood. Like the SC read, a deliberately ADDITIVE head slot (not a
+            # tenant of the exclusive hidden*3 read-context slot), so it composes with the
+            # production anchor/gate/mirror/sigma configuration. Unlike SC it needs NO
+            # graph read -- the embedding is already a per-query dense vector -- so it is
+            # just an encoder MLP (no attention conv). Off => no module, no head widening,
+            # so the run is byte-identical to baseline. See MAE_NEIGHBORHOOD_EMBEDDING.md.
+            self.mae_enc = nn.Sequential(
+                nn.Linear(f_mae, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
+            )
+            head_in += hidden  # [.., ctx_mae]
+        if self.has_analog:
+            # Analog-edge read (E3): each query attends (segment-softmax, the 6B/SC
+            # PortfolioReadConv precedent) over its <=k NONLOCAL analog wells in the
+            # AEF+MAE embedding space, importing each analog's fold-standardized observed
+            # residual (`analog_src_val`, a per-node scalar encoded by analog_enc) as the
+            # message payload, modulated by the target-blind edge attrs (cosine/geo/rel-
+            # elev). A deliberately ADDITIVE head slot (like SC/MAE), NOT a tenant of the
+            # exclusive hidden*3 read-context slot, so it composes with gate/mirror/sigma/
+            # writeback/MAE. A query with no surviving analog edge (all analogs in the
+            # held-out fold) aggregates to zero -- finite. Off => no module, no head
+            # widening => byte-identical to baseline. See notes/E3_ANALOG_EDGES.md.
+            self.analog_enc = nn.Sequential(
+                nn.Linear(1, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
+            )
+            self.analog_read = PortfolioReadConv(
+                hidden, hidden, f_analog, hidden, dropout=dropout
+            )
+            head_in += hidden  # [.., ctx_analog]
         if self.writeback:
             # query->reach write-back (6C): one bipartite gated conv (query as src, reach as
             # dst) applied as a residual BEFORE the channel stack, so well context mixes 2
@@ -647,6 +705,48 @@ class WTEGraphNet(nn.Module):
             nn.init.zeros_(self.prior_gate_mlp[-1].bias)
             with torch.no_grad():
                 self.prior_gate_mlp[-1].bias[-1] = 2.0
+        if self.ordinal:
+            # WP5 monotone ordinal shallow head, constructed AFTER every other module
+            # (same RNG discipline as the aquifer branch: flag off => baseline modules
+            # draw identical init RNG). One scalar "deepness" score over the SAME head
+            # input as the point/sigma heads, plus ordered scalar cutpoints
+            # c_0 < c_1 < ... (base + cumulative softplus). logit_j = c_j - score, so
+            # P(DTW < t_0) <= P(DTW < t_1) <= ... is nested BY CONSTRUCTION -- the
+            # head is not a threshold on the regression surface.
+            self.ordinal_score = nn.Sequential(
+                nn.Linear(head_in, hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, 1),
+            )
+            self.ordinal_cut_raw = nn.Parameter(torch.zeros(n_ordinal))
+        if self.two_surface:
+            # WP2 latent two-surface mixture, constructed AFTER every other module
+            # (same RNG discipline). The components are anchored on DIFFERENT
+            # physical priors -- phreatic on the terrain-coupled shallow anchor
+            # (FAC where present, else the terrain mirror), regional on the
+            # deep-well IDW datum (absent -> 0, which in wte_residual space IS the
+            # regional prior R) -- so component labels cannot swap across folds
+            # (identifiability by parameterization, not by penalty). The mean
+            # correction heads are zero-initialized: epoch-0 components ARE their
+            # anchors, and departures from them are learned, not initial noise.
+
+            def _ts_mlp() -> nn.Sequential:
+                return nn.Sequential(
+                    nn.Linear(head_in, hidden),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden, 1),
+                )
+
+            self.ts_head_p = _ts_mlp()
+            self.ts_head_r = _ts_mlp()
+            self.ts_logb_p = _ts_mlp()
+            self.ts_logb_r = _ts_mlp()
+            self.ts_member = _ts_mlp()
+            for mod in (self.ts_head_p, self.ts_head_r):
+                nn.init.zeros_(mod[-1].weight)
+                nn.init.zeros_(mod[-1].bias)
 
     def _augment_for_skip(self, h: torch.Tensor, g: dict):
         """Append the FAC raw-skip / confidence-gate pieces to the head input.
@@ -735,6 +835,23 @@ class WTEGraphNet(nn.Module):
             # Additive to whichever branch built h, so it composes with anchor/ms/pf.
             ctx_sc = self.sc_read(self.sc_enc(g["sc_x"]), q, g["sc_ei"], g["sc_ea"])
             h = torch.cat([h, ctx_sc], dim=-1)
+        if self.has_mae:
+            # additive per-query MAE context; composes with whichever branch built h
+            # (anchor/ms/pf/sc) and rides through to every output head unchanged.
+            h = torch.cat([h, self.mae_enc(g["mae_x"])], dim=-1)
+        if self.has_analog:
+            # additive per-query analog context: attention-read the fold-standardized
+            # observed residual of each dest well's <=k nonlocal embedding analogs. The
+            # trainer supplies analog_ei/analog_ea already masked to source-fold != this
+            # fold (leak-free), and analog_src_val standardized in this fold's target
+            # space. Zero-edge queries -> zero context (finite).
+            ctx_analog = self.analog_read(
+                self.analog_enc(g["analog_src_val"].view(-1, 1)),
+                q,
+                g["analog_ei"],
+                g["analog_ea"],
+            )
+            h = torch.cat([h, ctx_analog], dim=-1)
         # FAC raw-skip / confidence-gate pieces (no-op when fac_skip is off).
         h, skip = self._augment_for_skip(h, g)
         if self.sigma:
@@ -793,6 +910,30 @@ class WTEGraphNet(nn.Module):
             self.last_head_out = hv.detach().squeeze(-1)
             expert_vals.append(hv)
             primary = (w * torch.cat(expert_vals, dim=-1)).sum(-1)
+        elif self.two_surface:
+            fb = g["fac_base"].view(-1, 1)
+            fpres = g["fac_present"].view(-1, 1)
+            mb = g["mirror_base"].view(-1, 1)
+            db = g["deep_base"].view(-1, 1)
+            dpres = g["deep_present"].view(-1, 1)
+            # phreatic component = terrain-coupled shallow anchor (FAC where
+            # present, else the mirror) + learned correction; regional component
+            # = deep-IDW datum (absent -> 0 = the regional prior R itself in
+            # wte_residual space) + learned correction. Zero-init corrections
+            # make epoch-0 components exactly their anchors.
+            hp = (fpres * fb + (1.0 - fpres) * mb).squeeze(-1) + self.ts_head_p(
+                h
+            ).squeeze(-1)
+            hr = (dpres * db).squeeze(-1) + self.ts_head_r(h).squeeze(-1)
+            # clamp keeps each component's Laplace b in [e^-4, e^4] std units,
+            # same bounds as the sigma head.
+            lbp = torch.clamp(self.ts_logb_p(h).squeeze(-1), -4.0, 4.0)
+            lbr = torch.clamp(self.ts_logb_r(h).squeeze(-1), -4.0, 4.0)
+            m = self.ts_member(h).squeeze(-1)
+            self.ts_out = {"hp": hp, "hr": hr, "lbp": lbp, "lbr": lbr, "m": m}
+            pi = torch.sigmoid(m)
+            # point prediction (early stop + legacy scoring) is the mixture mean.
+            primary = pi * hp + (1.0 - pi) * hr
         else:
             hv = self.head(h).squeeze(-1)
             self.last_head_out = hv.detach()
@@ -806,6 +947,14 @@ class WTEGraphNet(nn.Module):
             primary = primary + gate * aq_delta
         elif self.has_aquifer:
             self.last_aquifer_gate = torch.zeros_like(primary)
+        if self.ordinal:
+            # computed LAST so every shared module above consumes identical forward
+            # RNG (dropout draws) with or without the ordinal head in the loss.
+            s = self.ordinal_score(h)  # (N, 1) deepness score
+            base = self.ordinal_cut_raw[0:1]
+            steps = nn.functional.softplus(self.ordinal_cut_raw[1:])
+            cuts = torch.cat([base, base + torch.cumsum(steps, dim=0)])
+            self.ordinal_logits = cuts.view(1, -1) - s
         if self.pinball:
             return primary, self.pin_head(h).squeeze(-1) + skip
         return primary
