@@ -947,3 +947,100 @@ def test_spatial_context_requires_both_widths():
         tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, f_sc_node=F_SC_N)
     with pytest.raises(ValueError):
         tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, f_sc_edge=F_SC_E)
+
+
+# ---------------------------------------------------------------------------
+# MAE neighborhood embedding: additive per-query head slot (no graph read)
+# ---------------------------------------------------------------------------
+F_MAE = 9
+
+
+def _mae_graph():
+    """_tiny_graph + a per-query MAE embedding (one dense vector per query node)."""
+    g = _tiny_graph()
+    torch.manual_seed(11)
+    g["mae_x"] = torch.randn(3, F_MAE)  # 3 query nodes
+    return g
+
+
+def _mae_model(seed=0, **kw):
+    torch.manual_seed(seed)
+    return tg.WTEGraphNet(
+        F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1, f_mae=F_MAE, **kw
+    )
+
+
+def test_mae_forward_shape_and_head_width():
+    g = _mae_graph()
+    m = _mae_model().eval()
+    assert m.has_mae
+    assert m.head[0].in_features == HIDDEN * 3  # [q, ctx_reach] + ctx_mae
+    with torch.no_grad():
+        out = m(g)
+    assert out.shape == (3,) and torch.isfinite(out).all()
+
+
+def test_mae_off_is_baseline_state_dict():
+    # f_mae=None must add no params and keep the plain hidden*2 head (keys unchanged),
+    # i.e. a run without --mae-embeddings is byte-identical to the baseline model.
+    base = tg.WTEGraphNet(F_REACH, F_QUERY, F_CH, F_LAT, HIDDEN, 2, 0.1)
+    assert not base.has_mae
+    assert not hasattr(base, "mae_enc")
+    assert base.head[0].in_features == HIDDEN * 2
+    assert not any(k.startswith("mae_enc") for k in base.state_dict())
+
+
+def test_mae_composes_with_prior_gate_mirror_sigma():
+    # the production arm shape (gate + mirror + sigma): head + sigma read head_in =
+    # hidden*3 ([q, ctx_reach, ctx_mae]); the gate keeps its 4 experts.
+    m = _mae_model(prior_gate=True, mirror_anchor=True, sigma=True)
+    assert m.head[0].in_features == HIDDEN * 3
+    assert m.sigma_head[0].in_features == HIDDEN * 3
+    assert m.prior_gate_mlp[0].in_features == HIDDEN * 3 + 7 + 3
+    assert m.prior_gate_mlp[-1].bias.shape[0] == 4  # fac/deep/mirror/head
+
+
+def test_mae_composes_with_spatial_context():
+    # two ADDITIVE slots stack: head_in = [q, ctx_reach, ctx_sc, ctx_mae] = hidden*4.
+    g = _mae_graph()
+    g["sc_x"] = torch.randn(6, F_SC_N)
+    g["sc_ei"] = torch.tensor([[0, 1, 2, 3, 4], [0, 0, 0, 1, 1]])
+    g["sc_ea"] = torch.randn(5, F_SC_E)
+    torch.manual_seed(0)
+    m = tg.WTEGraphNet(
+        F_REACH,
+        F_QUERY,
+        F_CH,
+        F_LAT,
+        HIDDEN,
+        2,
+        0.1,
+        f_sc_node=F_SC_N,
+        f_sc_edge=F_SC_E,
+        f_mae=F_MAE,
+    ).eval()
+    assert m.has_sc and m.has_mae
+    assert m.head[0].in_features == HIDDEN * 4
+    with torch.no_grad():
+        out = m(g)
+    assert out.shape == (3,) and torch.isfinite(out).all()
+
+
+def test_mae_uses_the_embedding():
+    # two different embeddings must yield different predictions -> the slot is live.
+    g = _mae_graph()
+    m = _mae_model().eval()
+    with torch.no_grad():
+        out_a = m(g)
+        g2 = dict(g)
+        g2["mae_x"] = g["mae_x"] + 3.0
+        out_b = m(g2)
+    assert not torch.allclose(out_a, out_b, atol=1e-5)
+
+
+def test_mae_missing_tensor_errors_loudly():
+    g = _mae_graph()
+    del g["mae_x"]
+    m = _mae_model().eval()
+    with pytest.raises(KeyError):
+        m(g)
