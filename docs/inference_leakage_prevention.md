@@ -155,6 +155,51 @@ Identity-based exclusion may be kept as a supplement, never as the mechanism.
 0 of 34,503 training wells, while 88.5% had a same-site record under a different
 ID <1 m away; only the radius clause was doing anything.*
 
+## 6. Target-derived label screens are cross-fit by fold
+
+Any screen that decides *whether a training label is admitted* by consulting the
+observed target (here, well water-table elevations) is target-derived and is
+subject to the same leave-one-fold-out contract as a trained feature — the screen
+is just a feature that gates a loss weight instead of entering the forward pass.
+The failure mode it prevents is subtle: a held-out well could make one of its own
+fold's pseudo-labels "pass," so that label would train the model that is then
+evaluated against that very well, importing the held-out observation through the
+loss even though it never appears as a feature.
+
+The rule, therefore:
+
+- **Fold f's inclusion mask is computed from fold f's training wells only** (the
+  `cv_fold != f` pool — the exact pool `crossfit_idw` uses for the regional prior
+  R). A held-out well (`cv_fold == f`) can never influence which labels fold f
+  trains on. The mask is per-fold (one bit per fold), not a single global flag.
+- **Cross-border passing is legitimate.** A label in fold f's held-out HUC4s may
+  still pass for fold f via training wells (`cv_fold != f`) within the search
+  radius — that is training-side information only, exactly like R being informed
+  by near neighbors across block boundaries.
+- **Full pool at deployment.** At inference the screen may use every well —
+  strictly more evidence than any CV fold had — mirroring the
+  crossfit-at-wells / full-pool-at-inference pattern of Rule 1. A `*_full` mask
+  computed from all wells is emitted for deployment and diagnostics, and is
+  **never** used to weight a CV fold's training loss.
+- **No evidence → no label.** Inclusion requires positive supporting evidence
+  (a well within the radius that supports the label). Absence of wells is not
+  evidence for the label; the conservative default is to drop it. A permissive
+  "keep the label where we cannot check it" default injects exactly the regional
+  bias this screen exists to remove.
+- **The screen decides admission, not value.** The pseudo-label's value stays
+  fixed from its target-blind source (here DTW = 0 from NHD + GSW shore evidence);
+  the wells decide only whether that claim stands. Setting the value from well
+  observations would be well-IDW — already a cross-fit feature — smuggled in as a
+  label.
+
+*Verification is mandatory and matches Rule 5's spirit: a unit test with synthetic
+geometry where a held-out well would flip a pass bit must assert the fold-f bit is
+unchanged; and the per-fold pass counts must differ across folds (a constant count
+across folds would prove the mask collapsed to a global flag and lost its fold
+awareness). Current implementation: `utils/build_glr_labels.py` (the GLR shoreline
+screen) and `utils/train_conus_gnn.py --glr-labels` (per-fold shore-label weight);
+tests in `tests/test_glr_labels.py`.*
+
 ## Scope and enforcement
 
 - Applies to: inference runners, renderers, mosaic/COG builders, validation
