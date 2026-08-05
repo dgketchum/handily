@@ -77,8 +77,11 @@ def _args(patch_dir, out, epochs, resume=False, **over):
         dec_depth=1,
         patch=8,
         mask_ratio=0.70,
+        mask_mode="token",
+        channel_drop_p=0.0,
         ckpt_every=100,
         seed=0,
+        vram_cap_gb=None,
         no_ram=False,
         resume=resume,
     )
@@ -150,6 +153,17 @@ def test_resume_arm_mismatch_fails_loud(patch_dir, tmp_path):
     tnm.train(_args(patch_dir, out, epochs=1))
     with pytest.raises(SystemExit, match="mismatch"):
         tnm.train(_args(patch_dir, out, epochs=1, resume=True, arm="s500"))
+
+
+def test_resume_pretext_mismatch_fails_loud(patch_dir, tmp_path):
+    # mask_mode / channel_drop_p change the pretext task: continuing a run under a
+    # different one is a different experiment, not a resume
+    out = tmp_path / "m.pt"
+    tnm.train(_args(patch_dir, out, epochs=1))
+    with pytest.raises(SystemExit, match="mismatch"):
+        tnm.train(_args(patch_dir, out, epochs=1, resume=True, mask_mode="block"))
+    with pytest.raises(SystemExit, match="mismatch"):
+        tnm.train(_args(patch_dir, out, epochs=1, resume=True, channel_drop_p=0.25))
 
 
 def test_resume_epochs_mismatch_fails_loud(patch_dir, tmp_path):

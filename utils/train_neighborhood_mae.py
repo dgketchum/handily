@@ -4,7 +4,8 @@ Self-supervised masked-autoencoder over the multi-scale 64x64 patches built by
 build_mae_patches.py. One arm per resolution (single scale) or the pyramid (all scales
 stacked as channel groups). Reconstruction loss is masked-token MSE, weighted per pixel
 by the DEM valid mask so nodata never enters the loss (nodata is imputed 0 in the input
-but zero-weighted in the target).
+but zero-weighted in the target). Harder-pretext levers: --mask-mode block (contiguous
+token rectangles) and --channel-drop-p (hide whole variables at input, reconstruct all).
 
 The embedding = mean-pooled encoder tokens with mask_ratio=0; extract_mae_embeddings.py
 loads a checkpoint and calls MAE.encode().
@@ -55,12 +56,26 @@ class MAE(nn.Module):
         dec_dim: int = 64,
         dec_depth: int = 2,
         mask_ratio: float = 0.70,
+        mask_mode: str = "token",
+        n_vars: int | None = None,
+        channel_drop_p: float = 0.0,
     ):
         super().__init__()
         self.in_ch, self.img, self.patch = in_ch, img, patch
         self.n_patch = (img // patch) ** 2
         self.pdim = patch * patch * in_ch
         self.mask_ratio = mask_ratio
+        if mask_mode not in ("token", "block"):
+            raise ValueError(f"mask_mode {mask_mode!r} not in ('token', 'block')")
+        self.mask_mode = mask_mode
+        # n_vars = physical variables; in_ch = n_vars * n_scales (scale-stacked pyramid).
+        # Channel drop hides a VARIABLE (all its scale copies -- dropping one scale's
+        # copy would leak it through the others) at input; the loss still reconstructs
+        # every channel at masked tokens, forcing cross-variable inference.
+        self.n_vars = n_vars if n_vars is not None else in_ch
+        if in_ch % self.n_vars != 0:
+            raise ValueError(f"in_ch {in_ch} not a multiple of n_vars {self.n_vars}")
+        self.channel_drop_p = channel_drop_p
         self.patch_embed = nn.Conv2d(in_ch, dim, patch, patch)
         self.pos = nn.Parameter(torch.zeros(1, self.n_patch, dim))
         enc = nn.TransformerEncoderLayer(
@@ -103,11 +118,62 @@ class MAE(nn.Module):
         t = self.enc_norm(self.encoder(self._tokens(x)))
         return t.mean(dim=1)
 
+    def _channel_keep(self, b: int, device) -> torch.Tensor:
+        """[B, in_ch, 1, 1] 0/1 keep-mask dropping whole variables (tied across scales).
+
+        Each variable is dropped iid with p=channel_drop_p; a sample that would drop
+        everything keeps one random variable so the encoder never sees a zero input."""
+        keep = (
+            torch.rand(b, self.n_vars, device=device) >= self.channel_drop_p
+        ).float()
+        dead = keep.sum(1) == 0
+        if dead.any():
+            j = torch.randint(0, self.n_vars, (int(dead.sum()),), device=device)
+            keep[dead, j] = 1.0
+        reps = self.in_ch // self.n_vars
+        return keep.repeat(1, reps)[:, :, None, None]  # scale-major tiling
+
+    def _mask_noise(self, b: int, device) -> torch.Tensor:
+        """Per-token noise whose ascending argsort puts KEPT tokens first.
+
+        token: iid uniform (classic MAE). block: contiguous token rectangles get their
+        noise pushed high until >= mask_ratio of the grid is covered, so the masked set
+        is spatially coherent and reconstruction cannot lean on adjacent visible tokens."""
+        n = self.n_patch
+        if self.mask_mode == "token":
+            return torch.rand(b, n, device=device)
+        g = self.img // self.patch
+        target = int(n * self.mask_ratio)
+        noise = torch.rand(b, n, device=device) * 0.01
+        covered = torch.zeros(b, g, g, dtype=torch.bool, device=device)
+        while True:
+            todo = covered.flatten(1).sum(1) < target
+            if not todo.any():
+                break
+            # one random rectangle per still-short sample (side 1..g//2)
+            h = torch.randint(1, g // 2 + 1, (b,), device=device)
+            w = torch.randint(1, g // 2 + 1, (b,), device=device)
+            r0 = (torch.rand(b, device=device) * (g - h + 1).float()).long()
+            c0 = (torch.rand(b, device=device) * (g - w + 1).float()).long()
+            rr = torch.arange(g, device=device)
+            rect = (
+                (rr[None, :, None] >= r0[:, None, None])
+                & (rr[None, :, None] < (r0 + h)[:, None, None])
+                & (rr[None, None, :] >= c0[:, None, None])
+                & (rr[None, None, :] < (c0 + w)[:, None, None])
+            )
+            covered |= rect & todo[:, None, None]
+        return noise + covered.flatten(1).float()  # covered tokens sort last -> masked
+
     def forward(self, x: torch.Tensor):
         b = x.shape[0]
-        tok = self._tokens(x)
+        if self.training and self.channel_drop_p > 0:
+            x_in = x * self._channel_keep(b, x.device)
+        else:
+            x_in = x
+        tok = self._tokens(x_in)
         n, keep = self.n_patch, int(self.n_patch * (1 - self.mask_ratio))
-        noise = torch.rand(b, n, device=x.device)
+        noise = self._mask_noise(b, x.device)
         ids_shuf = noise.argsort(1)
         ids_rest = ids_shuf.argsort(1)
         ids_keep = ids_shuf[:, :keep]
@@ -182,6 +248,13 @@ def make_batch(patches, mask, sidx, idx, device):
 # --------------------------------------------------------------------------- train
 def train(args) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda" and args.vram_cap_gb:
+        # hard allocator ceiling: when co-tenanting a GPU, torch OOMs THIS process
+        # rather than growing into a neighbor's headroom
+        total = torch.cuda.get_device_properties(0).total_memory
+        frac = min(1.0, args.vram_cap_gb * 2**30 / total)
+        torch.cuda.set_per_process_memory_fraction(frac, 0)
+        log.info("VRAM cap %.1f GB (%.0f%% of device)", args.vram_cap_gb, frac * 100)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     patch_dir = Path(args.patch_dir)
@@ -203,6 +276,9 @@ def train(args) -> None:
         dec_dim=args.dec_dim,
         dec_depth=args.dec_depth,
         mask_ratio=args.mask_ratio,
+        mask_mode=args.mask_mode,
+        n_vars=meta["n_channels"],
+        channel_drop_p=args.channel_drop_p,
     ).to(device)
     nparam = sum(p.numel() for p in model.parameters())
     log.info(
@@ -239,6 +315,11 @@ def train(args) -> None:
                     "dec_depth": args.dec_depth,
                     "mask_ratio": args.mask_ratio,
                 }.items()
+            )
+            # pretext keys use .get: checkpoints predating them mean token/0.0
+            same = same and ck["config"].get("mask_mode", "token") == args.mask_mode
+            same = (
+                same and ck["config"].get("channel_drop_p", 0.0) == args.channel_drop_p
             )
             # OneCycleLR state carries total_steps: resuming under a different
             # schedule length silently corrupts the LR curve, so require identity
@@ -304,6 +385,9 @@ def train(args) -> None:
                 "dec_dim": args.dec_dim,
                 "dec_depth": args.dec_depth,
                 "mask_ratio": args.mask_ratio,
+                "mask_mode": args.mask_mode,
+                "n_vars": meta["n_channels"],
+                "channel_drop_p": args.channel_drop_p,
             },
             "arm": args.arm,
             "scales": [meta["scales"][s] for s in sidx],
@@ -343,8 +427,29 @@ def main() -> None:
     ap.add_argument("--dec-depth", type=int, default=2)
     ap.add_argument("--patch", type=int, default=8)
     ap.add_argument("--mask-ratio", type=float, default=0.70)
+    ap.add_argument(
+        "--mask-mode",
+        choices=["token", "block"],
+        default="token",
+        help="token = iid random token masking (classic MAE); block = contiguous "
+        "rectangles of tokens (harder spatial pretext)",
+    )
+    ap.add_argument(
+        "--channel-drop-p",
+        type=float,
+        default=0.0,
+        help="per-sample probability of hiding each physical variable (all its scale "
+        "copies) at input; loss still reconstructs every channel (cross-variable "
+        "pretext)",
+    )
     ap.add_argument("--ckpt-every", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--vram-cap-gb",
+        type=float,
+        default=None,
+        help="hard torch allocator cap in GB for this process (polite GPU sharing)",
+    )
     ap.add_argument(
         "--no-ram",
         action="store_true",
