@@ -1,0 +1,88 @@
+(base) [dketchum@zephyr-login ~]$ curl -sL https://raw.githubusercontent.com/dgketchum/handily/main/dri_recon.sh | bash
+=== os ===
+Linux zephyr-login 4.18.0-553.132.1.el8_10.x86_64 #1 SMP Thu Jun 11 14:27:43 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+NAME="Rocky Linux"
+VERSION="8.10 (Green Obsidian)"
+=== scheduler ===
+/usr/bin/sinfo
+/usr/bin/squeue
+/usr/bin/sbatch
+PARTITION  AVAIL  TIMELIMIT   NODES(A/I/O/T) NODELIST
+student       up 1-00:00:00        0/14/0/14 compute[1-14]
+debug         up      30:00        0/14/0/14 compute[1-14]
+standard      up 7-00:00:00        0/14/0/14 compute[1-14]
+highmem       up 7-00:00:00          0/1/0/1 compute15
+general       up 7-00:00:00        0/14/0/14 compute[1-14]
+single-gpu    up 7-00:00:00          1/0/0/1 gpu1
+all-gpu       up 7-00:00:00          1/0/0/1 gpu1
+=== modules ===
+------------------------ /usr/local/Modules/modulefiles ------------------------
+apps/anaconda3-2022.10                           mpi/mpich4.0.3-gcc12.2.0
+apps/camx-7.20-gcc8.5.0                          mpi/mvapich2.3.7-gcc12.2.0
+apps/camx-7.31-gcc8.5.0                          mpi/openmpi4.1.4-gcc8.5.0
+apps/ferret-7.6.0-gcc12.2.0                      mpi/openmpi4.1.4-gcc12.2.0
+apps/gmsh-4.11.0                                 mpi/openmpi4.1.4-oneapi2023
+apps/hysplit-5.2.3                               nvidia-pgi/23.5
+apps/julia-1.8.3-gcc12.2.0
+apps/matlab-r2022b
+apps/nco-5.2.8
+apps/ncview-2.1.9
+apps/openfoam-v2112-220610-gcc12.2.0
+apps/paraview-5.11
+apps/R-4.2.2
+apps/RStudio-2022.07.2-576
+apps/wps-4.4-gcc12.2.0-dmpar
+apps/wps-4.4-gcc12.2.0-serial
+apps/wps-4.4-oneapi2023-dmpar
+apps/wps-4.5-gcc12.2.0-dmpar
+apps/wps-4.5-gcc12.2.0-serial
+apps/wps-4.5-oneapi2023-dmpar
+apps/wps-4.5-oneapi2023-serial
+apps/wrf-4.4.1-gcc12.2.0
+apps/wrf-4.4.1-oneapi2023
+apps/wrf-4.5.1-gcc12.2.0
+apps/wrf-4.5.1-gcc12.2.0_new
+apps/wrf-4.5.1-oneapi2023
+apps/wrf-sfire-4.4-gcc12.2.0
+compiler/gcc12.2.0
+intel/oneapi2021.4
+intel/oneapi2023.0
+intel/oneapi2023.0-nompi
+library/hdf5-1.12.2-gcc8.5.0
+library/hdf5-1.12.2-gcc12.2.0
+library/hdf5-1.12.2-oneapi2023
+library/hdf5-1.14.3-gcc12.2.0
+library/intelmkl-2022.0.1
+library/jasper-2.0.33-gcc12.2.0
+library/libradtran-2.0.4-gcc12.2.0
+library/libradtran-2.0.4-with-modules-gcc12.2.0
+=== tools ===
+git      /usr/bin/git
+curl     /usr/local/anaconda3/bin/curl
+wget     /usr/local/anaconda3/bin/wget
+rsync    /usr/bin/rsync
+tmux     /usr/bin/tmux
+screen   /usr/bin/screen
+python3  /usr/local/anaconda3/bin/python3
+gcc      /usr/bin/gcc
+cmake    /usr/bin/cmake
+=== egress (needs outbound 443) ===
+HTTP/2 400
+HTTP/2 200
+=== storage ===
+Filesystem                  Size  Used Avail Use% Mounted on
+izephyr-storage:/data/home   16T  1.3T   15T   9% /home
+ /data   /project   /scratch
+=== gpus ===
+PARTITION GRES NODES MEMORY CPUS
+student (null) 14 505836 56
+debug (null) 14 505836 56
+standard (null) 14 505836 56
+highmem (null) 1 1021932 56
+general (null) 14 505836 56
+single-gpu gpu:nvidia_l40s:4(S:0-1) 1 514967 64
+all-gpu gpu:nvidia_l40s:4(S:0-1) 1 514967 64
+=== recon done ===
+(base) [dketchum@zephyr-login ~]$
+
+
