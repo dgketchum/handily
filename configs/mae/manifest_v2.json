@@ -1,9 +1,9 @@
 {
-  "dem": "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif",
+  "dem": "/nas/handily/covariates/terrain/elev48i0100a.tif",
   "channels": [
     {
       "name": "dem_rel",
-      "path": "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif",
+      "path": "/nas/handily/covariates/terrain/elev48i0100a.tif",
       "transform": "dem_rel"
     },
     {
@@ -217,5 +217,6 @@
       "name": "lst_b10_amp_k",
       "path": "/nas/handily/covariates/mae_v2_100m/lst_b10_amp_k.tif"
     }
-  ]
+  ],
+  "footprint_channel": "prism_ppt_mm"
 }

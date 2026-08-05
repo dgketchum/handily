@@ -50,6 +50,7 @@ REF_W, REF_H = 49810, 31390  # cols, rows of every channel raster (both divisibl
 
 WIN = 64  # output tokens per side
 HALF = WIN // 2
+NORM_SUBSAMPLE = 30_000  # patches used for per-(channel,scale) robust norm stats
 SCALES = (1, 5, 10, 40)  # 100/500/1k/4k m pool factors -> 6.4/32/64/256 km footprints
 # The 4 km level (256 km footprint, +-128 km radius) is the basin-scale rung: NM rift /
 # Great Basin closed basins span 50-150 km, so a window must reach >=~150 km to see the
@@ -84,6 +85,13 @@ CHANNEL_NAMES = [c[0] for c in CHANNEL_SPECS]
 # -> exact same rasters).
 _COV_CACHE = Path("/data/ssd2/handily/conus/mae/covariate_cache")
 
+# Channel whose valid footprint defines the training domain. The DEM alone cannot:
+# elev48i0100a carries real values (0) over ocean and across the Canada/Mexico border,
+# so "DEM present" admits centers/pixels where every CONUS-only covariate is nodata
+# (measured 2026-07-21: ~49% of the lattice rectangle). When set, centers are sampled
+# only where this channel is valid and mask.u8 = DEM finite AND footprint finite.
+FOOTPRINT_CHANNEL: str | None = None
+
 
 def resolve_raster(path: str) -> str:
     """Return the local-cache copy of a raster if present, else the canonical path."""
@@ -99,8 +107,10 @@ def apply_manifest(manifest: dict) -> None:
     "path", "transform": absent | "dem_rel" | number}, ...]}. Every channel raster must
     already be on the canonical 100 m lattice (load_channel_full still asserts this).
     Exactly one channel must carry transform "dem_rel" -- it supplies the center-elevation
-    datum and the validity mask."""
-    global CHANNEL_SPECS, CHANNEL_NAMES, _DEM, _COV_CACHE
+    datum and the validity mask. Optional "footprint_channel": name of a channel whose
+    valid area defines the training domain (see FOOTPRINT_CHANNEL); it must appear
+    after the dem_rel channel so the mask AND lands on an initialized mask."""
+    global CHANNEL_SPECS, CHANNEL_NAMES, _DEM, _COV_CACHE, FOOTPRINT_CHANNEL
     specs: list[tuple[str, str, object]] = []
     for ch in manifest["channels"]:
         tr = ch.get("transform")
@@ -112,9 +122,19 @@ def apply_manifest(manifest: dict) -> None:
         raise SystemExit("manifest: duplicate channel names")
     if sum(1 for s in specs if s[2] == "dem_rel") != 1:
         raise SystemExit("manifest: exactly one channel must have transform 'dem_rel'")
+    fp = manifest.get("footprint_channel")
+    if fp is not None:
+        if fp not in names:
+            raise SystemExit(f"manifest: footprint_channel {fp!r} not in channels")
+        dem_idx = next(i for i, s in enumerate(specs) if s[2] == "dem_rel")
+        if names.index(fp) <= dem_idx:
+            raise SystemExit(
+                "manifest: footprint_channel must come after the dem_rel channel"
+            )
     CHANNEL_SPECS = specs
     CHANNEL_NAMES = names
     _DEM = manifest["dem"]
+    FOOTPRINT_CHANNEL = fp
     if manifest.get("cache_dir"):
         _COV_CACHE = Path(manifest["cache_dir"])
 
@@ -258,8 +278,17 @@ def extract_stack(
                     win = win - datum[:, None, None]
                     if mask_out is not None:
                         mask_out[b0:b1, si] = np.isfinite(win).astype("uint8")
+                elif name == FOOTPRINT_CHANNEL and mask_out is not None:
+                    # domain mask = DEM finite AND footprint finite (the DEM alone is
+                    # valid over ocean/cross-border; see FOOTPRINT_CHANNEL)
+                    mask_out[b0:b1, si] &= np.isfinite(win).astype("uint8")
                 if norm is not None:
                     win = apply_norm(win, st[si]["median"], st[si]["iqr"])
+                else:
+                    # raw pass may land in a float16 memmap: clip inside f16 range
+                    # (|x|<=6e4; NaN passes through). Values this far out saturate the
+                    # +-5 IQR normalization clip anyway, so stats are unaffected.
+                    win = np.clip(win, -6.0e4, 6.0e4)
                 out[b0:b1, si, ci] = win
         del full, raw, scales_full
 
@@ -275,6 +304,18 @@ def sample_centers(n: int, seed: int, block_px: int = 2000) -> pd.DataFrame:
         dem = src.read(1)
         nd = src.nodata
     valid_full = dem != nd
+    if FOOTPRINT_CHANNEL is not None:
+        spec = next(s for s in CHANNEL_SPECS if s[0] == FOOTPRINT_CHANNEL)
+        fp_full, _ = load_channel_full(spec[1], spec[2])
+        before = valid_full.mean()
+        valid_full &= np.isfinite(fp_full)
+        log.info(
+            "footprint %s: valid frac %.3f -> %.3f",
+            FOOTPRINT_CHANNEL,
+            before,
+            valid_full.mean(),
+        )
+        del fp_full
     pool = min(n * 6, 4_000_000)
     col = rng.integers(0, REF_W, pool)
     row = rng.integers(0, REF_H, pool)
@@ -308,9 +349,11 @@ def build(out_dir: Path, n_patches: int, seed: int) -> None:
         out_dir / "patches.f16", "float16", "w+", shape=(n, ns, nc, WIN, WIN)
     )
     mask = np.memmap(out_dir / "mask.u8", "uint8", "w+", shape=(n, ns, WIN, WIN))
-    raw_ms = np.zeros((n, ns, nc, WIN, WIN), "float32")  # transient, for norm stats
 
-    extract_stack(col, row, raw_ms, mask_out=mask, norm=None)
+    # pass 1: RAW values (f16, clipped to f16 range) straight into the final memmap.
+    # No full float32 staging array: at v2 scale (53 ch x 100k patches) that array
+    # would be ~350 GB RAM, and it can never work for the ~1M-patch cluster builds.
+    extract_stack(col, row, patches, mask_out=mask, norm=None)
 
     # dem_rel center datum (already center-relative -> read the raw elevation separately)
     with rasterio.open(resolve_raster(_DEM)) as src:
@@ -319,19 +362,29 @@ def build(out_dir: Path, n_patches: int, seed: int) -> None:
     center_elev[center_elev == 32767] = np.nan
     del dem
 
+    # pass 2: per (channel, scale) robust stats from a patch subsample, then blockwise
+    # in-place normalization of the memmap. Median/IQR from <=30k patches x 4096 px is
+    # statistically indistinguishable from the full-set stats the old in-RAM path used.
+    sub = np.sort(
+        np.random.default_rng(seed + 1).choice(
+            n, size=min(n, NORM_SUBSAMPLE), replace=False
+        )
+    )
     stats = {"channels": CHANNEL_NAMES, "scales": list(SCALES), "per_channel_scale": {}}
     for ci, name in enumerate(CHANNEL_NAMES):
         stats["per_channel_scale"][name] = []
         for si in range(ns):
-            vals = raw_ms[:, si, ci][mask[:, si] == 1]
+            raw_sub = np.asarray(patches[sub, si, ci], "float32")
+            vals = raw_sub[np.asarray(mask[sub, si]) == 1]
             med, iqr = robust_stats(vals)
             nanfrac = float(np.mean(~np.isfinite(vals))) if vals.size else 1.0
             stats["per_channel_scale"][name].append(
                 {"scale": SCALES[si], "median": med, "iqr": iqr, "nan_frac": nanfrac}
             )
-            patches[:, si, ci] = apply_norm(raw_ms[:, si, ci], med, iqr).astype(
-                "float16"
-            )
+            for b0 in range(0, n, 6000):
+                b1 = min(b0 + 6000, n)
+                x = np.asarray(patches[b0:b1, si, ci], "float32")
+                patches[b0:b1, si, ci] = apply_norm(x, med, iqr).astype("float16")
             if nanfrac > 0.10:
                 log.warning(
                     "%s s=%d nan_frac=%.3f (>10%%) -- investigate",
@@ -341,7 +394,6 @@ def build(out_dir: Path, n_patches: int, seed: int) -> None:
                 )
     patches.flush()
     mask.flush()
-    del raw_ms
 
     centers["center_elev_m"] = center_elev
     centers.to_parquet(out_dir / "centers.parquet")
@@ -353,11 +405,13 @@ def build(out_dir: Path, n_patches: int, seed: int) -> None:
         "scales": list(SCALES),
         "win": WIN,
         "dem": _DEM,
+        "footprint_channel": FOOTPRINT_CHANNEL,
         "lattice_origin_5070": list(LATTICE_ORIGIN),
         "res_m": RES_M,
         "patches_shape": [n, ns, nc, WIN, WIN],
         "dtype": "float16",
         "seed": seed,
+        "norm_subsample": int(min(n_patches, NORM_SUBSAMPLE)),
         "argv": sys.argv,
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))

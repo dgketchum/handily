@@ -130,9 +130,21 @@ def test_apply_norm_clip_and_nan_impute():
 @pytest.fixture()
 def _manifest_globals():
     # apply_manifest rebinds module globals; snapshot/restore so tests stay isolated
-    saved = (bmp.CHANNEL_SPECS, bmp.CHANNEL_NAMES, bmp._DEM, bmp._COV_CACHE)
+    saved = (
+        bmp.CHANNEL_SPECS,
+        bmp.CHANNEL_NAMES,
+        bmp._DEM,
+        bmp._COV_CACHE,
+        bmp.FOOTPRINT_CHANNEL,
+    )
     yield
-    bmp.CHANNEL_SPECS, bmp.CHANNEL_NAMES, bmp._DEM, bmp._COV_CACHE = saved
+    (
+        bmp.CHANNEL_SPECS,
+        bmp.CHANNEL_NAMES,
+        bmp._DEM,
+        bmp._COV_CACHE,
+        bmp.FOOTPRINT_CHANNEL,
+    ) = saved
 
 
 def test_apply_manifest_rebinds_roster(_manifest_globals):
@@ -184,3 +196,177 @@ def test_apply_manifest_rejects_duplicate_names(_manifest_globals):
                 ],
             }
         )
+
+
+def test_apply_manifest_footprint_validation(_manifest_globals):
+    chans = [
+        {"name": "dem_rel", "path": "/d.tif", "transform": "dem_rel"},
+        {"name": "slope", "path": "/s.tif"},
+    ]
+    with pytest.raises(SystemExit, match="footprint_channel"):
+        bmp.apply_manifest(
+            {"dem": "/d.tif", "channels": chans, "footprint_channel": "nope"}
+        )
+    # footprint before dem_rel would AND into an uninitialized mask
+    rev = [chans[1], chans[0]]
+    with pytest.raises(SystemExit, match="after the dem_rel"):
+        bmp.apply_manifest(
+            {"dem": "/d.tif", "channels": rev, "footprint_channel": "slope"}
+        )
+    bmp.apply_manifest(
+        {"dem": "/d.tif", "channels": chans, "footprint_channel": "slope"}
+    )
+    assert bmp.FOOTPRINT_CHANNEL == "slope"
+
+
+def _write_raster(path, arr, nodata):
+    import rasterio
+    from rasterio.transform import Affine
+
+    t = Affine(100.0, 0, bmp.LATTICE_ORIGIN[0], 0, -100.0, bmp.LATTICE_ORIGIN[1])
+    prof = dict(
+        driver="GTiff",
+        width=arr.shape[1],
+        height=arr.shape[0],
+        count=1,
+        dtype="float32",
+        crs="EPSG:5070",
+        transform=t,
+        nodata=nodata,
+    )
+    with rasterio.open(path, "w", **prof) as d:
+        d.write(arr.astype("float32"), 1)
+
+
+def test_sample_centers_respects_footprint(tmp_path, monkeypatch, _manifest_globals):
+    # DEM valid everywhere (the elev48i0100a failure mode: ocean/cross-border cells
+    # carry real values); footprint valid only for col >= 50 -> no center left of it
+    W, H = 200, 150
+    rng = np.random.default_rng(1)
+    dem = rng.normal(1500, 100, (H, W))
+    _write_raster(tmp_path / "dem.tif", dem, 32767)
+    fp = rng.normal(800, 50, (H, W))
+    fp[:, :50] = -9999
+    _write_raster(tmp_path / "fp.tif", fp, -9999)
+    monkeypatch.setattr(bmp, "REF_W", W)
+    monkeypatch.setattr(bmp, "REF_H", H)
+    bmp.apply_manifest(
+        {
+            "dem": str(tmp_path / "dem.tif"),
+            "cache_dir": str(tmp_path / "nocache"),
+            "channels": [
+                {
+                    "name": "dem_rel",
+                    "path": str(tmp_path / "dem.tif"),
+                    "transform": "dem_rel",
+                },
+                {"name": "fp", "path": str(tmp_path / "fp.tif")},
+            ],
+            "footprint_channel": "fp",
+        }
+    )
+    df = bmp.sample_centers(20, seed=0)
+    assert len(df) == 20
+    assert (df["col"] >= 50).all()
+
+
+def test_extract_stack_mask_is_dem_and_footprint(
+    tmp_path, monkeypatch, _manifest_globals
+):
+    # fine-scale mask must zero pixels where the footprint is nodata even though the
+    # DEM is valid there (window straddles the footprint boundary at col 50)
+    W, H = 200, 150
+    rng = np.random.default_rng(2)
+    dem = rng.normal(1500, 100, (H, W))
+    _write_raster(tmp_path / "dem.tif", dem, 32767)
+    fp = rng.normal(800, 50, (H, W))
+    fp[:, :50] = -9999
+    _write_raster(tmp_path / "fp.tif", fp, -9999)
+    monkeypatch.setattr(bmp, "REF_W", W)
+    monkeypatch.setattr(bmp, "REF_H", H)
+    bmp.apply_manifest(
+        {
+            "dem": str(tmp_path / "dem.tif"),
+            "cache_dir": str(tmp_path / "nocache"),
+            "channels": [
+                {
+                    "name": "dem_rel",
+                    "path": str(tmp_path / "dem.tif"),
+                    "transform": "dem_rel",
+                },
+                {"name": "fp", "path": str(tmp_path / "fp.tif")},
+            ],
+            "footprint_channel": "fp",
+        }
+    )
+    col, row = np.array([70]), np.array([75])  # window cols 38..101 straddle 50
+    out = np.zeros((1, len(bmp.SCALES), 2, bmp.WIN, bmp.WIN), "float32")
+    mask = np.zeros((1, len(bmp.SCALES), bmp.WIN, bmp.WIN), "uint8")
+    bmp.extract_stack(col, row, out, mask_out=mask, norm=None)
+    fine = mask[0, 0]  # window x -> raster col = 70 - 32 + x
+    assert (fine[:, : 50 - 38] == 0).all()  # footprint nodata -> masked out
+    assert (fine[:, 50 - 38 :] == 1).all()  # dem+footprint valid -> kept
+
+
+def test_build_end_to_end_small(tmp_path, monkeypatch, _manifest_globals):
+    # exercises the streaming build path (raw f16 pass -> subsample stats ->
+    # blockwise in-place normalize) on tiny on-lattice synthetic rasters
+    import json
+
+    import rasterio
+    from rasterio.transform import Affine
+
+    W, H = 200, 150
+    t = Affine(100.0, 0, bmp.LATTICE_ORIGIN[0], 0, -100.0, bmp.LATTICE_ORIGIN[1])
+    rng = np.random.default_rng(3)
+    prof = dict(
+        driver="GTiff",
+        width=W,
+        height=H,
+        count=1,
+        dtype="float32",
+        crs="EPSG:5070",
+        transform=t,
+        nodata=32767,
+    )
+    dem_path = tmp_path / "dem.tif"
+    dem = rng.normal(1500, 100, (H, W)).astype("float32")
+    dem[:5, :5] = 32767  # off-CONUS corner
+    with rasterio.open(dem_path, "w", **prof) as d:
+        d.write(dem, 1)
+    ch_path = tmp_path / "slope.tif"
+    slope = np.abs(rng.normal(5, 2, (H, W))).astype("float32")
+    with rasterio.open(ch_path, "w", **dict(prof, nodata=-9999)) as d:
+        d.write(slope, 1)
+
+    monkeypatch.setattr(bmp, "REF_W", W)
+    monkeypatch.setattr(bmp, "REF_H", H)
+    bmp.apply_manifest(
+        {
+            "dem": str(dem_path),
+            "cache_dir": str(tmp_path / "nocache"),
+            "channels": [
+                {"name": "dem_rel", "path": str(dem_path), "transform": "dem_rel"},
+                {"name": "slope", "path": str(ch_path)},
+            ],
+        }
+    )
+    out = tmp_path / "patches"
+    bmp.build(out, 40, seed=0)
+
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["n_patches"] == 40 and meta["n_channels"] == 2
+    assert meta["norm_subsample"] == 40
+    p = np.asarray(
+        np.memmap(
+            out / "patches.f16", "float16", "r", shape=tuple(meta["patches_shape"])
+        ),
+        "float32",
+    )
+    assert np.isfinite(p).all()  # nodata imputed to 0 post-norm
+    assert np.abs(p).max() <= 5.0 + 1e-2  # +-5 IQR clip held
+    stats = json.loads((out / "norm_stats.json").read_text())
+    med = stats["per_channel_scale"]["slope"][0]["median"]
+    assert abs(med - 5.0) < 1.0  # ~|N(5,2)| median recovered from subsample
+    m = np.memmap(out / "mask.u8", "uint8", "r", shape=(40, 4, bmp.WIN, bmp.WIN))
+    assert 0 < np.asarray(m).mean() <= 1.0
