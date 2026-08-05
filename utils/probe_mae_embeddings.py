@@ -35,7 +35,9 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.model_selection import GroupKFold
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from build_mae_patches import CHANNEL_SPECS, load_channel_full, snap_to_lattice  # noqa: E402
+# module import (not from-import) so a --manifest rebind of the channel roster is seen
+import build_mae_patches as bmp  # noqa: E402
+from build_mae_patches import load_channel_full, snap_to_lattice  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("probe_mae_embeddings")
@@ -60,7 +62,7 @@ def sample_point_covariates(x5070, y5070) -> pd.DataFrame:
     embedding. That asymmetry is the point of the falsifiable test."""
     col, row = snap_to_lattice(x5070, y5070)
     out = {}
-    for name, path, tr in CHANNEL_SPECS:
+    for name, path, tr in bmp.CHANNEL_SPECS:
         if tr == "dem_rel":
             continue
         full, _ = load_channel_full(path, tr)
@@ -131,35 +133,40 @@ def paired_bootstrap_mad_delta(obs, pred_b, pred_c, groups, n_boot=1000, seed=0)
     }
 
 
-# AEF-vs-MAE-vs-combined contrasts: (label, y_arm, y_feat, x_arm, x_feat). The reported
-# delta is MAD(y) - MAD(x) on the common well set (negative => y better than x), with the
-# block-bootstrap CI95 over HUC4 groups. Only contrasts whose two arms/featsets are both
-# present are computed, so the same probe serves AEF-only, MAE-only, or the full 3-arm run.
-CONTRAST_SPECS = [
-    ("aef_vs_mae_embonly", "aef", "a", "mae", "a"),
-    ("aef_vs_mae_withpoint", "aef", "c", "mae", "c"),
-    ("aefmae_vs_aef_embonly", "aefmae", "a", "aef", "a"),
-    ("aefmae_vs_mae_embonly", "aefmae", "a", "mae", "a"),
-    ("aefmae_vs_aef_withpoint", "aefmae", "c", "aef", "c"),
-    ("aefmae_vs_mae_withpoint", "aefmae", "c", "mae", "c"),
-]
+# Cross-arm contrasts: MAD(y) - MAD(x) on the common well set (negative => y better),
+# block-bootstrap CI95 over HUC4 groups, for EVERY pair of arms present and both featsets
+# (a = emb-only, c = emb+point). Direction: y = the later arm in CONTRAST_ORDER, arms not
+# listed there rank after all listed ones in --emb order -- so the historical trio keeps
+# its labels (aef_vs_mae, aefmae_vs_aef, aefmae_vs_mae) and a new candidate arm is always
+# judged as y against every incumbent x.
+CONTRAST_ORDER = ["mae", "aef", "aefmae"]
 
 
 def build_contrasts(obs, preds_a, preds_c, groups, seed) -> dict:
     """Paired block-bootstrap MAD(y)-MAD(x) for each present arm pair (negative => y better)."""
+    arms = list(preds_a)  # insertion order = --emb order
+
+    def rank(a):
+        if a in CONTRAST_ORDER:
+            return (0, CONTRAST_ORDER.index(a))
+        return (1, arms.index(a))
+
     src = {"a": preds_a, "c": preds_c}
     out = {}
-    for label, ya, yf, xa, xf in CONTRAST_SPECS:
-        if ya in src[yf] and xa in src[xf]:
-            d = paired_bootstrap_mad_delta(
-                obs, src[xf][xa], src[yf][ya], groups, seed=seed
-            )
-            out[label] = {
-                "delta_mad_y_minus_x_m": d["delta_mad_c_minus_b_m"],
-                "ci95_low_m": d["ci95_low_m"],
-                "ci95_high_m": d["ci95_high_m"],
-                "frac_y_better": d["frac_c_better"],
-            }
+    for i, p in enumerate(arms):
+        for q in arms[i + 1 :]:
+            xa, ya = sorted((p, q), key=rank)
+            for feat, tag in (("a", "embonly"), ("c", "withpoint")):
+                if ya in src[feat] and xa in src[feat]:
+                    d = paired_bootstrap_mad_delta(
+                        obs, src[feat][xa], src[feat][ya], groups, seed=seed
+                    )
+                    out[f"{ya}_vs_{xa}_{tag}"] = {
+                        "delta_mad_y_minus_x_m": d["delta_mad_c_minus_b_m"],
+                        "ci95_low_m": d["ci95_low_m"],
+                        "ci95_high_m": d["ci95_high_m"],
+                        "frac_y_better": d["frac_c_better"],
+                    }
     return out
 
 
@@ -184,9 +191,20 @@ def main() -> None:
         "--emb", action="append", required=True, help="arm=path.parquet (repeatable)"
     )
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument(
+        "--manifest",
+        default=None,
+        help="channel-manifest JSON rebinding the roster/paths "
+        "(build_mae_patches.apply_manifest). REQUIRED for a fair (c)-(b) gate on an "
+        "embedding trained from a manifest roster: baseline b must point-sample the "
+        "SAME channels the embedding saw, else the embedding gets credit for merely "
+        "carrying covariates absent from b.",
+    )
     ap.add_argument("--n-splits", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    if args.manifest:
+        bmp.apply_manifest(json.loads(Path(args.manifest).read_text()))
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -241,6 +259,7 @@ def main() -> None:
         "population_n": int(len(w)),
         "n_splits": args.n_splits,
         "locked_huc4_excluded": sorted(LOCKED_HUC4),
+        "manifest": args.manifest,
         "point_covariates": list(pt.columns),
         "baseline_b_point_only": panel(obs, pred_pt),
         "wide_basin_slice": {

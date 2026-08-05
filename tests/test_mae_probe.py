@@ -122,6 +122,36 @@ def test_build_contrasts_sign_and_presence():
     assert abs(con["aefmae_vs_aef_embonly"]["delta_mad_y_minus_x_m"] - (-0.5)) < 1e-9
 
 
+def test_build_contrasts_new_arm_judged_against_incumbents():
+    # a v2 candidate arm (not in CONTRAST_ORDER) must appear as y against EVERY
+    # incumbent, with the historical trio labels unchanged.
+    n = 40
+    obs = np.zeros(n)
+    groups = np.array(["01", "02"] * (n // 2))
+    preds = {
+        "aef": np.full(n, 1.0),
+        "mae": np.full(n, 2.0),
+        "aefmae": np.full(n, 0.5),
+        "v2hard": np.full(n, 0.25),
+    }
+    con = pmp.build_contrasts(obs, preds, preds, groups, seed=0)
+    expected_pairs = {
+        "aef_vs_mae",
+        "aefmae_vs_aef",
+        "aefmae_vs_mae",
+        "v2hard_vs_mae",
+        "v2hard_vs_aef",
+        "v2hard_vs_aefmae",
+    }
+    assert set(con) == {
+        f"{p}_{t}" for p in expected_pairs for t in ("embonly", "withpoint")
+    }
+    # v2hard MAD 0.25 vs arm-of-record aefmae MAD 0.5 -> delta -0.25, v2hard better
+    d = con["v2hard_vs_aefmae_embonly"]
+    assert abs(d["delta_mad_y_minus_x_m"] - (-0.25)) < 1e-9
+    assert d["frac_y_better"] == 1.0
+
+
 def test_build_contrasts_skips_absent_arms():
     n = 20
     obs = np.zeros(n)

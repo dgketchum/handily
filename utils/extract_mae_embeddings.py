@@ -43,6 +43,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("extract_mae_embeddings")
 
 
+def out_basename(
+    arm: str, tag: str | None, all_query_nodes: bool, coords_stem: str | None
+) -> str:
+    """Output parquet name. A tag keeps runs from different checkpoints of the SAME
+    arm (e.g. v1 vs v2 pyr_wide) from clobbering each other in the bundle."""
+    t = f"_{tag}" if tag else ""
+    if coords_stem:
+        return f"mae_embeddings_{arm}{t}_{coords_stem}.parquet"
+    return f"mae_embeddings_{arm}{t}{'_allq' if all_query_nodes else ''}.parquet"
+
+
 def build_well_stack(x5070, y5070, norm_stats: dict) -> np.ndarray:
     """Normalized multi-scale stack for points: [N, S, C, WIN, WIN] float16.
 
@@ -100,6 +111,13 @@ def main() -> None:
         default=None,
         help="path prefix for the cached normalized well stack (.npy + .parquet); "
         "reused across arms sharing a patch set. Default: <out-dir>/well_stack",
+    )
+    ap.add_argument(
+        "--tag",
+        default=None,
+        help="suffix for the output filename (mae_embeddings_<arm>_<tag>*.parquet) so "
+        "checkpoints sharing an arm name (v1 vs v2 pyr_wide) never clobber each "
+        "other's artifacts",
     )
     ap.add_argument(
         "--all-query-nodes",
@@ -183,12 +201,11 @@ def main() -> None:
     )
     df = pd.concat([wells[["query_node_idx", "canonical_id"]], emb_df], axis=1)
     if args.coords:
-        fname = f"mae_embeddings_{arm}_{Path(args.coords).stem}.parquet"
+        fname = out_basename(arm, args.tag, False, Path(args.coords).stem)
         out = out_dir / fname
         df.to_parquet(out)
     else:
-        suffix = "_allq" if args.all_query_nodes else ""
-        fname = f"mae_embeddings_{arm}{suffix}.parquet"
+        fname = out_basename(arm, args.tag, args.all_query_nodes, None)
         out = Path(args.bundle) / fname
         df.to_parquet(out)
         # also a copy in the mae embeddings dir (probe reads the real-wells-only one)
