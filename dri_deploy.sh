@@ -47,6 +47,8 @@ if ! command -v gcloud >/dev/null && [ ! -x "$HOME/google-cloud-sdk/bin/gcloud" 
   curl -sSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz | tar -xz -C "$HOME"
 fi
 export PATH=$HOME/google-cloud-sdk/bin:$PATH
+grep -q 'google-cloud-sdk/bin' "$HOME/.bashrc" 2>/dev/null || \
+  echo 'export PATH="$HOME/google-cloud-sdk/bin:$PATH"' >> "$HOME/.bashrc"
 gcloud auth print-access-token >/dev/null 2>&1 || gcloud auth login --no-launch-browser
 
 # ---- 5. mirror pull (flat; ~147 GB; just re-run on interruption) -----------------
