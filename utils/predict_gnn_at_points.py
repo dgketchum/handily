@@ -65,6 +65,7 @@ from build_conus_graph_inputs import (  # noqa: E402
     water_query_features,
 )
 from build_dupuit_wte import build_boundaries, hang_interp  # noqa: E402
+from build_source_edges import EDGE_COLS as SOURCE_EDGE_COLS  # noqa: E402
 from build_stacker_features import sample_coarse  # noqa: E402
 from fac_rem_registry import sample_fac_rem  # noqa: E402
 from infer_conus_gnn import (  # noqa: E402
@@ -99,10 +100,68 @@ def ckpt_extensions(ck: dict) -> tuple[int | None, bool]:
     return f_mae, writeback
 
 
+def ckpt_f_src(ck: dict, f_query: int) -> int | None:
+    """Source-obs block width from a fold checkpoint (--source-obs arms).
+
+    The src block widens ONLY query_enc's input, so its width is the excess of
+    ``query_enc.0.weight`` over the manifest's query feature dim (None = plain arm).
+    """
+    extra = int(ck["state_dict"]["query_enc.0.weight"].shape[1]) - int(f_query)
+    return extra if extra > 0 else None
+
+
+def ckpt_f_srcedge(ck: dict) -> int | None:
+    """Source-edge attr width from a fold checkpoint (--source-edges arms, rung 1).
+
+    ``source_read.score_mlp.0.weight`` is (hidden, in_src + in_dst + edge_dim) with
+    in_src = in_dst = hidden (``source_enc.0.weight``'s out dim), so the edge-attr
+    width is the excess over 2*hidden. None = no source-edge slot.
+    """
+    sd = ck["state_dict"]
+    if "source_read.score_mlp.0.weight" not in sd:
+        return None
+    hidden = int(sd["source_enc.0.weight"].shape[0])
+    return int(sd["source_read.score_mlp.0.weight"].shape[1]) - 2 * hidden
+
+
+def bundle_source_edges(man: dict, device: str) -> dict:
+    """Trainer-verbatim source-edge tensors for a --source-edges arm.
+
+    The trainer standardizes the edge attrs by a GLOBAL fit over the full edge
+    table (no fold or mask dependence), so refitting from the frozen parquet is
+    exact. The path comes from the inference manifest flags.
+    """
+    path = man["flags"].get("source_edges")
+    if not path:
+        raise SystemExit(
+            "checkpoint has a source_read slot but the inference manifest carries "
+            "no source_edges path (flags.source_edges)"
+        )
+    se = pd.read_parquet(path)
+    ea = apply_stats_df(se, fit_stats(se, list(SOURCE_EDGE_COLS), None))
+    src = torch.as_tensor(
+        se["src_query_node_idx"].to_numpy("int64"), dtype=torch.long, device=device
+    )
+    dst = torch.as_tensor(
+        se["query_node_idx"].to_numpy("int64"), dtype=torch.long, device=device
+    )
+    return {
+        "src": src,
+        "ei": torch.stack([src, dst]),
+        "ea": torch.as_tensor(ea, dtype=torch.float32, device=device),
+    }
+
+
 def build_model_pt(
-    man: dict, dims: dict, device: str, f_mae: int | None, writeback: bool
+    man: dict,
+    dims: dict,
+    device: str,
+    f_mae: int | None,
+    writeback: bool,
+    f_src: int | None = None,
+    f_srcedge: int | None = None,
 ) -> WTEGraphNet:
-    """infer_conus_gnn.build_model extended with the writeback/MAE ctor args."""
+    """infer_conus_gnn.build_model extended with the writeback/MAE/src ctor args."""
     flags = man["flags"]
     return WTEGraphNet(
         dims["reach"],
@@ -118,6 +177,8 @@ def build_model_pt(
         directional_edges=bool(flags.get("directional_edges")),
         f_mae=f_mae,
         writeback=writeback,
+        f_src=f_src,
+        f_srcedge=f_srcedge,
     ).to(device)
 
 
@@ -173,14 +234,51 @@ def run_folds_pt(
     where: str,
     f_mae: int | None,
     writeback: bool,
+    src_ctx: dict | None = None,
 ) -> dict:
-    """infer_conus_gnn.run_folds with the extended model ctor (one full batch)."""
+    """infer_conus_gnn.run_folds with the extended model ctor (one full batch).
+
+    ``src_ctx`` (--source-obs arms only) supplies the assimilation inputs:
+    ``resid`` = frame-aligned observed wte_residual_m (NaN where no obs) and
+    ``pool_by_fold(f)`` = the boolean mask of rows whose obs are VISIBLE to fold
+    f's forward. Values are standardized per fold by the checkpoint's y_c/y_s,
+    exactly the trainer's construction.
+    """
     man = models["manifest"]
     dims = dict(man["feature_dims"])
-    model = build_model_pt(man, dims, device, f_mae, writeback)
+    ck0 = next(iter(models["folds"].values()))
+    f_src = ckpt_f_src(ck0, dims["query"])
+    f_srcedge = ckpt_f_srcedge(ck0)
+    need_src = f_src is not None or f_srcedge is not None
+    if need_src != (src_ctx is not None):
+        raise SystemExit(
+            f"source-arm mismatch ({where}): checkpoint f_src={f_src} "
+            f"f_srcedge={f_srcedge} but "
+            f"src_ctx {'missing' if src_ctx is None else 'supplied'}"
+        )
+    model = build_model_pt(
+        man, dims, device, f_mae, writeback, f_src=f_src, f_srcedge=f_srcedge
+    )
     per_fold = []
     for f, ck in sorted(models["folds"].items()):
         feat = fold_tensors(ck, frame, anchors, device)
+        if src_ctx is not None:
+            y_c, y_s = float(ck["y_c"]), float(ck["y_s"])
+            sel = src_ctx["pool_by_fold"](int(f))
+            s = torch.as_tensor(sel.astype("float32"), device=device)
+            val = torch.as_tensor(
+                np.nan_to_num((src_ctx["resid"] - y_c) / y_s, nan=0.0),
+                dtype=torch.float32,
+                device=device,
+            )
+            if f_src is not None:
+                feat["src_x"] = torch.stack([val * s, s], dim=-1)
+            if f_srcedge is not None:
+                ed = src_ctx["edges"]
+                keep = s[ed["src"]] > 0
+                feat["srcedge_ei"] = ed["ei"][:, keep]
+                feat["srcedge_ea"] = ed["ea"][keep]
+                feat["srcedge_val"] = val
         out = forward_fold(model, ck, graph, feat, r_wte)
         assert_mixture_identity(out, r_wte, anchors, f, where)
         per_fold.append(out)
@@ -238,7 +336,35 @@ def oof_check_pt(models: dict, model_dir: Path, device: str, tol_m: float, mae_p
     """infer_conus_gnn.oof_check extended to writeback/MAE arms."""
     man = models["manifest"]
     graph, qn, f_mae, writeback = bundle_graph(models, device, mae_path)
-    log.info("oof-check: f_mae=%s writeback=%s", f_mae, writeback)
+    f_src = ckpt_f_src(models["folds"][0], man["feature_dims"]["query"])
+    f_srcedge = ckpt_f_srcedge(models["folds"][0])
+    log.info(
+        "oof-check: f_mae=%s writeback=%s f_src=%s f_srcedge=%s",
+        f_mae,
+        writeback,
+        f_src,
+        f_srcedge,
+    )
+    src_ctx = None
+    if f_src is not None or f_srcedge is not None:
+        # replay the trainer's FINAL-forward semantics: fold f's sources are the
+        # eligible (real, finite-target) wells OUTSIDE fold f (= its tr|va pool),
+        # so the archived OOF at test rows round-trips exactly.
+        resid = qn["wte_residual_m"].to_numpy("float64")
+        water = qn["is_water_pseudo"].to_numpy(bool)
+        shore = (
+            qn["is_shore_pseudo"].to_numpy(bool)
+            if "is_shore_pseudo" in qn.columns
+            else np.zeros(len(qn), bool)
+        )
+        eligible = ~water & ~shore & np.isfinite(resid)
+        fold_of = qn["cv_fold"].to_numpy("int64")
+        src_ctx = {
+            "resid": resid,
+            "pool_by_fold": lambda f: eligible & (fold_of != f),
+        }
+        if f_srcedge is not None:
+            src_ctx["edges"] = bundle_source_edges(man, device)
     r_wte = qn["regional_wte_idw_oof_m"].to_numpy("float64")
     anchors = build_anchors(
         qn[man["dtw_base_col"]].to_numpy("float64"),
@@ -248,7 +374,16 @@ def oof_check_pt(models: dict, model_dir: Path, device: str, tol_m: float, mae_p
         bool(man["flags"]["mirror_anchor"]),
     )
     agg = run_folds_pt(
-        models, graph, qn, r_wte, anchors, device, "oof-check", f_mae, writeback
+        models,
+        graph,
+        qn,
+        r_wte,
+        anchors,
+        device,
+        "oof-check",
+        f_mae,
+        writeback,
+        src_ctx=src_ctx,
     )
     arch = pd.read_parquet(model_dir / "gnn_oof_predictions.parquet")
     arch = arch.set_index("canonical_id").loc[qn["canonical_id"]]
@@ -306,6 +441,16 @@ def main() -> None:
     log.info("arm %s: f_mae=%s writeback=%s", model_dir.name, f_mae, writeback)
     if f_mae is not None and not args.mae_embeddings:
         raise SystemExit("this arm has an MAE head; pass --mae-embeddings")
+    if (
+        ckpt_f_src(models["folds"][0], man["feature_dims"]["query"]) is not None
+        or ckpt_f_srcedge(models["folds"][0]) is not None
+    ):
+        raise SystemExit(
+            "source-assimilation arm: external-point prediction needs the source "
+            "wells INSIDE the forward (query set = points + source wells so their "
+            "obs can reach the points through the writeback / source edges) -- not "
+            "implemented yet; use --oof-check or the warm-eval path on the bundle"
+        )
 
     gdir = Path(man["graph_dir"])
     bman = json.loads((gdir / "graph_manifest.json").read_text())
