@@ -312,6 +312,8 @@ class WTEGraphNet(nn.Module):
         f_sc_edge: int | None = None,
         f_mae: int | None = None,
         f_analog: int | None = None,
+        f_src: int | None = None,
+        f_srcedge: int | None = None,
         writeback: bool = False,
         pinball: bool = False,
         fac_skip: bool = False,
@@ -378,6 +380,20 @@ class WTEGraphNet(nn.Module):
         self.has_mae = f_mae is not None
         self.has_analog = f_analog is not None
         self.writeback = writeback
+        # source-obs (assimilation rung 0): extra per-query obs feature block
+        # [standardized obs value * valid, valid, ...] concatenated onto query_x
+        # BEFORE query_enc, so a source well's observation rides the 6C write-back
+        # onto its reaches and reaches nearby queries through the channel stack.
+        self.has_src = f_src is not None
+        if self.has_src and not writeback:
+            # without the write-back a source obs can influence nothing but its own
+            # (loss-masked) row -- a silent no-op arm, so fail loud instead.
+            raise ValueError("source-obs features (f_src) require query-writeback (6C)")
+        # source-well edges (assimilation rung 1): each query attention-reads its
+        # <=k nearest source wells' observed residuals over direct spatial edges,
+        # bypassing the diluted writeback->reach->lateral path rung 0 died on.
+        # Independent of writeback/f_src (edges ARE the transmission path).
+        self.has_srcedge = f_srcedge is not None
         if self.has_ms and self.has_anchor:
             # anchors are off in prod; keep the head bookkeeping ([q, ctx_reach, ctx_*])
             # single-branch so we never have to reconcile two hidden*3 read contexts.
@@ -442,8 +458,12 @@ class WTEGraphNet(nn.Module):
         self.reach_enc = nn.Sequential(
             nn.Linear(f_reach, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
         )
+        # in_dim widens by the source-obs block when present (f_src=None -> unchanged,
+        # byte-identical to baseline).
         self.query_enc = nn.Sequential(
-            nn.Linear(f_query, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
+            nn.Linear(f_query + (f_src or 0), hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
         )
         # Channel + lateral message passing is flow-direction-conditioned when
         # directional_edges is set (the trainer supplies ch_dir/lat_dir). Anchor convs
@@ -552,6 +572,26 @@ class WTEGraphNet(nn.Module):
                 hidden, hidden, f_analog, hidden, dropout=dropout
             )
             head_in += hidden  # [.., ctx_analog]
+        if self.has_srcedge:
+            # Source-edge read (assimilation rung 1): the analog slot's twin over
+            # LOCAL spatial kNN edges to visible source wells ("learned IDW"). Each
+            # query attends (PortfolioReadConv) over its surviving source edges,
+            # importing the source's fold-standardized observed residual
+            # (`srcedge_val`, per-node scalar via source_enc) modulated by the
+            # target-blind spatial edge attrs (log-distances / rel-elev /
+            # same-basin). Leakage control is the TRAINER's job: it filters the
+            # edge set per forward to the visible-source protocol (per-epoch drawn
+            # masks in training, all-train at val, train+val at final/OOF), so a
+            # well never reads its own site and a test row never feeds an edge. A
+            # query with no surviving edge aggregates to zero (finite). Additive
+            # head slot; off => no module, no head widening => byte-identical.
+            self.source_enc = nn.Sequential(
+                nn.Linear(1, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
+            )
+            self.source_read = PortfolioReadConv(
+                hidden, hidden, f_srcedge, hidden, dropout=dropout
+            )
+            head_in += hidden  # [.., ctx_srcedge]
         if self.writeback:
             # query->reach write-back (6C): one bipartite gated conv (query as src, reach as
             # dst) applied as a residual BEFORE the channel stack, so well context mixes 2
@@ -789,6 +829,13 @@ class WTEGraphNet(nn.Module):
         # keyed access errors loudly if the flag is on but the trainer omitted them.
         ch_dir = g["ch_dir"] if self.directional_edges else None
         lat_dir = g["lat_dir"] if self.directional_edges else None
+        # source-obs block rides in through query_enc (keyed access errors loudly if
+        # the flag is on but the trainer omitted src_x).
+        qx = (
+            torch.cat([g["query_x"], g["src_x"]], dim=-1)
+            if self.has_src
+            else g["query_x"]
+        )
         r = self.reach_enc(g["reach_x"])
         if self.has_anchor and "anchor_x" in g:
             a = self.anchor_enc(g["anchor_x"])
@@ -800,7 +847,7 @@ class WTEGraphNet(nn.Module):
             for layer in self.channel:
                 r = r + layer(r, r, g["ch_ei"], g["ch_ea"], dir_sign=ch_dir)
                 r = r + self.anchor_to_reach(a, r, g["ar_ei"], g["ar_ea"])
-            q = self.query_enc(g["query_x"])
+            q = self.query_enc(qx)
             ctx_reach = self.lateral(r, q, g["lat_ei"], g["lat_ea"], dir_sign=lat_dir)
             ctx_anchor = self.anchor_to_query(a, q, g["aq_ei"], g["aq_ea"])
             h = torch.cat([q, ctx_reach, ctx_anchor], dim=-1)
@@ -809,7 +856,7 @@ class WTEGraphNet(nn.Module):
             # onto reaches as a residual (mirrors the anchor BC pre-channel injection). When
             # writeback is off this reorder is a pure no-op (query_enc reads only query_x),
             # so the compute graph is byte-identical to baseline.
-            q = self.query_enc(g["query_x"])
+            q = self.query_enc(qx)
             if self.writeback:
                 # reversed lateral edges (query src -> reach dst); residual, so reaches with
                 # no incident well are unchanged. Context then mixes 2 hops out via channels.
@@ -852,6 +899,19 @@ class WTEGraphNet(nn.Module):
                 g["analog_ea"],
             )
             h = torch.cat([h, ctx_analog], dim=-1)
+        if self.has_srcedge:
+            # additive per-query source-well context (rung 1): attention-read the
+            # fold-standardized observed residual of the query's visible spatial
+            # source wells. The trainer supplies srcedge_ei/srcedge_ea already
+            # filtered to the visible-source protocol; zero-edge queries -> zero
+            # context (finite).
+            ctx_srcedge = self.source_read(
+                self.source_enc(g["srcedge_val"].view(-1, 1)),
+                q,
+                g["srcedge_ei"],
+                g["srcedge_ea"],
+            )
+            h = torch.cat([h, ctx_srcedge], dim=-1)
         # FAC raw-skip / confidence-gate pieces (no-op when fac_skip is off).
         h, skip = self._augment_for_skip(h, g)
         if self.sigma:

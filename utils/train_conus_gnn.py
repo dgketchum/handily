@@ -55,6 +55,7 @@ HANG_DTW_COL = DUPUIT_FEATURE_COLS[0]
 # as `base - native` and carry obs_wte/z_surf; dtw_residual reconstructs `base + native`.
 HEAD_SPACE_MODES = (TARGET_WTE, TARGET_WTE_RESIDUAL)
 from build_analog_edges import analog_fold_keep  # noqa: E402
+from build_source_edges import EDGE_COLS as SOURCE_EDGE_COLS  # noqa: E402
 from train_wte_gnn import (  # noqa: E402
     WTEGraphNet,
     apply_stats,
@@ -255,6 +256,7 @@ def train_fold(
     pair_w=0.0,
     ordinal_y_t=None,
     ts_prior_t=None,
+    src_ctx=None,
 ):
     """Train one fold; early-stop on val DTW-MAD; return native_hat over all queries.
 
@@ -264,10 +266,59 @@ def train_fold(
     BCE term at ``args.ordinal_weight`` on the same train rows/weights.
     ``ts_prior_t`` (full-length float in (0,1), optional; --two-surface only) is the
     privileged P(phreatic) assignment prior for the WP2 membership BCE term.
+    ``src_ctx`` (--source-obs / --source-edges) carries the fold's assimilation
+    machinery: standardized obs values, the train / train+val eligible source pools,
+    the mask fraction range, a fold-seeded rng for the per-epoch source redraw,
+    ``has_x`` (whether the rung-0 src_x feature block is on), and -- rung 1 -- the
+    fold-static source-edge tensors (``edge_src``/``edge_ei``/``edge_ea``).
     """
     opt = torch.optim.Adam(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
+    # source-well assimilation (rungs 0/1), the masked-label protocol: each epoch a
+    # fresh random subset of the eligible TRAIN pool becomes sources -- their
+    # standardized obs becomes VISIBLE (rung 0: feat["src_x"]; rung 1: their edges
+    # survive the filter); redrawing every epoch stops the model memorizing which
+    # wells are always targets. Loss handling differs by rung: with src_x on, a
+    # drawn source carries its OWN obs in its feature row, so its loss is a copy
+    # task and is zeroed (and pairs through it dropped). Edges-only arms keep FULL
+    # label mass -- self/same-site edges are dropped at build time, so a source
+    # never sees its own label and its loss is legitimate supervision (zeroing it
+    # anyway cost ~60% of train labels per epoch: rung 1's A2 cold regression).
+    # The eval forwards are deterministic: val/early-stop shows ALL train sources;
+    # the final forward (whose test rows feed the OOF) shows train+val sources --
+    # test rows are never in a pool, so they stay unassisted. With val_mix on
+    # (--source-val-mix) early stopping averages the val MAD of a NO-source
+    # forward with the all-train-sources one, so model selection cannot favor
+    # edge-reliant weights that lose unassisted (cold/far-from-well) skill --
+    # rung 1's second protocol defect.
+    src_on = src_ctx is not None
+    if src_on:
+        sv = src_ctx["val_std"]
+        src_has_x = src_ctx.get("has_x", True)
+        src_has_edges = "edge_ei" in src_ctx
+        src_val_mix = src_ctx.get("val_mix", False)
+
+        def _apply_sources(sel: np.ndarray) -> None:
+            """Point feat's source tensors at a visible-source mask: the rung-0
+            src_x block and/or the rung-1 edge subset (visible sources only)."""
+            s = torch.as_tensor(sel.astype("float32"), device=device)
+            if src_has_x:
+                feat["src_x"] = torch.stack([sv * s, s], dim=-1)
+            if src_has_edges:
+                keep = s[src_ctx["edge_src"]] > 0
+                feat["srcedge_ei"] = src_ctx["edge_ei"][:, keep]
+                feat["srcedge_ea"] = src_ctx["edge_ea"][keep]
+                feat["srcedge_val"] = sv
+
+        src_pool_idx = np.flatnonzero(src_ctx["tr_pool"])
+        src_fmin, src_fmax = src_ctx["frac"]
+        src_rng = src_ctx["rng"]
+        if sample_w_t is None:
+            # the rung-0 protocol zeroes per-row weights, so force the weighted loss
+            # path even when depth-aware weighting is off (uniform ones == plain
+            # mean for edges-only arms, so forcing is harmless there).
+            sample_w_t = torch.ones(len(sv), dtype=torch.float32, device=device)
     weighted = sample_w_t is not None
     pair_delta = _huber_delta_std(args, mode, y_s)
     huber = nn.HuberLoss(
@@ -281,6 +332,15 @@ def train_fold(
     for epoch in range(args.epochs):
         model.train()
         opt.zero_grad()
+        drawn_t = None
+        if src_on:
+            k = int(round(src_rng.uniform(src_fmin, src_fmax) * len(src_pool_idx)))
+            drawn = np.zeros(len(tr), dtype=bool)
+            drawn[src_rng.choice(src_pool_idx, size=k, replace=False)] = True
+            _apply_sources(drawn)
+            drawn_t = torch.as_tensor(drawn, device=device)
+            if src_has_x:
+                w_tr = sample_w_t[tr_t] * (~drawn_t[tr_t]).float()
         out = model(feat)
         if args.pinball:
             primary, pin = out
@@ -346,9 +406,18 @@ def train_fold(
             # space is the correct arena. delta is the POINT-loss Huber knee
             # (_huber_delta_std) -- NOT eff_tau, which is the pinball QUANTILE and
             # dimensionally wrong as a knee; the plan asks for no second tau knob.
-            dp = pred_point[pair_idx[0]] - pred_point[pair_idx[1]]
-            dy = y_std[pair_idx[0]] - y_std[pair_idx[1]]
-            loss = loss + pair_w * nn.functional.huber_loss(dp, dy, delta=pair_delta)
+            pi = pair_idx
+            if src_on and src_has_x:
+                # drop pairs with a drawn-source member: with src_x on, a source's
+                # prediction has seen its own obs, so loss through it leaks the label.
+                keep = ~drawn_t[pair_idx[0]] & ~drawn_t[pair_idx[1]]
+                pi = pair_idx[:, keep]
+            if pi.numel():
+                dp = pred_point[pi[0]] - pred_point[pi[1]]
+                dy = y_std[pi[0]] - y_std[pi[1]]
+                loss = loss + pair_w * nn.functional.huber_loss(
+                    dp, dy, delta=pair_delta
+                )
         if ordinal_y_t is not None and model.ordinal_logits is not None:
             # WP5 ordinal BCE, mean over thresholds then the SAME per-row weighting
             # as the point loss (water pseudo-rows enter as shallow evidence at
@@ -361,10 +430,23 @@ def train_fold(
         loss.backward()
         opt.step()
         model.eval()
+        val_mad0 = None
+        if src_on:
+            if src_val_mix:
+                # unassisted half of the mixed criterion: no sources visible.
+                _apply_sources(np.zeros(len(src_ctx["tr_pool"]), dtype=bool))
+                with torch.no_grad():
+                    nat0 = _combine_native(model(feat), y_s, y_c, base, mode, args)
+                dtw0 = _native_to_dtw(nat0, base, mode)
+                val_mad0 = float(np.nanmedian(np.abs(dtw0[va] - obs_dtw[va])))
+            # deterministic val semantics: every eligible train well is a source.
+            _apply_sources(src_ctx["tr_pool"])
         with torch.no_grad():
             native = _combine_native(model(feat), y_s, y_c, base, mode, args)
         pred_dtw = _native_to_dtw(native, base, mode)
         val_mad = float(np.nanmedian(np.abs(pred_dtw[va] - obs_dtw[va])))
+        if val_mad0 is not None:
+            val_mad = 0.5 * (val_mad + val_mad0)
         if val_mad < best_mad - 1e-4:
             best_mad, best_epoch, since = val_mad, epoch, 0
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -375,6 +457,10 @@ def train_fold(
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
+    if src_on:
+        # final-forward semantics: train+val eligible wells are sources; test rows
+        # are in neither pool, so the OOF read at them is the cold eval.
+        _apply_sources(src_ctx["trva_pool"])
     with torch.no_grad():
         native = _combine_native(model(feat), y_s, y_c, base, mode, args)
     if use_pairs:
@@ -821,6 +907,48 @@ def main() -> None:
         "from that fold's forward (a test well never reads a test-fold label). Off => "
         "byte-identical to baseline. See notes/E3_ANALOG_EDGES.md.",
     )
+    # --- source-well assimilation (rung 0): obs-as-input features + masked labels ---
+    p.add_argument(
+        "--source-obs",
+        action="store_true",
+        help="(assimilation rung 0) give each real training well's observed target "
+        "(fold-standardized) as a 2-col query feature block [value*valid, valid] and "
+        "train with masked labels: each epoch a fresh random fraction "
+        "~U(--source-frac-min, --source-frac-max) of eligible train wells become "
+        "SOURCES (obs visible, loss weight 0); the rest stay targets (obs zeroed, "
+        "loss on) -- a row never trains on a label it can see. Val/early-stop "
+        "forward shows ALL train sources; the final OOF forward shows train+val "
+        "sources (held-out test rows never carry their own obs, so the OOF is the "
+        "cold eval). Requires --query-writeback -- the only path an obs can take to "
+        "another query at rung 0. See notes/SOURCE_WELL_ASSIMILATION_PLAN.md.",
+    )
+    p.add_argument(
+        "--source-val-mix",
+        action="store_true",
+        help="early-stop on the MEAN of two val MADs: a no-source forward and the "
+        "all-train-sources forward. Guards model selection against edge-reliant "
+        "weights that lose unassisted (far-from-well / cold) skill -- rung 1's "
+        "second protocol defect (plan section 9).",
+    )
+    p.add_argument("--source-frac-min", type=float, default=0.3)
+    p.add_argument("--source-frac-max", type=float, default=0.9)
+    p.add_argument(
+        "--source-edges",
+        default=None,
+        help="(assimilation rung 1) path to a source_edges.parquet "
+        "(utils/build_source_edges.py): each query's <=k nearest eligible source "
+        "wells as direct spatial edges, attention-read as an additive head slot "
+        "('learned IDW'). The masked-label protocol governs edge visibility: per "
+        "epoch only the drawn train-pool sources keep their edges; val forward "
+        "keeps all-train sources' edges; the final OOF "
+        "forward keeps train+val (held-out rows never feed an edge, so the OOF "
+        "stays the cold eval). Composes with --source-obs (rung 0 features) but "
+        "does not require it or --query-writeback -- the edges are their own "
+        "transmission path. Edges-only arms keep full label mass (a source never "
+        "sees its own label through an edge, so its loss is legitimate); only "
+        "--source-obs arms loss-zero drawn sources. "
+        "See SOURCE_WELL_ASSIMILATION_PLAN.md sections 4/8/9.",
+    )
     # --- anti-compression pair loss (item 4): regularize the LOCAL WTE gradient -----
     p.add_argument(
         "--pair-loss-weight",
@@ -1256,6 +1384,15 @@ def main() -> None:
             "--query-writeback is wired only into the non-anchor forward branch; pass "
             "--no-anchors or use a bundle without anchors"
         )
+    if args.source_obs and not args.query_writeback:
+        raise SystemExit(
+            "--source-obs requires --query-writeback: the write-back is the only path "
+            "a source well's obs can take to another query (rung 0)"
+        )
+    if (args.source_obs or args.source_edges) and not (
+        0.0 < args.source_frac_min <= args.source_frac_max < 1.0
+    ):
+        raise SystemExit("--source-frac-min/max must satisfy 0 < min <= max < 1")
     an = ar = aq = None
     anchor_cols = ar_cols = aq_cols = None
     anchor_head_m = None  # TARGET_WTE absolute-head BC (fold-standardized per fold)
@@ -2138,6 +2275,95 @@ def main() -> None:
         aquifer_delta_init_zero=args.aquifer_delta_init_zero,
     )
 
+    # source-well assimilation (rungs 0/1): the eligible source pool = real wells with
+    # a finite target (water/shore/swl pseudo-rows never donate an obs). The rung-0 src
+    # block is [standardized obs value * valid, valid]; standardization is per-fold
+    # (y_c/y_s) so it happens inside the fold loop, not here. Both rungs share the
+    # masked-label protocol (drawn sources visible + loss-zeroed, per-epoch redraw).
+    f_src = 2 if args.source_obs else None
+    src_protocol = bool(args.source_obs or args.source_edges)
+    src_eligible = None
+    if src_protocol:
+        src_eligible = real & np.isfinite(target)
+        log.info(
+            "source protocol ON (obs=%s edges=%s): %d eligible source wells, "
+            "per-epoch mask frac ~U(%.2f, %.2f)",
+            bool(args.source_obs),
+            bool(args.source_edges),
+            int(src_eligible.sum()),
+            args.source_frac_min,
+            args.source_frac_max,
+        )
+
+    # source edges (assimilation rung 1): direct spatial query<-source-well edges
+    # ("learned IDW"). Like the analog block: edge INDEX + ATTRS are target-blind
+    # constants standardized once; src_cv_fold carries the fold guard; the per-node
+    # source VALUE is fold-standardized inside the loop. UNLIKE analog, visibility is
+    # additionally filtered per forward by the masked-label protocol (train_fold).
+    f_srcedge = None
+    se_src_t = se_dst_t = se_ea_t = se_src_fold = None
+    if args.source_edges:
+        se = pd.read_parquet(args.source_edges)
+        need = {"query_node_idx", "src_query_node_idx", "src_cv_fold"}
+        if not need.issubset(se.columns):
+            raise SystemExit(
+                f"--source-edges {args.source_edges} missing {need - set(se.columns)}"
+            )
+        if not set(SOURCE_EDGE_COLS).issubset(se.columns):
+            raise SystemExit(
+                f"--source-edges {args.source_edges} missing edge-feature cols "
+                f"{SOURCE_EDGE_COLS}"
+            )
+        se_dst = se["query_node_idx"].to_numpy("int64")
+        se_src = se["src_query_node_idx"].to_numpy("int64")
+        if (
+            se_dst.max() >= len(qn)
+            or se_src.max() >= len(qn)
+            or min(se_dst.min(), se_src.min()) < 0
+        ):
+            raise SystemExit("--source-edges references out-of-range query_node_idx")
+        if (se_dst == se_src).any():
+            raise SystemExit("--source-edges has self-edges (source == dest)")
+        if not src_eligible[se_src].all():
+            raise SystemExit(
+                f"{int((~src_eligible[se_src]).sum())} source edges source from "
+                "ineligible nodes (pseudo or non-finite target); rebuild with "
+                "build_source_edges.py"
+            )
+        se_ea_np = apply_stats(se, fit_stats(se, list(SOURCE_EDGE_COLS), None))
+        if not np.isfinite(se_ea_np).all():
+            raise SystemExit("--source-edges has non-finite edge features")
+        se_src_t = torch.as_tensor(se_src, dtype=torch.long, device=device)
+        se_dst_t = torch.as_tensor(se_dst, dtype=torch.long, device=device)
+        se_ea_t = torch.as_tensor(se_ea_np, dtype=torch.float32, device=device)
+        se_src_fold = se["src_cv_fold"].to_numpy("int64")
+        f_srcedge = se_ea_t.shape[1]
+        deg = pd.Series(se_dst).value_counts()
+        log.info(
+            "source edges ON: %s (%d edges, %d dest nodes, mean degree %.1f, "
+            "%d edge features; protocol-masked per forward)",
+            args.source_edges,
+            len(se),
+            deg.size,
+            float(deg.mean()),
+            f_srcedge,
+        )
+
+    def source_edge_ctx(fold: int | None) -> dict:
+        """Fold-static source-edge tensors for src_ctx: edges whose source is NOT in
+        the held-out fold (the analog leak guard); train_fold then narrows per
+        forward to the visible-source protocol. Empty dict when edges are off."""
+        if f_srcedge is None:
+            return {}
+        keep = torch.as_tensor(
+            analog_fold_keep(se_src_fold, fold), dtype=torch.bool, device=device
+        )
+        return {
+            "edge_src": se_src_t[keep],
+            "edge_ei": torch.stack([se_src_t[keep], se_dst_t[keep]]),
+            "edge_ea": se_ea_t[keep],
+        }
+
     # All-wells query features for the memory probe (shapes match any fold).
     # Stats fit on real wells only (water pseudo-rows never shape a fit).
     probe_x = torch.as_tensor(
@@ -2166,6 +2392,8 @@ def main() -> None:
             f_sc_edge=f_sc_edge,
             f_mae=f_mae,
             f_analog=f_analog,
+            f_src=f_src,
+            f_srcedge=f_srcedge,
             writeback=args.query_writeback,
             pinball=args.pinball,
             fac_skip=fac_skip,
@@ -2186,6 +2414,18 @@ def main() -> None:
         yc0 = float(np.median(target))
         ys0 = float(1.4826 * np.median(np.abs(target - yc0)) or 1.0)
         probe_feat |= analog_feat(None, yc0, ys0)  # full edge set (sizing only)
+        if f_src is not None:
+            probe_feat["src_x"] = torch.zeros(
+                (len(qn), f_src), dtype=torch.float32, device=device
+            )
+        if f_srcedge is not None:
+            # full edge set (sizing only) + zero source values
+            se_probe = source_edge_ctx(None)
+            probe_feat["srcedge_ei"] = se_probe["edge_ei"]
+            probe_feat["srcedge_ea"] = se_probe["edge_ea"]
+            probe_feat["srcedge_val"] = torch.zeros(
+                len(qn), dtype=torch.float32, device=device
+            )
         if use_fac_anchor:
             if fac_pred_dtw is not None:
                 pc0 = float(np.nanmedian(fac_pred_dtw))
@@ -2339,6 +2579,28 @@ def main() -> None:
         # analog edges with source in the held-out fold f are dropped (leak-free), and
         # the source value is standardized in this fold's target space.
         feat |= analog_feat(f, y_c, y_s)
+        # source-obs (rung 0): this fold's assimilation machinery -- obs values
+        # standardized in THIS fold's target space (the target itself), the train /
+        # train+val eligible pools, and a fold-seeded rng for per-epoch source redraws.
+        # feat["src_x"] itself is set (and re-set each epoch) inside train_fold.
+        src_ctx = None
+        if src_protocol:
+            src_ctx = {
+                "val_std": torch.as_tensor(
+                    np.nan_to_num((target - y_c) / y_s, nan=0.0),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "has_x": bool(args.source_obs),
+                "val_mix": bool(args.source_val_mix),
+                "tr_pool": tr & src_eligible,
+                "trva_pool": (tr | va) & src_eligible,
+                "frac": (args.source_frac_min, args.source_frac_max),
+                "rng": np.random.default_rng(10_000 * (args.seed + 1) + int(f)),
+            }
+            # rung 1: this fold's static edge tensors (source not in fold f);
+            # train_fold narrows them per forward to the visible-source protocol.
+            src_ctx |= source_edge_ctx(int(f))
         # anchor pred-dtw standardization stats, hoisted so --save-models can persist
         # them for any flag combination (None where the anchor is off).
         pc = ps = dc = ds = hc = hs = None
@@ -2421,6 +2683,8 @@ def main() -> None:
             f_sc_edge=f_sc_edge,
             f_mae=f_mae,
             f_analog=f_analog,
+            f_src=f_src,
+            f_srcedge=f_srcedge,
             writeback=args.query_writeback,
             pinball=args.pinball,
             fac_skip=fac_skip,
@@ -2454,6 +2718,7 @@ def main() -> None:
             pair_w=pair_w,
             ordinal_y_t=ordinal_y_t,
             ts_prior_t=ts_prior_t,
+            src_ctx=src_ctx,
         )
         if fac_gate and model.last_fac_gate is not None:
             # last_fac_gate is from train_fold's final full-batch forward (all queries).
@@ -2618,6 +2883,12 @@ def main() -> None:
                         "fac_lambda": bool(fac_lambda),
                         "directional_edges": bool(args.directional_edges),
                         "query_writeback": bool(args.query_writeback),
+                        "source_obs": bool(args.source_obs),
+                        "f_src": int(f_src) if f_src is not None else None,
+                        "source_edges": str(args.source_edges)
+                        if args.source_edges
+                        else None,
+                        "f_srcedge": int(f_srcedge) if f_srcedge is not None else None,
                         "mainstem_read": bool(use_ms),
                         "portfolio_read": bool(use_pf),
                         "spatial_context": bool(use_sc),
@@ -3127,6 +3398,23 @@ def main() -> None:
             "f_sc_edge": int(f_sc_edge) if use_sc else None,
         },
         "query_writeback": {"enabled": bool(args.query_writeback)},
+        "source_obs": {
+            "enabled": bool(args.source_obs),
+            "f_src": int(f_src) if f_src is not None else None,
+            "frac_min": float(args.source_frac_min) if src_protocol else None,
+            "frac_max": float(args.source_frac_max) if src_protocol else None,
+            "n_eligible": int(src_eligible.sum()) if src_protocol else None,
+            # drawn sources are loss-zeroed only when src_x carries their own obs
+            # (rung 0); edges-only arms keep full label mass (rung 1b).
+            "loss_masked": bool(args.source_obs) if src_protocol else None,
+            "val_mix": bool(args.source_val_mix) if src_protocol else None,
+        },
+        "source_edges": {
+            "enabled": bool(args.source_edges),
+            "path": str(args.source_edges) if args.source_edges else None,
+            "f_srcedge": int(f_srcedge) if f_srcedge is not None else None,
+            "edge_cols": list(SOURCE_EDGE_COLS) if args.source_edges else None,
+        },
         "mae_embeddings": {
             "enabled": bool(args.mae_embeddings),
             "path": args.mae_embeddings if args.mae_embeddings else None,
