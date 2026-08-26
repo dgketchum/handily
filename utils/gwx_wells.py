@@ -57,12 +57,18 @@ def load_window_wells(
     confinement: tuple[str, ...],
     exclude_sources: set[str],
     include_sources: set[str] | None = None,
+    states: set[str] | None = None,
 ) -> gpd.GeoDataFrame:
     """Read the GWX index (pandas, no WKB decode) and clip to the window.
 
     ``include_sources`` (if non-empty) restricts to those sources only and
     overrides ``exclude_sources`` -- used to score NWIS-only as a development /
     tuning set, kept disjoint from the independent non-NWIS comparison set.
+
+    ``states`` (if non-empty) additionally restricts to the GWX ``state`` label.
+    A raster window is a rectangle, so a state-scoped panel needs this on top of
+    the bbox: the MT 10 m mosaic bbox, for instance, also spans parts of ID, WY,
+    ND and SD, whose wells would otherwise enter a "Montana" panel.
     """
     cols = [
         "source",
@@ -76,6 +82,7 @@ def load_window_wells(
         "obs_count",
         "is_active",
         "canonical_id",
+        "state",
     ]
     df = pd.read_parquet(index_path, columns=cols)
     tr = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
@@ -94,6 +101,8 @@ def load_window_wells(
         & df["mean_dtw"].notna().to_numpy()
         & source_keep
     )
+    if states:
+        keep &= df["state"].isin(states).to_numpy()
     sub = df.loc[keep].copy()
     sub["x5070"], sub["y5070"] = x[keep], y[keep]
     gdf = gpd.GeoDataFrame(

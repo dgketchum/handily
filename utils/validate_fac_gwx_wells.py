@@ -111,6 +111,13 @@ def main() -> None:
         help="If set (comma-list), keep ONLY these sources (overrides exclude); "
         "e.g. --include-sources nwis for the NWIS-only tuning set.",
     )
+    p.add_argument(
+        "--states",
+        default="",
+        help="If set (comma-list of GWX state labels, e.g. MT), keep ONLY wells "
+        "in those states. The window is the predictor raster's bbox, which for a "
+        "state mosaic spills into neighbours -- required for a state-scoped panel.",
+    )
     p.add_argument("--confinement", default=",".join(WT_CLASSES))
     p.add_argument("--valley-dist-m", type=float, default=500.0)
     p.add_argument(
@@ -127,20 +134,22 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     exclude = {s for s in args.exclude_sources.split(",") if s}
     include = {s for s in args.include_sources.split(",") if s}
+    states = {s for s in args.states.split(",") if s}
     conf = tuple(c for c in args.confinement.split(",") if c)
 
     with rasterio.open(args.fac_rem) as src:
         b = src.bounds
     bbox = (b.left, b.bottom, b.right, b.top)
 
-    wells = load_window_wells(args.gwx_index, bbox, conf, exclude, include)
+    wells = load_window_wells(args.gwx_index, bbox, conf, exclude, include, states)
     log.info(
-        "GWX wells in window: %d (confinement=%s, %s)",
+        "GWX wells in window: %d (confinement=%s, %s%s)",
         len(wells),
         conf,
         f"including sources={sorted(include)}"
         if include
         else f"excluding sources={sorted(exclude)}",
+        f", states={sorted(states)}" if states else "",
     )
 
     if args.holdout_oof:
@@ -319,6 +328,7 @@ def main() -> None:
         "gwx_index": args.gwx_index,
         "excluded_sources": sorted(exclude),
         "included_sources": sorted(include),
+        "states": sorted(states),
         "confinement_classes": list(conf),
         "holdout_oof": args.holdout_oof,
         "holdout_buffer_km": args.holdout_buffer_km if args.holdout_oof else None,
