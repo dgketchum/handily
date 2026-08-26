@@ -791,6 +791,17 @@ def main() -> None:
         "byte-identical to baseline. See notes/MAE_NEIGHBORHOOD_EMBEDDING.md.",
     )
     p.add_argument(
+        "--extra-query-features",
+        default=None,
+        help="path to a parquet keyed by query_node_idx whose remaining columns are "
+        "appended to the bundle's query_feature_cols as DIRECT query features (same "
+        "footing as fac_rem_dtw_m et al.: per-fold z-score + median fill + missingness "
+        "indicator). Lets a target-blind, well-free raster covariate be screened "
+        "without a graph rebuild; reach-node placement still needs the builder. Must "
+        "cover every base query node (fails loud otherwise). Off => byte-identical to "
+        "baseline.",
+    )
+    p.add_argument(
         "--query-writeback",
         action="store_true",
         help="(Phase 6C) add the query->reach write-back conv: well context is written onto "
@@ -945,6 +956,69 @@ def main() -> None:
 
     assert (rn["reach_node_idx"].to_numpy() == np.arange(len(rn))).all()
     assert (qn["query_node_idx"].to_numpy() == np.arange(len(qn))).all()
+
+    # --- additive DIRECT query features from a sidecar parquet ------------------------
+    # Same semantics as a builder-added query column (e.g. fac_rem_dtw_m): the columns
+    # join into `qn` and extend `query_feature_cols`, so they ride the per-fold
+    # fit_stats/apply_stats path (train-fold z-score + median fill + missingness
+    # indicator) exactly like every native query feature. This exists so a
+    # target-blind, well-free raster covariate can be screened as a query feature
+    # without a multi-hour graph rebuild; the reach-node placement still requires the
+    # builder. Sidecar columns must be target-blind by construction -- the loader does
+    # not and cannot verify that.
+    extra_query_cols: list[str] = []
+    if args.extra_query_features:
+        xq = pd.read_parquet(args.extra_query_features)
+        if "query_node_idx" not in xq.columns:
+            raise SystemExit(
+                f"--extra-query-features {args.extra_query_features} lacks "
+                "query_node_idx"
+            )
+        if xq["query_node_idx"].duplicated().any():
+            raise SystemExit(
+                f"--extra-query-features {args.extra_query_features} has duplicate "
+                "query_node_idx"
+            )
+        extra_query_cols = [c for c in xq.columns if c != "query_node_idx"]
+        if not extra_query_cols:
+            raise SystemExit(
+                f"--extra-query-features {args.extra_query_features} carries no "
+                "feature columns besides query_node_idx"
+            )
+        clash = sorted(set(extra_query_cols) & set(qn.columns))
+        if clash:
+            raise SystemExit(
+                f"--extra-query-features would shadow existing query_nodes columns: "
+                f"{clash}; rename them in the sidecar"
+            )
+        xq = xq.set_index("query_node_idx")
+        qidx_all = qn["query_node_idx"].to_numpy()
+        # Aux/pseudo rows (SWL) may legitimately be absent from a sidecar built on the
+        # base bundle; a missing BASE row is a build-scope bug, not data to impute.
+        base_q = (
+            qidx_all[~qn["is_swl_aux"].to_numpy(bool)]
+            if ("is_swl_aux" in qn.columns)
+            else qidx_all
+        )
+        missing = np.setdiff1d(base_q, xq.index.to_numpy())
+        if len(missing):
+            raise SystemExit(
+                f"--extra-query-features covers {len(xq)} nodes; {len(missing)} base "
+                "query nodes have NO value -- rebuild the sidecar over ALL base query "
+                "nodes (missing rows must NOT be imputed here)."
+            )
+        for c in extra_query_cols:
+            qn[c] = xq[c].reindex(qidx_all).to_numpy("float64")
+        query_cols = list(query_cols) + extra_query_cols
+        log.info(
+            "extra query features ON: %s (%d cols: %s; NaN%% %s)",
+            args.extra_query_features,
+            len(extra_query_cols),
+            ", ".join(extra_query_cols),
+            ", ".join(
+                f"{c}={100.0 * qn[c].isna().mean():.2f}" for c in extra_query_cols
+            ),
+        )
 
     # Water-stage pseudo-rows (labels only, never metrics): default-False for
     # bundles predating --water-pseudo-labels. `real` masks every fit/metric.
@@ -3057,6 +3131,11 @@ def main() -> None:
             "enabled": bool(args.mae_embeddings),
             "path": args.mae_embeddings if args.mae_embeddings else None,
             "f_mae": int(f_mae) if f_mae is not None else None,
+        },
+        "extra_query_features": {
+            "enabled": bool(args.extra_query_features),
+            "path": args.extra_query_features if args.extra_query_features else None,
+            "cols": extra_query_cols or None,
         },
         "analog_edges": {
             "enabled": bool(args.analog_edges),
