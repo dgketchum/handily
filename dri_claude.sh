@@ -55,7 +55,7 @@ if [ -d "$REPO/.git" ] && [ ! -f "$REPO/CLAUDE.md" ]; then
 - MAE manifest for this machine: configs/mae/manifest_v2_dri.json
   (written by dri_deploy.sh; cache_dir points at the scratch mirror).
 - This clone is read-only https: commit locally if useful, but you cannot
-  push. Relay files/results via `gcloud storage cp ... gs://wudr/dri/`.
+  push. Relay files/results via `gcloud storage cp ... gs://wudr/zephyr/`.
 - Long foreground work goes in tmux; batch work goes in sbatch.
 MD
   grep -qx 'CLAUDE.md' "$REPO/.git/info/exclude" 2>/dev/null || \
