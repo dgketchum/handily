@@ -49,6 +49,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import torch
+from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_conus_graph_inputs import (  # noqa: E402
@@ -113,15 +114,25 @@ def ckpt_f_src(ck: dict, f_query: int) -> int | None:
 def ckpt_f_srcedge(ck: dict) -> int | None:
     """Source-edge attr width from a fold checkpoint (--source-edges arms, rung 1).
 
-    ``source_read.score_mlp.0.weight`` is (hidden, in_src + in_dst + edge_dim) with
-    in_src = in_dst = hidden (``source_enc.0.weight``'s out dim), so the edge-attr
-    width is the excess over 2*hidden. None = no source-edge slot.
+    ``source_read.score_mlp.0.weight`` (softmax attention) or
+    ``source_read.gate_mlp.0.weight`` (--source-edge-gated) is
+    (hidden, in_src + in_dst + edge_dim) with in_src = in_dst = hidden
+    (``source_enc.0.weight``'s out dim), so the edge-attr width is the excess
+    over 2*hidden. None = no source-edge slot.
     """
     sd = ck["state_dict"]
-    if "source_read.score_mlp.0.weight" not in sd:
+    key = next(
+        (
+            k
+            for k in ("source_read.score_mlp.0.weight", "source_read.gate_mlp.0.weight")
+            if k in sd
+        ),
+        None,
+    )
+    if key is None:
         return None
     hidden = int(sd["source_enc.0.weight"].shape[0])
-    return int(sd["source_read.score_mlp.0.weight"].shape[1]) - 2 * hidden
+    return int(sd[key].shape[1]) - 2 * hidden
 
 
 def bundle_source_edges(man: dict, device: str) -> dict:
@@ -152,6 +163,132 @@ def bundle_source_edges(man: dict, device: str) -> dict:
     }
 
 
+def point_source_ctx(
+    man: dict,
+    bman: dict,
+    gdir: Path,
+    qxy: np.ndarray,
+    z_surf: np.ndarray,
+    lat: pd.DataFrame,
+    rn_full: pd.DataFrame,
+    device: str,
+    exclude_m: float = 0.0,
+) -> dict:
+    """Deployment source context for EXTERNAL points (--source-edges arms).
+
+    The source side of the read carries ONLY the encoded observed residual --
+    the model never consumes source covariates through this path -- so the
+    bundle wells stay OUT of the query set. We build fresh point<-well kNN
+    edges with the build_source_edges recipe (same relief-lifted metric, same
+    k, same 4 attrs incl. FAC-basin identity), standardize them with the
+    trainer's GLOBAL fit over the frozen bundle edge table (trainer-verbatim,
+    like bundle_source_edges), and expose every eligible well to every fold:
+    deployment leaves no observation on the table, and external points carry
+    no labels into the forward, so the training protocol's same-site/masking
+    guards do not apply. ``exclude_m`` > 0 drops edges from wells within that
+    radius of the point (an eval-fairness sensitivity knob; 0 = deployment
+    semantics -- a map cell at a well reads that well).
+    """
+    se = pd.read_parquet(man["flags"]["source_edges"])
+    stats = fit_stats(se, list(SOURCE_EDGE_COLS), None)
+    k = int(se["rank"].max()) + 1
+    qn = (
+        pd.read_parquet(gdir / "query_nodes.parquet")
+        .sort_values("query_node_idx")
+        .reset_index(drop=True)
+    )
+    water = (
+        qn["is_water_pseudo"].to_numpy(bool)
+        if "is_water_pseudo" in qn.columns
+        else np.zeros(len(qn), bool)
+    )
+    resid_all = qn["wte_residual_m"].to_numpy("float64")
+    elig = ~water & np.isfinite(resid_all)
+    w = qn[elig].reset_index(drop=True)
+    wxy = w[["x5070", "y5070"]].to_numpy("float64")
+    wz = np.nan_to_num(w["z_surf_well_m"].to_numpy("float64"), nan=0.0)
+    vw = float(bman["r_relief_vw"])
+
+    # controlling-reach FAC basin, raw labels on both sides (equality is what
+    # same_basin encodes; build_source_edges factorizes only for compactness)
+    basin_of_reach = rn_full.set_index("reach_node_idx")["basin"]
+    blat = pd.read_parquet(
+        gdir / "lateral_edges.parquet",
+        columns=["query_node_idx", "reach_node_idx", "is_controlling"],
+    )
+    bctrl = (
+        blat[blat["is_controlling"].astype(bool)]
+        .drop_duplicates("query_node_idx")
+        .set_index("query_node_idx")["reach_node_idx"]
+    )
+    src_basin = w["query_node_idx"].map(bctrl).map(basin_of_reach)
+    pctrl = (
+        lat[lat["is_controlling"].astype(bool)]
+        .drop_duplicates("query_node_idx")
+        .set_index("query_node_idx")["reach_node_idx"]
+    )
+    dest_basin = (
+        pd.Series(np.arange(len(qxy), dtype="int64")).map(pctrl).map(basin_of_reach)
+    )
+
+    pad = 8 if exclude_m > 0 else 0
+    kq = min(k + pad, len(w))
+    tree = cKDTree(_relief_coords(wxy, wz, vw))
+    rd, loc = tree.query(_relief_coords(qxy, z_surf, vw), k=kq, workers=-1)
+    if kq == 1:
+        rd, loc = rd[:, None], loc[:, None]
+    dest = np.repeat(np.arange(len(qxy), dtype="int64"), kq)
+    src = loc.ravel().astype("int64")
+    geo_km = np.sqrt(((qxy[dest] - wxy[src]) ** 2).sum(axis=1)) / 1000.0
+    ed = pd.DataFrame(
+        {
+            "dest": dest,
+            "src": src,
+            "log1p_geo_dist_km": np.log1p(geo_km),
+            "log1p_relief_dist_km": np.log1p(rd.ravel() / 1000.0),
+            "rel_elev_m": z_surf[dest] - wz[src],
+            "same_basin": (
+                dest_basin.iloc[dest].notna().to_numpy()
+                & (dest_basin.iloc[dest].to_numpy() == src_basin.iloc[src].to_numpy())
+            ).astype("float64"),
+        }
+    )
+    if exclude_m > 0:
+        ed = ed[geo_km * 1000.0 >= exclude_m]
+    ed = ed[ed.groupby("dest").cumcount() < k].reset_index(drop=True)
+    deg = ed.groupby("dest").size()
+    log.info(
+        "point source edges: %d edges to %d/%d points (k=%d, vw=%.0f, "
+        "exclude_m=%.0f, %d eligible wells, median rank-0 geo %.2f km, "
+        "frac_same_basin %.2f)",
+        len(ed),
+        int(deg.size),
+        len(qxy),
+        k,
+        vw,
+        exclude_m,
+        len(w),
+        float(np.expm1(ed.groupby("dest")["log1p_geo_dist_km"].min().median())),
+        float(ed["same_basin"].mean()),
+    )
+    ea = apply_stats_df(ed, stats)
+    src_t = torch.as_tensor(
+        ed["src"].to_numpy("int64"), dtype=torch.long, device=device
+    )
+    dst_t = torch.as_tensor(
+        ed["dest"].to_numpy("int64"), dtype=torch.long, device=device
+    )
+    return {
+        "resid": w["wte_residual_m"].to_numpy("float64"),
+        "pool_by_fold": lambda f: np.ones(len(w), dtype=bool),
+        "edges": {
+            "src": src_t,
+            "ei": torch.stack([src_t, dst_t]),
+            "ea": torch.as_tensor(ea, dtype=torch.float32, device=device),
+        },
+    }
+
+
 def build_model_pt(
     man: dict,
     dims: dict,
@@ -179,6 +316,7 @@ def build_model_pt(
         writeback=writeback,
         f_src=f_src,
         f_srcedge=f_srcedge,
+        srcedge_gated=bool(flags.get("source_edge_gated")),
     ).to(device)
 
 
@@ -420,6 +558,14 @@ def main() -> None:
         "(what a rendered raster gives a cell containing the well), 100 = "
         "training-semantics sensitivity variant",
     )
+    ap.add_argument(
+        "--source-exclude-m",
+        type=float,
+        default=0.0,
+        help="(--source-edges arms) drop point<-well source edges from wells "
+        "within this radius of the point; 0 = deployment semantics (a cell at "
+        "a well reads that well), >0 = eval-fairness sensitivity variant",
+    )
     ap.add_argument("--dem", default=DEM)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--oof-check", action="store_true")
@@ -441,16 +587,13 @@ def main() -> None:
     log.info("arm %s: f_mae=%s writeback=%s", model_dir.name, f_mae, writeback)
     if f_mae is not None and not args.mae_embeddings:
         raise SystemExit("this arm has an MAE head; pass --mae-embeddings")
-    if (
-        ckpt_f_src(models["folds"][0], man["feature_dims"]["query"]) is not None
-        or ckpt_f_srcedge(models["folds"][0]) is not None
-    ):
+    if ckpt_f_src(models["folds"][0], man["feature_dims"]["query"]) is not None:
         raise SystemExit(
-            "source-assimilation arm: external-point prediction needs the source "
-            "wells INSIDE the forward (query set = points + source wells so their "
-            "obs can reach the points through the writeback / source edges) -- not "
-            "implemented yet; use --oof-check or the warm-eval path on the bundle"
+            "--source-obs (rung 0) arm: external-point prediction needs the source "
+            "wells inside the query set (their obs travel via src_x + writeback) -- "
+            "unsupported (rung 0 is shelved); use --oof-check or a --source-edges arm"
         )
+    f_srcedge_pt = ckpt_f_srcedge(models["folds"][0])
 
     gdir = Path(man["graph_dir"])
     bman = json.loads((gdir / "graph_manifest.json").read_text())
@@ -572,6 +715,9 @@ def main() -> None:
     geom["reach_node_idx"] = geom["reach_node_idx"].astype("int64")
     lat = build_lateral_edges(qxy, geom, None, int(bman["knn_lateral"]))
     lat = attach_lateral_attrs(lat, rn_full, z_surf, float(bman["conductance_p"]))
+    # pre-prune copy: prune_for_queries REMAPS lat's reach_node_idx to the pruned
+    # numbering, but the source-edge basin lookup needs rn_full's original ids.
+    lat_full = lat
     rn, ce, lat = prune_for_queries(rn_full, ce_full, lat, int(man["channel_layers"]))
     log.info(
         "pruned subgraph: %d reaches / %d ch edges / %d lat edges",
@@ -598,8 +744,30 @@ def main() -> None:
         emb = emb.loc[pts["_row"].to_numpy()].reset_index()
         graph["mae_x"] = mae_tensor(emb, stats, cols, f_mae, args.device)
 
+    src_ctx = None
+    if f_srcedge_pt is not None:
+        src_ctx = point_source_ctx(
+            man,
+            bman,
+            gdir,
+            qxy,
+            z_surf,
+            lat_full,
+            rn_full,
+            args.device,
+            exclude_m=float(args.source_exclude_m),
+        )
     agg = run_folds_pt(
-        models, graph, frame, r_wte, anchors, args.device, "points", f_mae, writeback
+        models,
+        graph,
+        frame,
+        r_wte,
+        anchors,
+        args.device,
+        "points",
+        f_mae,
+        writeback,
+        src_ctx=src_ctx,
     )
     out = pts.drop(columns=["_row"]).copy()
     out["pred_wte_m"] = agg["wte"]
