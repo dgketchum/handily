@@ -949,6 +949,15 @@ def main() -> None:
         "--source-obs arms loss-zero drawn sources. "
         "See SOURCE_WELL_ASSIMILATION_PLAN.md sections 4/8/9.",
     )
+    p.add_argument(
+        "--source-edge-gated",
+        action="store_true",
+        help="use independent per-edge sigmoid gates (EdgeGatedConv) for the source "
+        "read instead of softmax attention (PortfolioReadConv). Softmax must "
+        "distribute weight-1 over the <=k neighbors; sigmoid gates can close every "
+        "edge and abstain when all visible sources are uninformative (plan "
+        "section 10). Requires --source-edges.",
+    )
     # --- anti-compression pair loss (item 4): regularize the LOCAL WTE gradient -----
     p.add_argument(
         "--pair-loss-weight",
@@ -1393,6 +1402,8 @@ def main() -> None:
         0.0 < args.source_frac_min <= args.source_frac_max < 1.0
     ):
         raise SystemExit("--source-frac-min/max must satisfy 0 < min <= max < 1")
+    if args.source_edge_gated and not args.source_edges:
+        raise SystemExit("--source-edge-gated requires --source-edges")
     an = ar = aq = None
     anchor_cols = ar_cols = aq_cols = None
     anchor_head_m = None  # TARGET_WTE absolute-head BC (fold-standardized per fold)
@@ -2394,6 +2405,7 @@ def main() -> None:
             f_analog=f_analog,
             f_src=f_src,
             f_srcedge=f_srcedge,
+            srcedge_gated=bool(args.source_edge_gated),
             writeback=args.query_writeback,
             pinball=args.pinball,
             fac_skip=fac_skip,
@@ -2685,6 +2697,7 @@ def main() -> None:
             f_analog=f_analog,
             f_src=f_src,
             f_srcedge=f_srcedge,
+            srcedge_gated=bool(args.source_edge_gated),
             writeback=args.query_writeback,
             pinball=args.pinball,
             fac_skip=fac_skip,
@@ -2889,6 +2902,7 @@ def main() -> None:
                         if args.source_edges
                         else None,
                         "f_srcedge": int(f_srcedge) if f_srcedge is not None else None,
+                        "source_edge_gated": bool(args.source_edge_gated),
                         "mainstem_read": bool(use_ms),
                         "portfolio_read": bool(use_pf),
                         "spatial_context": bool(use_sc),
@@ -3414,6 +3428,7 @@ def main() -> None:
             "path": str(args.source_edges) if args.source_edges else None,
             "f_srcedge": int(f_srcedge) if f_srcedge is not None else None,
             "edge_cols": list(SOURCE_EDGE_COLS) if args.source_edges else None,
+            "gated": bool(args.source_edge_gated) if args.source_edges else None,
         },
         "mae_embeddings": {
             "enabled": bool(args.mae_embeddings),

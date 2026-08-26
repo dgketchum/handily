@@ -422,6 +422,32 @@ def test_zero_edge_queries_stay_finite():
     assert torch.isfinite(out).all()
 
 
+def test_source_edge_gated_swaps_read_module_and_keeps_semantics():
+    """--source-edge-gated: sigmoid-gate read (EdgeGatedConv) replaces softmax
+    attention; the dest-not-source and zero-edge invariants must still hold."""
+    m = _se_model(srcedge_gated=True).eval()
+    keys = [k for k in m.state_dict() if k.startswith("source_read.")]
+    assert any(".gate_mlp." in k for k in keys)
+    assert not any(".score_mlp." in k for k in keys)
+    g = _se_graph()
+    with torch.no_grad():
+        out_a = m(g)
+        g2 = dict(g)
+        v = g["srcedge_val"].clone()
+        v[0] = 5.0
+        g2["srcedge_val"] = v
+        out_b = m(g2)
+    assert torch.isfinite(out_a).all()
+    assert not torch.allclose(out_a[2], out_b[2], atol=1e-6)
+    assert torch.allclose(out_a[0], out_b[0], atol=1e-6)
+    assert torch.allclose(out_a[1], out_b[1], atol=1e-6)
+    g["srcedge_ei"] = torch.zeros((2, 0), dtype=torch.long)
+    g["srcedge_ea"] = torch.zeros((0, F_SE))
+    with torch.no_grad():
+        out = m(g)
+    assert torch.isfinite(out).all()
+
+
 class _EdgeRecorderModel(torch.nn.Module):
     """records the visible-source set implied by feat's edge subset each forward."""
 

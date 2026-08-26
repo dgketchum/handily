@@ -314,6 +314,7 @@ class WTEGraphNet(nn.Module):
         f_analog: int | None = None,
         f_src: int | None = None,
         f_srcedge: int | None = None,
+        srcedge_gated: bool = False,
         writeback: bool = False,
         pinball: bool = False,
         fac_skip: bool = False,
@@ -588,8 +589,17 @@ class WTEGraphNet(nn.Module):
             self.source_enc = nn.Sequential(
                 nn.Linear(1, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
             )
-            self.source_read = PortfolioReadConv(
-                hidden, hidden, f_srcedge, hidden, dropout=dropout
+            # srcedge_gated swaps softmax attention for independent per-edge
+            # sigmoid gates: softmax can only REDISTRIBUTE trust among the <=k
+            # neighbors (weights sum to 1), while sigmoid gates can close every
+            # edge and abstain outright -- the missing off-switch when all
+            # visible sources are uninformative (the cold/far-from-well regime).
+            self.source_read = (
+                EdgeGatedConv(hidden, hidden, f_srcedge, hidden, dropout=dropout)
+                if srcedge_gated
+                else PortfolioReadConv(
+                    hidden, hidden, f_srcedge, hidden, dropout=dropout
+                )
             )
             head_in += hidden  # [.., ctx_srcedge]
         if self.writeback:
