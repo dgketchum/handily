@@ -38,7 +38,7 @@ import rasterio
 from rasterio.windows import Window
 from scipy.ndimage import minimum_filter, uniform_filter
 
-DEM = "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif"
+DEM = "/data/ssd2/handily/conus/covariates/elev48i0100a.tif"
 ACCUM = "/data/ssd2/handily/conus/hydrography90m/accumulation_conus_100m_5070.tif"
 SLOPE = "/data/ssd2/handily/conus/covariates/slope_deg.tif"
 OUT_DIR = "/nas/handily/covariates/terrain"

@@ -43,7 +43,7 @@ log = logging.getLogger("build_wte_anchors")
 
 HYDRO_DIR = "/data/ssd2/handily/conus/hydrography90m"
 ACC_PATH = f"{HYDRO_DIR}/accumulation_conus_100m_5070.tif"
-ELEV_PATH = "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif"
+ELEV_PATH = "/data/ssd2/handily/conus/covariates/elev48i0100a.tif"
 
 # Hydrography90m accumulation is an upstream *cell* count on the native 3 arc-sec
 # (~90 m) grid. Nominal cell area = (90 m)^2 = 0.0081 km^2. This is the equatorial

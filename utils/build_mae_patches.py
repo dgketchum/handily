@@ -60,7 +60,7 @@ SCALES = (1, 5, 10, 40)  # 100/500/1k/4k m pool factors -> 6.4/32/64/256 km foot
 _COV = "/data/ssd2/handily/conus/covariates"
 _TER = "/nas/handily/covariates/terrain"
 _GEO = "/nas/handily/covariates/geology"
-_DEM = "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif"
+_DEM = "/data/ssd2/handily/conus/covariates/elev48i0100a.tif"
 
 # (name, path, transform): transform in {None (raw), "dem_rel", float scale}
 CHANNEL_SPECS: list[tuple[str, str, object]] = [

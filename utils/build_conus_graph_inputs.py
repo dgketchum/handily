@@ -67,7 +67,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("build_conus_graph_inputs")
 
 NWIS = {"nwis", "ngwmn"}
-DEM = "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif"
+DEM = "/data/ssd2/handily/conus/covariates/elev48i0100a.tif"
 # Target modes. dtw_residual = predict (mean_dtw - regional prior), reconstruct
 # DTW = regional + residual (v1/v2). wte = predict real-magnitude water-table
 # elevation directly, reconstruct DTW = z_surf_well - wte_hat. The two paths share

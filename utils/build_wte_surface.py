@@ -42,7 +42,7 @@ log = logging.getLogger("build_wte_surface")
 
 HYDRO_DIR = "/data/ssd2/handily/conus/hydrography90m"
 ANCHOR_PATH = f"{HYDRO_DIR}/anchor_head_100m_5070.tif"
-DEM_PATH = "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif"
+DEM_PATH = "/data/ssd2/handily/conus/covariates/elev48i0100a.tif"
 OUT_NODATA = -9999.0
 
 # 4-connectivity matches the 5-point stencil.

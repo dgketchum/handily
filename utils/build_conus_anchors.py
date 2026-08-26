@@ -107,7 +107,7 @@ HEAD_UNCERTAINTY_MANAGED_BUMP = 1.5
 
 SOURCE_RANK = {"nhd_hr": 0, "nwi": 1, "3dhp": 2}  # precedence for dedup primary
 
-DEM = "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif"
+DEM = "/data/ssd2/handily/conus/covariates/elev48i0100a.tif"
 # USPS-keyed CONUS states polygon, used to clip/assign the 3DHP fallback to the
 # states that lack NHD-HR. Defaulted so the fallback materializes without an extra
 # flag; override with --state-polys. Loaded lazily (only if a fallback is needed).

@@ -40,7 +40,7 @@ from build_stacker_features import sample_coarse  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("build_conus_reach_graph")
 
-DEM = "/data/ssd1/streamflow-ml-data/conus-dem/data/elev48i0100a.tif"
+DEM = "/data/ssd2/handily/conus/covariates/elev48i0100a.tif"
 REACH_GEOM = "/data/ssd2/handily/conus/wte_gnn/nhd_flowline_geom.parquet"
 
 # VAA passthrough + derived node features (model inputs).
