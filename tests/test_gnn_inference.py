@@ -12,6 +12,10 @@ which reproduces the archived OOF predictions to <1e-3 m):
   * recompose -- exact convex identity where FAC present, (1 - w_fac)
     renormalization where absent, head fallback under the guard
   * master_window -- 10 m window nests the coarse window exactly
+  * leak_gate -- enforced on the two-signal leak signature, informational (never
+    failing) for source-assimilation arms that read the well pool by design
+  * ckpt_extensions / ckpt_f_src / ckpt_f_srcedge -- state-dict introspection of
+    the MAE head, writeback branch and source-read slot
 """
 
 import importlib.util
@@ -23,6 +27,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import rasterio
+import torch
 from rasterio.transform import from_origin
 
 _UTILS = Path(__file__).resolve().parents[1] / "utils"
@@ -295,3 +300,86 @@ def test_well_pool_noop_without_column():
     qn = pd.DataFrame({"canonical_id": ["w1", "w2"]})
     out = inf.well_pool(qn)
     assert out is qn
+
+
+# ---------------------------------------------------------------------------
+# leak gate: enforced for plain arms, informational for source-assimilation arms
+# ---------------------------------------------------------------------------
+def _leak_panel_inputs():
+    """A map pinned exactly to obs while the archived OOF sits 8 m away.
+
+    Both leak signals fire: map MAD 0.00 m vs OOF MAD 8.00 m (ratio 0 < 0.5) and
+    median |map - oof| 8.00 m > the 2.0 m tracking tolerance.
+    """
+    transform = from_origin(inf.X0, inf.Y0, inf.RES, inf.RES)
+    rows, cols = np.meshgrid(np.arange(5), np.arange(5), indexing="ij")
+    rows, cols = rows.ravel(), cols.ravel()
+    obs = 10.0 + np.arange(len(rows), dtype="float64")
+    grid = np.full((5, 5), np.nan)
+    grid[rows, cols] = obs
+    oof = pd.DataFrame(
+        {
+            "x5070": inf.X0 + (cols + 0.5) * inf.RES,
+            "y5070": inf.Y0 - (rows + 0.5) * inf.RES,
+            "obs_dtw_m": obs,
+            "gnn_dtw_m": obs + 8.0,
+        }
+    )
+    return grid, transform, oof
+
+
+def test_leak_gate_fails_on_leak_signature():
+    grid, transform, oof = _leak_panel_inputs()
+    with pytest.raises(SystemExit, match="LEAK GATE FAILED"):
+        inf.leak_gate("00000000", grid, transform, oof, 0.5, 5, 2.0)
+
+
+def test_leak_gate_informational_for_source_arm():
+    grid, transform, oof = _leak_panel_inputs()
+    panel = inf.leak_gate(
+        "00000000", grid, transform, oof, 0.5, 5, 2.0, informational=True
+    )
+    assert panel["status"] == "informational_source_arm"
+    assert panel["n_wells"] == 25
+    assert panel["mad_map_vs_obs_m"] == 0.0
+    assert panel["mad_oof_vs_obs_m"] == 8.0
+    assert panel["median_abs_map_minus_oof_m"] == 8.0
+
+
+# ---------------------------------------------------------------------------
+# checkpoint introspection (the manifest records neither MAE nor the src slot)
+# ---------------------------------------------------------------------------
+def test_ckpt_introspection_plain_arm():
+    ck = {"state_dict": {"query_enc.0.weight": torch.zeros(48, 46)}}
+    assert inf.ckpt_extensions(ck) == (None, False)
+    assert inf.ckpt_f_src(ck, 46) is None
+    assert inf.ckpt_f_srcedge(ck) is None
+
+
+def test_ckpt_introspection_source_edge_writeback_arm():
+    ck = {
+        "state_dict": {
+            "query_enc.0.weight": torch.zeros(48, 46),
+            "writeback_conv.gate_mlp.0.weight": torch.zeros(48, 96),
+            "source_enc.0.weight": torch.zeros(48, 1),
+            # (hidden, in_src + in_dst + f_srcedge) = (48, 48 + 48 + 4)
+            "source_read.score_mlp.0.weight": torch.zeros(48, 100),
+        }
+    }
+    assert inf.ckpt_extensions(ck) == (None, True)
+    assert inf.ckpt_f_src(ck, 46) is None
+    assert inf.ckpt_f_srcedge(ck) == 4
+
+
+def test_ckpt_introspection_gated_source_read_and_mae():
+    ck = {
+        "state_dict": {
+            "query_enc.0.weight": torch.zeros(48, 48),  # +2 src-obs block
+            "mae_enc.0.weight": torch.zeros(48, 64),
+            "source_enc.0.weight": torch.zeros(48, 1),
+            "source_read.gate_mlp.0.weight": torch.zeros(48, 100),
+        }
+    }
+    assert inf.ckpt_extensions(ck) == (64, False)
+    assert inf.ckpt_f_src(ck, 46) == 2
+    assert inf.ckpt_f_srcedge(ck) == 4

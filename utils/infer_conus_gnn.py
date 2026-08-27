@@ -43,6 +43,21 @@ and compares against the archived OOF predictions -- the end-to-end round-trip
 gate (stats + tensor assembly + forward) that must pass before lattice output
 is trusted.
 
+Source-assimilation arms (``--source-edges``, the r1e recipe) render too: every
+lattice cell gets fresh cell<-well kNN source edges built with the frozen
+bundle's recipe (``deployment_source_ctx``, shared with predict_gnn_at_points.py),
+so the map READS the well pool at inference time. Two consequences:
+
+- ``--query-writeback`` arms make reach states depend on the whole query set, so
+  the basin is forwarded in ONE batch (``--query-chunk`` is ignored, and logged);
+  a chunked writeback forward would be a different computation.
+- the LEAK GATE becomes INFORMATIONAL: a cell sitting at a training well reads
+  that well by design, so beating OOF there is intended behaviour, not leakage.
+  The panel is still computed and written to infer_run.json, never enforced.
+
+``--extra-sources`` admits an external observation table (e.g. the frozen NDWR
+admission set) into the kNN source pool alongside the bundle wells.
+
 Usage:
     uv run python utils/infer_conus_gnn.py \
         --model-dir /data/ssd2/handily/conus/wte_gnn/gnn_conus_monitoring_gate_mirror_sigma_prod \
@@ -76,15 +91,18 @@ from build_conus_graph_inputs import (  # noqa: E402
     attach_lateral_attrs,
     build_lateral_edges,
     deep_well_mask,
+    sample_drilled_depth,
     sample_gridmet,
     sample_relief_etrm,
     sample_terrain_multiscale,
     water_query_features,
 )
+from build_dupuit_wte import build_boundaries, hang_interp  # noqa: E402
+from build_source_edges import EDGE_COLS as SOURCE_EDGE_COLS  # noqa: E402
 from build_stacker_features import sample_coarse  # noqa: E402
 from fac_rem_registry import sample_fac_rem  # noqa: E402
 from train_conus_gnn import _fac_feat, prune_reach_graph  # noqa: E402
-from train_wte_gnn import WTEGraphNet, apply_stats  # noqa: E402
+from train_wte_gnn import WTEGraphNet, apply_stats, fit_stats  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("infer_conus_gnn")
@@ -235,7 +253,22 @@ def load_models(model_dir: Path) -> dict:
     return {"manifest": man, "folds": folds, "shared": shared}
 
 
-def build_model(man: dict, dims: dict, device: str) -> WTEGraphNet:
+def build_model(
+    man: dict,
+    dims: dict,
+    device: str,
+    f_mae: int | None = None,
+    writeback: bool = False,
+    f_src: int | None = None,
+    f_srcedge: int | None = None,
+) -> WTEGraphNet:
+    """Model in the checkpoint's shape.
+
+    The extension args default OFF, so a plain prior-gate arm builds exactly the
+    network it always did; they are detected from the checkpoint state dict
+    (``ckpt_extensions`` / ``ckpt_f_src`` / ``ckpt_f_srcedge``) because the
+    inference manifest does not record the MAE head or its width.
+    """
     flags = man["flags"]
     return WTEGraphNet(
         dims["reach"],
@@ -249,7 +282,344 @@ def build_model(man: dict, dims: dict, device: str) -> WTEGraphNet:
         prior_gate=True,
         mirror_anchor=bool(flags["mirror_anchor"]),
         directional_edges=bool(flags.get("directional_edges")),
+        f_mae=f_mae,
+        writeback=writeback,
+        f_src=f_src,
+        f_srcedge=f_srcedge,
+        srcedge_gated=bool(flags.get("source_edge_gated")),
     ).to(device)
+
+
+def ckpt_extensions(ck: dict) -> tuple[int | None, bool]:
+    """(f_mae, writeback) from a fold checkpoint's state dict.
+
+    The inference manifest records neither the MAE head nor its width (known
+    gap), so the weights are the authority: ``mae_enc.0.weight`` is
+    (hidden, f_mae); any ``writeback_conv.*`` key means the 6C branch exists.
+    """
+    sd = ck["state_dict"]
+    f_mae = sd["mae_enc.0.weight"].shape[1] if "mae_enc.0.weight" in sd else None
+    writeback = any(k.startswith("writeback_conv.") for k in sd)
+    return f_mae, writeback
+
+
+def ckpt_f_src(ck: dict, f_query: int) -> int | None:
+    """Source-obs block width from a fold checkpoint (--source-obs arms).
+
+    The src block widens ONLY query_enc's input, so its width is the excess of
+    ``query_enc.0.weight`` over the manifest's query feature dim (None = plain arm).
+    """
+    extra = int(ck["state_dict"]["query_enc.0.weight"].shape[1]) - int(f_query)
+    return extra if extra > 0 else None
+
+
+def ckpt_f_srcedge(ck: dict) -> int | None:
+    """Source-edge attr width from a fold checkpoint (--source-edges arms, rung 1).
+
+    ``source_read.score_mlp.0.weight`` (softmax attention) or
+    ``source_read.gate_mlp.0.weight`` (--source-edge-gated) is
+    (hidden, in_src + in_dst + edge_dim) with in_src = in_dst = hidden
+    (``source_enc.0.weight``'s out dim), so the edge-attr width is the excess
+    over 2*hidden. None = no source-edge slot.
+    """
+    sd = ck["state_dict"]
+    key = next(
+        (
+            k
+            for k in ("source_read.score_mlp.0.weight", "source_read.gate_mlp.0.weight")
+            if k in sd
+        ),
+        None,
+    )
+    if key is None:
+        return None
+    hidden = int(sd["source_enc.0.weight"].shape[0])
+    return int(sd[key].shape[1]) - 2 * hidden
+
+
+def bundle_source_edges(man: dict, device: str) -> dict:
+    """Trainer-verbatim source-edge tensors for a --source-edges arm.
+
+    The trainer standardizes the edge attrs by a GLOBAL fit over the full edge
+    table (no fold or mask dependence), so refitting from the frozen parquet is
+    exact. The path comes from the inference manifest flags.
+    """
+    path = man["flags"].get("source_edges")
+    if not path:
+        raise SystemExit(
+            "checkpoint has a source_read slot but the inference manifest carries "
+            "no source_edges path (flags.source_edges)"
+        )
+    se = pd.read_parquet(path)
+    ea = apply_stats(se, fit_stats(se, list(SOURCE_EDGE_COLS), None))
+    src = torch.as_tensor(
+        se["src_query_node_idx"].to_numpy("int64"), dtype=torch.long, device=device
+    )
+    dst = torch.as_tensor(
+        se["query_node_idx"].to_numpy("int64"), dtype=torch.long, device=device
+    )
+    return {
+        "src": src,
+        "ei": torch.stack([src, dst]),
+        "ea": torch.as_tensor(ea, dtype=torch.float32, device=device),
+    }
+
+
+def load_extra_sources(
+    path: str, geom: gpd.GeoDataFrame, rn_full: pd.DataFrame
+) -> pd.DataFrame:
+    """Admitted external source wells + their controlling-reach FAC basin.
+
+    ``path`` is a frozen admission table (x5070/y5070/wte_residual_m/z_surf_m,
+    residual in the bundle's frame: (z_surf - dtw) - r_wte). The basin label is
+    the identity the source-edge ``same_basin`` attr compares, so it is attached
+    here with a rank-0 lateral attachment against the UNPRUNED reach frame.
+    """
+    extra = pd.read_parquet(path)
+    need = ["x5070", "y5070", "wte_residual_m", "z_surf_m"]
+    missing = [c for c in need if c not in extra.columns]
+    if missing:
+        raise SystemExit(f"--extra-sources missing columns {missing}")
+    exy = extra[["x5070", "y5070"]].to_numpy("float64")
+    elat = build_lateral_edges(exy, geom, None, 1)
+    basin_of_reach = rn_full.set_index("reach_node_idx")["basin"]
+    extra = extra[need].copy()
+    extra["basin"] = (
+        elat[elat["is_controlling"].astype(bool)]
+        .drop_duplicates("query_node_idx")
+        .set_index("query_node_idx")["reach_node_idx"]
+        .reindex(np.arange(len(extra)))
+        .map(basin_of_reach)
+        .to_numpy()
+    )
+    log.info(
+        "extra sources: %d admitted wells from %s (%.0f%% with basin)",
+        len(extra),
+        path,
+        100.0 * float(pd.notna(extra["basin"]).mean()),
+    )
+    return extra
+
+
+def dd_dup_features(
+    bman: dict,
+    gdir: Path,
+    qxy: np.ndarray,
+    z_surf: np.ndarray,
+    self_exclude_m: float = 0.0,
+    boundaries: pd.DataFrame | None = None,
+) -> dict[str, np.ndarray]:
+    """drilled-depth + Dupuit-hang query features (dd/dup arms), shared recipe.
+
+    Both are well-free at inference time: drilled depth is construction
+    metadata (kNN IDW-mean + p90 over the GWX unconfined pool, no cross-fit
+    needed) and the hang features are a kNN-IDW of the bundle's top-2-Strahler
+    boundary reach elevations. ``self_exclude_m`` is the drilled-depth
+    self/nest guard: 0 = deployment semantics (a lattice cell is not a well),
+    100 = the training-semantics sensitivity variant the point predictor
+    exposes. ``boundaries`` lets a multi-basin run build the boundary set once
+    (it is a CONUS-wide table).
+    """
+    dd = bman["drilled_depth"]
+    out = dict(
+        sample_drilled_depth(
+            dd["points"],
+            qxy,
+            int(dd["k"]),
+            float(dd["power"]),
+            self_exclude_m=float(self_exclude_m),
+        )
+    )
+    dh = bman["dupuit_hang"]
+    bnd = (
+        boundaries
+        if boundaries is not None
+        else build_boundaries(
+            str(gdir / "reach_nodes.parquet"),
+            bman["sources"]["geom"],
+            top_orders=int(dh["top_orders"]),
+        )
+    )
+    hang_wte, d_bnd = hang_interp(
+        bnd[["cx", "cy"]].to_numpy("float64"),
+        bnd["reach_elev_m"].to_numpy("float64"),
+        qxy,
+        k=int(dh["idw_k"]),
+        power=float(dh["idw_power"]),
+    )
+    out["dupuit_hang_dtw_m"] = z_surf - hang_wte
+    out["log1p_dupuit_d_m"] = np.log1p(d_bnd)
+    return out
+
+
+def deployment_source_ctx(
+    man: dict,
+    bman: dict,
+    gdir: Path,
+    qxy: np.ndarray,
+    z_surf: np.ndarray,
+    lat: pd.DataFrame,
+    rn_full: pd.DataFrame,
+    device: str,
+    exclude_m: float = 0.0,
+    extra: pd.DataFrame | None = None,
+) -> dict:
+    """Deployment source context for query points OUTSIDE the bundle.
+
+    Used identically by the point predictor (a well set) and the renderer (a
+    100 m lattice's cell centres). The source side of the read carries ONLY the
+    encoded observed residual -- the model never consumes source covariates
+    through this path -- so the bundle wells stay OUT of the query set. We build
+    fresh query<-well kNN edges with the build_source_edges recipe (same
+    relief-lifted metric, same k, same 4 attrs incl. FAC-basin identity),
+    standardize them with the trainer's GLOBAL fit over the frozen bundle edge
+    table (trainer-verbatim, like bundle_source_edges), and expose every
+    eligible well to every fold: deployment leaves no observation on the table,
+    and external queries carry no labels into the forward, so the training
+    protocol's same-site/masking guards do not apply. ``exclude_m`` > 0 drops
+    edges from wells within that radius of the query point (an eval-fairness
+    sensitivity knob; 0 = deployment semantics -- a map cell at a well reads
+    that well).
+
+    ``extra`` admits sources beyond the bundle (e.g. a frozen NDWR admission
+    table): columns x5070/y5070/wte_residual_m/z_surf_m/basin, where
+    wte_residual_m is in the bundle's frame ((z_surf - dtw) - r_wte, same R)
+    and basin is the controlling-reach FAC basin label (NaN -> never
+    same_basin). Extra sources join the kNN pool on equal footing.
+
+    ``lat`` must be the PRE-prune lateral attachment: prune_for_queries remaps
+    reach_node_idx to the pruned numbering, but the basin lookup is keyed on
+    ``rn_full``'s original ids.
+    """
+    se = pd.read_parquet(man["flags"]["source_edges"])
+    stats = fit_stats(se, list(SOURCE_EDGE_COLS), None)
+    k = int(se["rank"].max()) + 1
+    qn = (
+        pd.read_parquet(gdir / "query_nodes.parquet")
+        .sort_values("query_node_idx")
+        .reset_index(drop=True)
+    )
+    water = (
+        qn["is_water_pseudo"].to_numpy(bool)
+        if "is_water_pseudo" in qn.columns
+        else np.zeros(len(qn), bool)
+    )
+    resid_all = qn["wte_residual_m"].to_numpy("float64")
+    elig = ~water & np.isfinite(resid_all)
+    w = qn[elig].reset_index(drop=True)
+    wxy = w[["x5070", "y5070"]].to_numpy("float64")
+    wz = np.nan_to_num(w["z_surf_well_m"].to_numpy("float64"), nan=0.0)
+    vw = float(bman["r_relief_vw"])
+
+    # controlling-reach FAC basin, raw labels on both sides (equality is what
+    # same_basin encodes; build_source_edges factorizes only for compactness)
+    basin_of_reach = rn_full.set_index("reach_node_idx")["basin"]
+    blat = pd.read_parquet(
+        gdir / "lateral_edges.parquet",
+        columns=["query_node_idx", "reach_node_idx", "is_controlling"],
+    )
+    bctrl = (
+        blat[blat["is_controlling"].astype(bool)]
+        .drop_duplicates("query_node_idx")
+        .set_index("query_node_idx")["reach_node_idx"]
+    )
+    src_basin = w["query_node_idx"].map(bctrl).map(basin_of_reach)
+    resid = w["wte_residual_m"].to_numpy("float64")
+    n_extra = 0
+    if extra is not None and len(extra):
+        n_extra = len(extra)
+        wxy = np.vstack([wxy, extra[["x5070", "y5070"]].to_numpy("float64")])
+        wz = np.concatenate(
+            [wz, np.nan_to_num(extra["z_surf_m"].to_numpy("float64"), nan=0.0)]
+        )
+        resid = np.concatenate([resid, extra["wte_residual_m"].to_numpy("float64")])
+        src_basin = pd.concat(
+            [src_basin.reset_index(drop=True), extra["basin"].reset_index(drop=True)],
+            ignore_index=True,
+        )
+    pctrl = (
+        lat[lat["is_controlling"].astype(bool)]
+        .drop_duplicates("query_node_idx")
+        .set_index("query_node_idx")["reach_node_idx"]
+    )
+    dest_basin = (
+        pd.Series(np.arange(len(qxy), dtype="int64")).map(pctrl).map(basin_of_reach)
+    )
+
+    pad = 8 if exclude_m > 0 else 0
+    kq = min(k + pad, len(resid))
+    tree = cKDTree(_relief_coords(wxy, wz, vw))
+    rd, loc = tree.query(_relief_coords(qxy, z_surf, vw), k=kq, workers=-1)
+    if kq == 1:
+        rd, loc = rd[:, None], loc[:, None]
+    dest = np.repeat(np.arange(len(qxy), dtype="int64"), kq)
+    src = loc.ravel().astype("int64")
+    geo_km = np.sqrt(((qxy[dest] - wxy[src]) ** 2).sum(axis=1)) / 1000.0
+    ed = pd.DataFrame(
+        {
+            "dest": dest,
+            "src": src,
+            "log1p_geo_dist_km": np.log1p(geo_km),
+            "log1p_relief_dist_km": np.log1p(rd.ravel() / 1000.0),
+            "rel_elev_m": z_surf[dest] - wz[src],
+            "same_basin": (
+                dest_basin.iloc[dest].notna().to_numpy()
+                & (dest_basin.iloc[dest].to_numpy() == src_basin.iloc[src].to_numpy())
+            ).astype("float64"),
+        }
+    )
+    if exclude_m > 0:
+        ed = ed[geo_km * 1000.0 >= exclude_m]
+    ed = ed[ed.groupby("dest").cumcount() < k].reset_index(drop=True)
+    deg = ed.groupby("dest").size()
+    stats_panel = {
+        "n_edges": int(len(ed)),
+        "n_query_with_edges": int(deg.size),
+        "n_query": int(len(qxy)),
+        "k": k,
+        "relief_vw": vw,
+        "exclude_m": float(exclude_m),
+        "n_sources": int(len(resid)),
+        "n_sources_bundle": int(len(w)),
+        "n_sources_extra": int(n_extra),
+        "median_rank0_geo_dist_km": float(
+            np.expm1(ed.groupby("dest")["log1p_geo_dist_km"].min().median())
+        ),
+        "frac_same_basin": float(ed["same_basin"].mean()),
+    }
+    log.info(
+        "source edges: %d edges to %d/%d query points (k=%d, vw=%.0f, "
+        "exclude_m=%.0f, %d eligible wells (%d bundle + %d extra), "
+        "median rank-0 geo %.2f km, frac_same_basin %.2f)",
+        stats_panel["n_edges"],
+        stats_panel["n_query_with_edges"],
+        stats_panel["n_query"],
+        k,
+        vw,
+        exclude_m,
+        stats_panel["n_sources"],
+        stats_panel["n_sources_bundle"],
+        n_extra,
+        stats_panel["median_rank0_geo_dist_km"],
+        stats_panel["frac_same_basin"],
+    )
+    ea = apply_stats(ed, stats)
+    src_t = torch.as_tensor(
+        ed["src"].to_numpy("int64"), dtype=torch.long, device=device
+    )
+    dst_t = torch.as_tensor(
+        ed["dest"].to_numpy("int64"), dtype=torch.long, device=device
+    )
+    return {
+        "resid": resid,
+        "pool_by_fold": lambda f: np.ones(len(resid), dtype=bool),
+        "edges": {
+            "src": src_t,
+            "ei": torch.stack([src_t, dst_t]),
+            "ea": torch.as_tensor(ea, dtype=torch.float32, device=device),
+        },
+        "stats": stats_panel,
+    }
 
 
 def build_anchors(
@@ -452,6 +822,9 @@ def run_folds(
     anchors: dict,
     device: str,
     where: str,
+    f_mae: int | None = None,
+    writeback: bool = False,
+    src_ctx: dict | None = None,
 ) -> dict:
     """All folds forward + identity check -> fold-aggregated physical fields.
 
@@ -459,10 +832,28 @@ def run_folds(
     (each fold has its own y_c/y_s/q_stats); the ensemble WTE/sigma/head are
     fold medians, the gate weights a renormalized fold mean, and fold_spread
     (p90-p10 of per-fold WTE) is the ensemble-disagreement layer.
+
+    ``src_ctx`` (source-assimilation arms only) supplies the assimilation
+    inputs: ``resid`` = the source-indexed observed wte_residual_m (NaN where no
+    obs) and ``pool_by_fold(f)`` = the boolean mask of sources VISIBLE to fold
+    f's forward. Values are standardized per fold by that checkpoint's y_c/y_s,
+    exactly the trainer's construction.
     """
     man = models["manifest"]
     dims = dict(man["feature_dims"])
-    model = build_model(man, dims, device)
+    ck0 = next(iter(models["folds"].values()))
+    f_src = ckpt_f_src(ck0, dims["query"])
+    f_srcedge = ckpt_f_srcedge(ck0)
+    need_src = f_src is not None or f_srcedge is not None
+    if need_src != (src_ctx is not None):
+        raise SystemExit(
+            f"source-arm mismatch ({where}): checkpoint f_src={f_src} "
+            f"f_srcedge={f_srcedge} but "
+            f"src_ctx {'missing' if src_ctx is None else 'supplied'}"
+        )
+    model = build_model(
+        man, dims, device, f_mae, writeback, f_src=f_src, f_srcedge=f_srcedge
+    )
     per_fold = []
     for f, ck in sorted(models["folds"].items()):
         feat = fold_tensors(ck, frame, anchors, device)
@@ -471,6 +862,23 @@ def run_folds(
                 f"query feature-width skew: got {feat['query_x'].shape[1]}, "
                 f"expected {dims['query']}"
             )
+        if src_ctx is not None:
+            y_c, y_s = float(ck["y_c"]), float(ck["y_s"])
+            sel = src_ctx["pool_by_fold"](int(f))
+            s = torch.as_tensor(sel.astype("float32"), device=device)
+            val = torch.as_tensor(
+                np.nan_to_num((src_ctx["resid"] - y_c) / y_s, nan=0.0),
+                dtype=torch.float32,
+                device=device,
+            )
+            if f_src is not None:
+                feat["src_x"] = torch.stack([val * s, s], dim=-1)
+            if f_srcedge is not None:
+                ed = src_ctx["edges"]
+                keep = s[ed["src"]] > 0
+                feat["srcedge_ei"] = ed["ei"][:, keep]
+                feat["srcedge_ea"] = ed["ea"][keep]
+                feat["srcedge_val"] = val
         out = forward_fold(model, ck, graph, feat, r_wte)
         assert_mixture_identity(out, r_wte, anchors, f, where)
         per_fold.append(out)
@@ -522,6 +930,28 @@ def oof_check(models: dict, model_dir: Path, device: str, tol_m: float) -> None:
         **reach_tensors(rn, ce, models["shared"], dims, device),
         **lateral_tensors(lat, models["shared"], dims, device),
     }
+    _, writeback = ckpt_extensions(models["folds"][0])
+    if writeback:
+        graph["lat_ei_reversed"] = graph["lat_ei"].flip(0)
+    src_ctx = None
+    if ckpt_f_srcedge(models["folds"][0]) is not None:
+        # replay the trainer's FINAL-forward semantics: fold f's sources are the
+        # eligible (real, finite-target) wells OUTSIDE fold f (= its tr|va pool),
+        # so the archived OOF at test rows round-trips exactly.
+        resid = qn["wte_residual_m"].to_numpy("float64")
+        water = qn["is_water_pseudo"].to_numpy(bool)
+        shore = (
+            qn["is_shore_pseudo"].to_numpy(bool)
+            if "is_shore_pseudo" in qn.columns
+            else np.zeros(len(qn), bool)
+        )
+        eligible = ~water & ~shore & np.isfinite(resid)
+        fold_of = qn["cv_fold"].to_numpy("int64")
+        src_ctx = {
+            "resid": resid,
+            "pool_by_fold": lambda f: eligible & (fold_of != f),
+            "edges": bundle_source_edges(man, device),
+        }
     # bundle columns verbatim -- no recomputation, so a mismatch isolates the
     # persisted-contract replay rather than feature drift.
     r_wte = qn["regional_wte_idw_oof_m"].to_numpy("float64")
@@ -532,7 +962,17 @@ def oof_check(models: dict, model_dir: Path, device: str, tol_m: float) -> None:
         float(man["flags"]["mirror_depth_m"]),
         bool(man["flags"]["mirror_anchor"]),
     )
-    agg = run_folds(models, graph, qn, r_wte, anchors, device, "oof-check")
+    agg = run_folds(
+        models,
+        graph,
+        qn,
+        r_wte,
+        anchors,
+        device,
+        "oof-check",
+        writeback=writeback,
+        src_ctx=src_ctx,
+    )
     arch = pd.read_parquet(model_dir / "gnn_oof_predictions.parquet")
     arch = arch.set_index("canonical_id").loc[qn["canonical_id"]]
     fold = qn["cv_fold"].to_numpy("int64")
@@ -588,6 +1028,7 @@ def leak_gate(
     frac: float,
     min_wells: int,
     track_tol_m: float,
+    informational: bool = False,
 ) -> dict:
     """Fail loud if the coarse map beats its own OOF at training wells.
 
@@ -605,6 +1046,13 @@ def leak_gate(
     ratio 0.41 with R pinned to 0.010 m and zero obs-collapsed wells). A ratio
     trip that tracks OOF passes with status "pass_ratio_tripped" for review.
     Returns the gate panel for infer_run.json.
+
+    ``informational`` (source-assimilation arms) computes and records the same
+    panel but never fails: a source-armed render legitimately reads the well
+    pool, so a cell at a training well pins toward that well's observation by
+    design (deployment semantics) -- both gate signals fire on the intended
+    behaviour and the leak premise no longer holds. The panel is still the
+    place to watch how hard the map is pinning.
     """
     x = oof["x5070"].to_numpy("float64")
     y = oof["y5070"].to_numpy("float64")
@@ -641,6 +1089,22 @@ def leak_gate(
         mad_oof,
         gap,
     )
+    if informational:
+        panel |= {
+            "status": "informational_source_arm",
+            "note": "source-assimilation arm: the render reads the well pool by "
+            "design (a cell at a well reads that well), so the leak-gate premise "
+            "-- map must not beat its own OOF at training wells -- does not apply; "
+            "panel recorded, never enforced",
+        }
+        log.warning(
+            "%s: leak gate INFORMATIONAL (source-assimilation arm): the render "
+            "assimilates the well pool by design, so beating OOF at training "
+            "wells is the intended behaviour, not leakage -- panel recorded, "
+            "not enforced",
+            basin,
+        )
+        return panel
     if mad_map < frac * mad_oof:
         if gap > track_tol_m:
             raise SystemExit(
@@ -677,8 +1141,12 @@ def infer_basin(
     device: str,
     water_xy: np.ndarray | None = None,
     oof: pd.DataFrame | None = None,
+    extra_sources: pd.DataFrame | None = None,
+    boundaries: pd.DataFrame | None = None,
 ) -> None:
     man = models["manifest"]
+    f_mae, writeback = ckpt_extensions(models["folds"][0])
+    f_srcedge = ckpt_f_srcedge(models["folds"][0])
     out_dir = HUC8_ROOT / basin / "gnn" / args.model_name
     out_dir.mkdir(parents=True, exist_ok=True)
     transform, width, height, rows, cols, qx, qy = basin_lattice(basin)
@@ -788,6 +1256,13 @@ def infer_basin(
         frame["gsw_occ_pct"] = _sample_gsw_occurrence(lon_q, lat_q)
         for c, v in water_query_features(qxy, z_surf, water_xy, args.dem).items():
             frame[c] = v
+    if "drilled_depth_idw_m" in man["query_feature_cols"]:
+        # deployment semantics: a lattice cell is not a well, so no drilled-depth
+        # self/nest exclusion (build_conus_graph_inputs.sample_drilled_depth).
+        for c, v in dd_dup_features(
+            bman, Path(man["graph_dir"]), qxy, z_surf, boundaries=boundaries
+        ).items():
+            frame[c] = v
     missing = [c for c in man["query_feature_cols"] if c not in frame.columns]
     if missing:
         raise SystemExit(f"lattice frame lacks query features: {missing}")
@@ -796,6 +1271,9 @@ def infer_basin(
     lat_all = attach_lateral_attrs(
         lat_all, rn_full, z_surf, float(bman["conductance_p"])
     )
+    # pre-prune copy: prune_for_queries REMAPS lat's reach_node_idx to the pruned
+    # numbering, but the source-edge basin lookup needs rn_full's original ids.
+    lat_full = lat_all
     # One prune on the union of attached reaches: the kept subgraph contains the
     # full channel_layers-hop receptive field of every attached reach, so chunked
     # forwards over query subsets are exact (reach states are query-independent
@@ -826,16 +1304,77 @@ def infer_basin(
     }
     if man["flags"]["sigma_head"]:
         agg["sigma"] = np.full(n, np.nan)
+
+    src_ctx = None
+    if f_srcedge is not None:
+        # cell<-well kNN source edges over the WHOLE lattice (dest ids are global
+        # cell ids; sliced per chunk below), deployment semantics: every eligible
+        # well visible to every fold, no exclusion disk.
+        src_ctx = deployment_source_ctx(
+            man,
+            bman,
+            Path(man["graph_dir"]),
+            qxy,
+            z_surf,
+            lat_full,
+            rn_full,
+            device,
+            exclude_m=float(args.source_exclude_m),
+            extra=extra_sources,
+        )
+        src_dst = src_ctx["edges"]["ei"][1]
+
+    # With writeback the reach states depend on the ENTIRE query set (queries are
+    # written back onto reaches before the channel stack), so a chunked forward is
+    # NOT the same computation as the full-batch one: the basin goes through in a
+    # single batch. Without writeback, reach states are query-independent and the
+    # chunked path is exact.
+    chunk = n if writeback else args.query_chunk
+    if writeback and args.query_chunk < n:
+        log.info(
+            "%s: query-writeback arm -- forwarding all %d cells in ONE batch "
+            "(--query-chunk %d ignored; chunking would change the computation)",
+            basin,
+            n,
+            args.query_chunk,
+        )
+    cuda = device.startswith("cuda")
+    if cuda:
+        torch.cuda.reset_peak_memory_stats()
     qidx = lat_all["query_node_idx"].to_numpy("int64")
-    for i0 in range(0, n, args.query_chunk):
-        i1 = min(i0 + args.query_chunk, n)
+    for i0 in range(0, n, chunk):
+        i1 = min(i0 + chunk, n)
         sub = frame.iloc[i0:i1].reset_index(drop=True)
         lat_c = lat_all[(qidx >= i0) & (qidx < i1)].copy()
         lat_c["query_node_idx"] = lat_c["query_node_idx"] - i0
         graph = {**rt, **lateral_tensors(lat_c, models["shared"], dims, device)}
+        if writeback:
+            graph["lat_ei_reversed"] = graph["lat_ei"].flip(0)
+        chunk_src = src_ctx
+        if src_ctx is not None and (i0, i1) != (0, n):
+            keep = (src_dst >= i0) & (src_dst < i1)
+            ei = src_ctx["edges"]["ei"][:, keep].clone()
+            ei[1] -= i0
+            chunk_src = {
+                **src_ctx,
+                "edges": {
+                    "src": src_ctx["edges"]["src"][keep],
+                    "ei": ei,
+                    "ea": src_ctx["edges"]["ea"][keep],
+                },
+            }
         anchors_c = {k: v[i0:i1] for k, v in anchors_all.items()}
         ch = run_folds(
-            models, graph, sub, r_wte[i0:i1], anchors_c, device, f"{basin}[{i0}:{i1}]"
+            models,
+            graph,
+            sub,
+            r_wte[i0:i1],
+            anchors_c,
+            device,
+            f"{basin}[{i0}:{i1}]",
+            f_mae=f_mae,
+            writeback=writeback,
+            src_ctx=chunk_src,
         )
         for key in ("wte", "head_wte", "fold_spread", "sigma"):
             if key in ch and key in agg:
@@ -845,6 +1384,14 @@ def infer_basin(
             log.info("%s: %d/%d cells done", basin, i1, n)
     if not np.isfinite(agg["wte"]).all():
         raise SystemExit(f"{basin}: non-finite WTE cells after all chunks (bug)")
+    peak_gb = float(torch.cuda.max_memory_allocated() / 2**30) if cuda else None
+    if peak_gb is not None:
+        log.info(
+            "%s: peak GPU tensor allocation %.2f GiB (%d cells per forward)",
+            basin,
+            peak_gb,
+            min(chunk, n),
+        )
 
     dtw = z_surf - agg["wte"]
     neg = float((dtw < 0).mean())
@@ -864,6 +1411,7 @@ def infer_basin(
             args.leak_gate_frac,
             args.leak_gate_min_wells,
             args.leak_gate_track_m,
+            informational=f_srcedge is not None,
         )
     tags = {
         "wells": "monitoring_only",
@@ -912,6 +1460,12 @@ def infer_basin(
                 "r_source": args.r_source,
                 "r_exclude_km": args.r_exclude_km,
                 "deep_exclude_km": args.deep_exclude_km,
+                "query_writeback": bool(writeback),
+                "full_batch_forward": bool(chunk >= n),
+                "query_chunk": int(chunk),
+                "peak_gpu_alloc_gb": peak_gb,
+                "source_edges": (src_ctx or {}).get("stats"),
+                "extra_sources_path": args.extra_sources,
                 "leak_gate": gate_panel,
                 **tags,
             },
@@ -949,6 +1503,21 @@ def main() -> None:
         type=int,
         default=1_000_000,
         help="lattice cells per forward pass (bounds GPU memory; chunking is exact)",
+    )
+    ap.add_argument(
+        "--source-exclude-m",
+        type=float,
+        default=0.0,
+        help="(--source-edges arms) drop cell<-well source edges from wells "
+        "within this radius of the cell; 0 = deployment semantics (a cell at a "
+        "well reads that well), >0 = eval-fairness sensitivity variant",
+    )
+    ap.add_argument(
+        "--extra-sources",
+        help="(--source-edges arms) parquet of admitted external source wells "
+        "(x5070/y5070/wte_residual_m/z_surf_m) joining the bundle wells in the "
+        "kNN source pool; wte_residual_m must be in the bundle frame "
+        "((z_surf - dtw) - r_wte). Controlling-reach basin is attached here.",
     )
     ap.add_argument("--save-lattice", action="store_true")
     ap.add_argument(
@@ -999,6 +1568,31 @@ def main() -> None:
     args.model_name = args.model_dir.name
     models = load_models(args.model_dir)
     man = models["manifest"]
+    f_mae, writeback = ckpt_extensions(models["folds"][0])
+    f_src = ckpt_f_src(models["folds"][0], man["feature_dims"]["query"])
+    f_srcedge = ckpt_f_srcedge(models["folds"][0])
+    log.info(
+        "arm %s: f_mae=%s writeback=%s f_src=%s f_srcedge=%s",
+        args.model_name,
+        f_mae,
+        writeback,
+        f_src,
+        f_srcedge,
+    )
+    if f_mae is not None:
+        raise SystemExit(
+            f"{args.model_name} has an MAE head (f_mae={f_mae}): the renderer has "
+            "no lattice MAE embeddings (they exist only at the bundle's query "
+            "nodes / extract_mae_embeddings.py --coords point sets), so this arm "
+            "cannot render. Use a non-MAE arm, or predict_gnn_at_points.py "
+            "--mae-embeddings for point output."
+        )
+    if f_src is not None:
+        raise SystemExit(
+            f"{args.model_name} is a --source-obs (rung 0) arm: the source wells "
+            "must live inside the query set for their obs to travel, which a "
+            "lattice render cannot do (rung 0 is shelved). Use a --source-edges arm."
+        )
 
     if args.oof_check:
         oof_check(models, args.model_dir, args.device, args.oof_tol_m)
@@ -1064,6 +1658,19 @@ def main() -> None:
         len(ce_full),
         len(geom),
     )
+    boundaries = None
+    if "drilled_depth_idw_m" in man["query_feature_cols"]:
+        # CONUS-wide boundary set: built once, reused by every basin
+        boundaries = build_boundaries(
+            str(gdir / "reach_nodes.parquet"),
+            bman["sources"]["geom"],
+            top_orders=int(bman["dupuit_hang"]["top_orders"]),
+        )
+    extra_sources = None
+    if args.extra_sources:
+        if f_srcedge is None:
+            raise SystemExit("--extra-sources requires a --source-edges arm")
+        extra_sources = load_extra_sources(args.extra_sources, geom, rn_full)
 
     done = skipped = 0
     for b in basins:
@@ -1083,6 +1690,8 @@ def main() -> None:
             args.device,
             water_xy=water_xy,
             oof=oof,
+            extra_sources=extra_sources,
+            boundaries=boundaries,
         )
         done += 1
     log.info("inference complete: %d basins run, %d skipped (existing)", done, skipped)

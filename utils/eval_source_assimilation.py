@@ -47,17 +47,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_conus_graph_inputs import _relief_coords  # noqa: E402
 from infer_conus_gnn import (  # noqa: E402
     build_anchors,
+    build_model,
+    bundle_source_edges,
+    ckpt_f_src,
+    ckpt_f_srcedge,
     fold_tensors,
     forward_fold,
     load_models,
 )
-from predict_gnn_at_points import (  # noqa: E402
-    build_model_pt,
-    bundle_graph,
-    bundle_source_edges,
-    ckpt_f_src,
-    ckpt_f_srcedge,
-)
+from predict_gnn_at_points import bundle_graph  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("eval_source_assimilation")
@@ -227,7 +225,7 @@ def main() -> None:
         bool(man["flags"]["mirror_anchor"]),
     )
     dims = dict(man["feature_dims"])
-    model = build_model_pt(
+    model = build_model(
         man, dims, args.device, f_mae, writeback, f_src=f_src, f_srcedge=f_srcedge
     )
     src_edges = bundle_source_edges(man, args.device) if f_srcedge else None

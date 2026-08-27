@@ -121,6 +121,24 @@ tracking median, thresholds, status) is persisted with the run metadata.
 throughout, because both sides of those comparisons shared the leak. Only a
 map-versus-OOF comparison can catch this class.*
 
+### 2a. Source-assimilation arms: the gate is informational, not waived
+
+A `--source-edges` (assimilation) arm reads the observation pool at inference time
+**by design** — a map cell sitting at a well reads that well, which is the product,
+not a defect. Both gate signals therefore fire on intended behaviour, and the gate's
+premise ("the map must not beat its own OOF at training wells") no longer holds. For
+these arms the panel is still computed and persisted with the run metadata, but is
+recorded with status `informational_source_arm` and never fails the run. Two
+obligations replace the enforcement:
+
+- **The assimilation pool must be declared** in the run metadata: source counts
+  (bundle + admitted external), the external table's path, the kNN k, the median
+  rank-0 source distance (km) and the same-basin fraction. A map whose accuracy comes
+  from assimilated observations must say so, with the pool it assimilated.
+- **Accuracy claims still come from held-out evaluation** (§3, §4) — the arm's
+  own OOF, or wells outside the assimilated pool and spatially buffered from it.
+  Map-at-well error for a source arm measures the pin, not skill.
+
 ## 3. "Held out" means spatially buffered
 
 Validation of rasters against wells must exclude wells within the interpolation
