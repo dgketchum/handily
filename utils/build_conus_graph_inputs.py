@@ -61,6 +61,7 @@ from build_stacker_features import (  # noqa: E402
     sample_coarse,
 )
 from build_dupuit_wte import build_boundaries, hang_interp  # noqa: E402
+from build_water_mask_v3 import sample_water_mask as sample_water_mask_v3  # noqa: E402
 from fac_rem_registry import sample_fac_rem, sample_str_top2_wte  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -150,6 +151,34 @@ WATER_FEATURE_COLS = [
 ]
 WBD_HU8_PARQUET = "/nas/hydrography/HUC_Boundaries/wbd_national/wbdhu8_5070.parquet"
 WATER_BLOCKS_PARQUET = "permanent_water_blocks.parquet"  # cached in the bundle dir
+# --- Lever C: screened V3 surface-water mask + MODIS-JJA wetness ---------------
+# The >=90 %-occurrence block selector above was tuned for pseudo-LABEL purity and
+# is far too strict reused as dist/HAND FEATURES (7 blocks vs ~726 real corridor
+# cells in pilot HUC8 16040103). V3 = JRC occ >= 50 % AND a target-blind contiguity
+# screen (>= 200 occ>=50 30 m pixels within 1 km), which drops the high-elevation
+# snow/shadow false positives without censoring the deep-error river corridor.
+# Built CONUS-wide on the canonical 100 m EPSG:5070 lattice by
+# utils/build_water_mask_v3.py; notes/NAIP_WATER_EVIDENCE_PLAN.md sections 9-11.
+WATER_V3_DIR = Path("/nas/handily/covariates/water_mask_v3")
+WATER_V3_MASK_TIF = str(WATER_V3_DIR / "water_mask_v3_100m_5070.tif")
+WATER_V3_CELLS_PARQUET = str(WATER_V3_DIR / "water_mask_v3_cells.parquet")
+WATER_V3_FEATURE_COLS = [
+    "on_water_v3",  # 1.0 on the screened mask, 0.0 elsewhere (dimensionless flag)
+    "log1p_dist_water_v3_m",  # log1p distance (m) to the nearest screened water cell
+    "hand_water_v3_m",  # z_surf(query) - DEM(nearest screened cell): height above stage
+]
+# CONUS MODIS-JJA wetness composites (utils/build_modis_jja_wetness.py; MOD13Q1 v061
+# JJA 2018-2024 per-pixel median, EPSG:5070 250 m, dimensionless, higher = wetter).
+# NDWI is the NIR/SWIR-2.1 (NDMI) form -- it separates wet from dry where NDVI cannot
+# (NDVI is confounded by upland shrub/conifer). Target-blind seasonal wetness the
+# GSW occurrence layer misses (irrigated-meadow subirrigation, ephemeral wet meadows).
+MODIS_JJA_NDVI = (
+    "/nas/handily/covariates/modis_jja_wetness_250m/modis_jja_ndvi_median.tif"
+)
+MODIS_JJA_NDWI = (
+    "/nas/handily/covariates/modis_jja_wetness_250m/modis_jja_ndwi_median.tif"
+)
+MODIS_WETNESS_FEATURE_COLS = ["modis_jja_ndvi_med", "modis_jja_ndwi_med"]
 # IrrMapper irrigation frequency (behind --irrigation-features): % of 2015-2024 years
 # a 30 m pixel was classified irrigated. Mechanism: sustained irrigation recharges a
 # local shallow mound the terrain cannot see (flood-irrigated hay valleys), and the
@@ -2029,6 +2058,115 @@ def water_query_features(
     }
 
 
+def water_v3_query_features(
+    qxy: np.ndarray,
+    q_surf: np.ndarray,
+    on_water: np.ndarray,
+    cell_xy: np.ndarray,
+    dem_path: str,
+    sampler=None,
+) -> dict[str, np.ndarray]:
+    """Screened-mask (V3) water-context features -- the multi-tier companion to
+    ``water_query_features`` (which is keyed to the strict occ>=90 block pool).
+
+    ``on_water_v3`` is the mask membership flag read from the 100 m mask raster
+    (NOT derived from the distance, which is only ~0 at a cell center);
+    ``log1p_dist_water_v3_m`` / ``hand_water_v3_m`` mirror the >=90 pair exactly:
+    Euclidean distance to the nearest screened water cell center and the height of
+    the query above that cell's DEM elevation (the DEM is hydro-flattened over wide
+    water, so the nearest-cell elevation IS the local stage).
+    """
+    if sampler is None:
+        sampler = sample_coarse
+    dist, idx = cKDTree(cell_xy).query(qxy, k=1)
+    uniq, inv = np.unique(idx, return_inverse=True)
+    z_u = sampler(dem_path, cell_xy[uniq, 0], cell_xy[uniq, 1])
+    return {
+        "on_water_v3": np.asarray(on_water, "float64"),
+        "log1p_dist_water_v3_m": np.log1p(dist),
+        "hand_water_v3_m": np.asarray(q_surf, "float64") - np.asarray(z_u)[inv],
+    }
+
+
+def water_v3_inference_block(
+    bman: dict | None,
+    qxy: np.ndarray,
+    z_surf: np.ndarray,
+    fac_dtw: np.ndarray,
+    r_wte: np.ndarray,
+    dem_path: str,
+    sampler=None,
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
+    """Replay a bundle's V3 water treatment at inference points (lattice or wells).
+
+    ONE place so the renderer and the point path cannot drift from the bundle (or
+    from each other): reads the ``water_v3`` block of the bundle's graph_manifest
+    and applies exactly what the build applied --
+
+    * the three V3 query features (flag / distance / height-above-stage);
+    * the FAC hydro-flatten on the mask (``fac_rem_dtw := 0``), applied BEFORE the
+      FAC anomaly and the gate's FAC expert anchor are formed;
+    * the R pin on the mask (``R := z_surf``). At build time the pin is applied to
+      the water PSEUDO-ROWS; a masked lattice cell IS the deployment counterpart of
+      a water pseudo-row, so here it is applied to every masked point. (A masked
+      cell that also contains a real well is pinned here but was not at build time
+      -- a corner case in favour of the water semantics.)
+
+    Returns ``(feature cols, fac_dtw, r_wte, on_water)``; a no-op returning the
+    inputs unchanged when the bundle carries no ``water_v3`` block.
+    """
+    v3 = (bman or {}).get("water_v3")
+    if not v3:
+        return {}, fac_dtw, r_wte, np.zeros(len(qxy), bool)
+    on_water = sample_water_mask_v3(qxy[:, 0], qxy[:, 1], v3["mask_raster"])
+    log.info(
+        "water V3: %d/%d points on the screened mask (flatten=%s pin_r=%s)",
+        int(on_water.sum()),
+        len(on_water),
+        bool(v3.get("fac_flatten")),
+        bool(v3.get("pin_r_at_water_rows")),
+    )
+    cols: dict[str, np.ndarray] = {}
+    if v3.get("features_enabled"):
+        cells = pd.read_parquet(v3["cells_parquet"])[["x5070", "y5070"]].to_numpy(
+            "float64"
+        )
+        cols = water_v3_query_features(
+            qxy, z_surf, on_water, cells, dem_path, sampler=sampler
+        )
+    if v3.get("fac_flatten"):
+        flat = on_water & np.isfinite(fac_dtw)
+        log.info(
+            "water V3 flatten: %d points zeroed (median pre-flatten %.2f m)",
+            int(flat.sum()),
+            float(np.nanmedian(fac_dtw[flat])) if flat.any() else float("nan"),
+        )
+        fac_dtw = np.where(flat, 0.0, fac_dtw)
+    if v3.get("pin_r_at_water_rows"):
+        log.info(
+            "water V3 R pin: %d points -> R := z_surf (median |z_surf - R| %.2f m)",
+            int(on_water.sum()),
+            float(np.nanmedian(np.abs(z_surf[on_water] - r_wte[on_water])))
+            if on_water.any()
+            else float("nan"),
+        )
+        r_wte = np.where(on_water, z_surf, r_wte)
+    return cols, fac_dtw, r_wte, on_water
+
+
+def sample_modis_jja_wetness(x: np.ndarray, y: np.ndarray) -> dict[str, np.ndarray]:
+    """MODIS-JJA NDVI / NDWI summer-median wetness at EPSG:5070 coords.
+
+    Both rasters are 250 m EPSG:5070 float32 with NaN nodata (dimensionless indices,
+    higher = wetter). Off-grid / nodata stays NaN; the trainer median-imputes and
+    flags via the NaN indicator, exactly like the other coarse covariates.
+    """
+    return {
+        "modis_jja_ndvi_med": sample_coarse(MODIS_JJA_NDVI, x, y),
+        "modis_jja_ndwi_med": sample_coarse(MODIS_JJA_NDWI, x, y),
+    }
+
+
 def build_water_rows(
     block_xy: np.ndarray,
     huc8_polys_path: str,
@@ -2431,6 +2569,53 @@ def main() -> None:
         help="drop water blocks farther than this from every well before the FAC "
         "probe (keeps the registry sampling cheap; open water with no wells in "
         "reach carries no learnable context anyway)",
+    )
+    ap.add_argument(
+        "--water-v3-features",
+        action="store_true",
+        help="(wte_residual only) add WATER_V3_FEATURE_COLS from the CONUS screened "
+        "water mask (occ>=50 + 200 px/km contiguity screen, "
+        "utils/build_water_mask_v3.py): on_water_v3 flag + distance to / height above "
+        "the nearest screened water cell. Additive to --water-features (the >=90 tier "
+        "stays; more tiers, the model chooses).",
+    )
+    ap.add_argument(
+        "--modis-wetness-features",
+        action="store_true",
+        help="add MODIS_WETNESS_FEATURE_COLS (MODIS-JJA NDVI + NDWI 2018-2024 summer "
+        "medians, 250 m EPSG:5070, dimensionless) as query features -- seasonal "
+        "wetness the GSW occurrence layer misses",
+    )
+    ap.add_argument(
+        "--water-v3-flatten",
+        action="store_true",
+        help="(requires --water-v3-features) hydro-flatten the FAC-REM prior on the "
+        "screened water mask: fac_rem_dtw_m := 0 at every query row whose location "
+        "falls in the mask, BEFORE fac_rem_wte_anom_m is formed. The gate is a "
+        "pass-through of the FAC prior on water (median |OOF - fac_rem_dtw| = 0.0001 m "
+        "over the water pseudo-rows), so flattening the INPUT is what moves the "
+        "on-water prediction. The pre-flatten depth is kept as fac_rem_dtw_orig_m "
+        "(diagnostics). Inference must flatten identically (infer_conus_gnn / "
+        "predict_gnn_at_points read the same mask off the manifest).",
+    )
+    ap.add_argument(
+        "--water-v3-pin-r",
+        action="store_true",
+        help="(requires --water-v3-features) pin the regional prior R to the land "
+        "surface at water pseudo-rows (R := z_surf, i.e. stage WTE = ground on open "
+        "water) instead of the well-IDW value. Keeps fac_rem_wte_anom_m in "
+        "distribution on water: at inference the water cells are excluded from the "
+        "IDW pool and R drifts (-11.1 m median at the pilot's water cells), which "
+        "pushed the anomaly out of the training range and drove the residual mirror "
+        "hedge. Inference pins R the same way at masked lattice cells.",
+    )
+    ap.add_argument(
+        "--water-v3-pseudo-labels",
+        action="store_true",
+        help="(requires --water-pseudo-labels + --water-v3-features) draw the "
+        "water-stage pseudo-rows from the screened V3 mask cells instead of the "
+        ">=90 %% occurrence blocks -- same per-HUC8 cap semantics, ~100x the corridor "
+        "coverage",
     )
     ap.add_argument(
         "--shoreline-points",
@@ -2840,8 +3025,71 @@ def main() -> None:
             "leakage_note": "pseudo-rows are masked out of every cross-fit prior "
             "pool and excluded from trainer val/test metrics + scorer panels",
         }
+    # --- Lever C: screened V3 water mask (features / flatten / pin-R / labels) ---
+    water_v3_cells = None
+    water_v3_meta = None
+    if (
+        args.water_v3_features
+        or args.water_v3_flatten
+        or args.water_v3_pin_r
+        or args.water_v3_pseudo_labels
+    ):
+        if args.target != TARGET_WTE_RESIDUAL:
+            raise SystemExit("--water-v3-* flags are wte_residual-only")
+        if not args.water_v3_features and (
+            args.water_v3_flatten or args.water_v3_pin_r
+        ):
+            raise SystemExit(
+                "--water-v3-flatten/--water-v3-pin-r require --water-v3-features "
+                "(the mask must be a declared feature so inference reproduces it)"
+            )
+        if args.water_v3_pseudo_labels and not args.water_pseudo_labels:
+            raise SystemExit(
+                "--water-v3-pseudo-labels requires --water-pseudo-labels (it only "
+                "swaps the block pool the rows are drawn from)"
+            )
+        for p in (WATER_V3_MASK_TIF, WATER_V3_CELLS_PARQUET):
+            if not Path(p).exists():
+                raise SystemExit(
+                    f"missing V3 water mask product {p} -- build it with "
+                    "utils/build_water_mask_v3.py"
+                )
+        water_v3_cells = pd.read_parquet(WATER_V3_CELLS_PARQUET)
+        v3_build = json.loads((WATER_V3_DIR / "build_manifest.json").read_text())
+        log.info(
+            "water V3 mask: %d masked 100 m cells (%.0f km2 of screened surface "
+            "water); pool = %d boundary cells (%.0f km2 shell) from %s",
+            v3_build["n_cells_masked"],
+            v3_build["area_km2_masked"],
+            len(water_v3_cells),
+            len(water_v3_cells) * 0.01,
+            WATER_V3_MASK_TIF,
+        )
+        water_v3_meta = {
+            "mask_raster": WATER_V3_MASK_TIF,
+            "cells_parquet": WATER_V3_CELLS_PARQUET,
+            "n_cells_masked": int(v3_build["n_cells_masked"]),
+            "area_km2_masked": float(v3_build["area_km2_masked"]),
+            "n_pool_cells": int(len(water_v3_cells)),
+            "pool_semantics": v3_build["cells_parquet_semantics"],
+            "features_enabled": bool(args.water_v3_features),
+            "feature_cols": WATER_V3_FEATURE_COLS if args.water_v3_features else [],
+            "fac_flatten": bool(args.water_v3_flatten),
+            "pin_r_at_water_rows": bool(args.water_v3_pin_r),
+            "pseudo_labels_from_v3": bool(args.water_v3_pseudo_labels),
+            "recipe": "JRC GSW occurrence >= 50 % AND >= 200 occ>=50 30 m pixels "
+            "within 1 km (target-blind contiguity screen; NO fac clause)",
+        }
     if args.water_pseudo_labels:
-        bxy = water_blocks[["x5070", "y5070"]].to_numpy("float64")
+        bxy = (
+            water_v3_cells[["x5070", "y5070"]].to_numpy("float64")
+            if args.water_v3_pseudo_labels
+            else water_blocks[["x5070", "y5070"]].to_numpy("float64")
+        )
+        if args.water_v3_pseudo_labels:
+            log.info(
+                "water rows: drawing from the V3 screened mask (%d cells)", len(bxy)
+            )
         wxy_now = wells[["x5070", "y5070"]].to_numpy("float64")
         near = (
             cKDTree(wxy_now).query(bxy, k=1)[0] <= args.water_max_well_dist_km * 1000.0
@@ -2876,6 +3124,22 @@ def main() -> None:
         water_meta["n_pseudo_rows"] = int(len(wrows))
         water_meta["per_huc8_cap"] = args.water_per_huc8_cap
         water_meta["max_well_dist_km"] = args.water_max_well_dist_km
+        water_meta["pool"] = (
+            "water_v3_mask" if args.water_v3_pseudo_labels else "gsw_occ90_blocks"
+        )
+        n_capped = int((wrows.groupby("huc8").size() == args.water_per_huc8_cap).sum())
+        log.info(
+            "water rows: %d/%d HUC8s at the per-HUC8 cap (%d) -- cap binding fraction "
+            "%.2f (dimensionless)",
+            n_capped,
+            int(wrows["huc8"].nunique()),
+            args.water_per_huc8_cap,
+            n_capped / max(int(wrows["huc8"].nunique()), 1),
+        )
+        water_meta["n_huc8_at_cap"] = n_capped
+        water_meta["n_huc8"] = int(wrows["huc8"].nunique())
+        if args.water_v3_pseudo_labels and water_v3_meta is not None:
+            water_v3_meta["n_pseudo_rows"] = int(len(wrows))
         wells = pd.concat([wells, wrows], ignore_index=True)
 
     # --- E6 land-side shoreline ring pseudo-rows (labels-never-priors) ---------
@@ -3086,6 +3350,39 @@ def main() -> None:
         # under --require-fac. Sampled up front because it is either an anomaly feature
         # (str_top2 base) or the residual BASE itself (fac_rem base).
         fac_dtw = sample_fac_rem(xy[:, 0], xy[:, 1])
+        wells["fac_rem_dtw_orig_m"] = fac_dtw.copy()  # pre-flatten, diagnostics only
+        # --water-v3-flatten: hydro-flatten the FAC prior on screened surface water
+        # BEFORE the anomaly is formed, so fac_rem_dtw_m AND fac_rem_wte_anom_m (and
+        # therefore the gate's FAC expert anchor) all see DTW = 0 on water. The frozen-
+        # weights probe showed the gate is a pass-through of this prior on water, so
+        # this input edit is the ~1:1 lever on the on-water prediction.
+        on_water_v3 = np.zeros(len(wells), bool)
+        if water_v3_cells is not None:
+            on_water_v3 = sample_water_mask_v3(xy[:, 0], xy[:, 1], WATER_V3_MASK_TIF)
+            log.info(
+                "water V3 mask: %d/%d query rows on screened water (%d water pseudo-rows, "
+                "%d well rows)",
+                int(on_water_v3.sum()),
+                len(on_water_v3),
+                int((on_water_v3 & wells["is_water_pseudo"].to_numpy(bool)).sum()),
+                int((on_water_v3 & ~wells["is_water_pseudo"].to_numpy(bool)).sum()),
+            )
+        if args.water_v3_flatten:
+            flat = on_water_v3 & np.isfinite(fac_dtw)
+            n_moved = int((flat & (fac_dtw > 0)).sum())
+            log.info(
+                "FAC water-flatten: %d/%d masked rows zeroed (%d had fac_rem_dtw > 0; "
+                "median pre-flatten %.2f m)",
+                int(flat.sum()),
+                int(on_water_v3.sum()),
+                n_moved,
+                float(np.nanmedian(fac_dtw[flat])) if flat.any() else float("nan"),
+            )
+            fac_dtw = np.where(flat, 0.0, fac_dtw)
+            if water_v3_meta is not None:
+                water_v3_meta["n_rows_flattened"] = int(flat.sum())
+                water_v3_meta["n_rows_flatten_moved"] = n_moved
+        wells["on_water_v3"] = on_water_v3.astype("float64")
         wells["fac_rem_dtw_m"] = fac_dtw
         fac_joined, fac_finite_frac = True, float(np.isfinite(fac_dtw).mean())
         fac_wte = well_surf_m - fac_dtw  # FAC-REM water-surface ELEVATION
@@ -3139,6 +3436,29 @@ def main() -> None:
                     f"{int((~np.isfinite(r_wte)).sum())} wells lack finite relief-IDW R "
                     "-- investigate (do not patch)"
                 )
+            # --water-v3-pin-r: on open water the stage WTE IS the land surface, so R
+            # at a water pseudo-row is z_surf, not the well-IDW value. Consequences:
+            # the residual target becomes exactly 0 there, and fac_rem_wte_anom_m
+            # collapses to -fac_rem_dtw (== 0 once flattened) instead of inheriting the
+            # well-IDW's offset -- which is what keeps the anomaly IN DISTRIBUTION at
+            # inference, where water cells are excluded from the IDW pool and R drifts.
+            # Real wells (even the handful sitting on the mask) keep their IDW R: they
+            # carry a real observation, not a stage pseudo-label.
+            if args.water_v3_pin_r:
+                pin = wells["is_water_pseudo"].to_numpy(bool)
+                d_pin = (
+                    np.abs(well_surf_m[pin] - r_wte[pin]) if pin.any() else np.array([])
+                )
+                log.info(
+                    "R pin at water rows: %d rows -> R := z_surf; |z_surf - IDW R| "
+                    "median %.2f m, p90 %.2f m (the drift the pin removes)",
+                    int(pin.sum()),
+                    float(np.median(d_pin)) if len(d_pin) else float("nan"),
+                    float(np.percentile(d_pin, 90)) if len(d_pin) else float("nan"),
+                )
+                r_wte = np.where(pin, well_surf_m, r_wte)
+                if water_v3_meta is not None:
+                    water_v3_meta["n_rows_r_pinned"] = int(pin.sum())
             head_anom_cols = [FAC_REM_WTE_ANOM_COL, DEEP_REGIONAL_WTE_ANOM_COL]
         elif args.residual_base == "ensemble_median":
             # Per-well median of three physically-distinct level-0 members: the
@@ -3274,6 +3594,32 @@ def main() -> None:
                     float(np.isfinite(v).mean()),
                     float(np.nanmedian(v)),
                 )
+        # Screened-mask (V3) water tier -- additive to the >=90 tier above.
+        if args.water_v3_features:
+            v3 = water_v3_query_features(
+                xy,
+                well_surf_m,
+                on_water_v3,
+                water_v3_cells[["x5070", "y5070"]].to_numpy("float64"),
+                args.dem,
+            )
+            for col, vals in v3.items():
+                wells[col] = vals
+                log.info(
+                    "  %s: %.3f finite frac, median %.2f",
+                    col,
+                    float(np.isfinite(vals).mean()),
+                    float(np.nanmedian(vals)),
+                )
+        if args.modis_wetness_features:
+            for col, vals in sample_modis_jja_wetness(xy[:, 0], xy[:, 1]).items():
+                wells[col] = vals
+                log.info(
+                    "  %s: %.3f finite frac, median %.3f (dimensionless)",
+                    col,
+                    float(np.isfinite(vals).mean()),
+                    float(np.nanmedian(vals)),
+                )
         # Multi-scale terrain-position family (height-above-floor + TPI + TWI x 4 scales).
         if args.terrain_multiscale_features:
             for col, vals in sample_terrain_multiscale(xy[:, 0], xy[:, 1]).items():
@@ -3388,6 +3734,8 @@ def main() -> None:
             + (ZS_FEATURE_COLS if args.zell_sanford_features else [])
             + (DUPUIT_FEATURE_COLS if args.dupuit_hang_features else [])
             + (WATER_FEATURE_COLS if args.water_features else [])
+            + (WATER_V3_FEATURE_COLS if args.water_v3_features else [])
+            + (MODIS_WETNESS_FEATURE_COLS if args.modis_wetness_features else [])
         )
         log.info(
             "target=wte_residual  residual_base=%s  R=%s  R-MAD(DTW)=%.2f m  "
@@ -3984,6 +4332,10 @@ def main() -> None:
             WTE_RESID_BASE_COL,
             WTE_RESIDUAL_TARGET_COL,
             "fac_rem_dtw_m",
+            # PRE-flatten FAC-REM depth: == fac_rem_dtw_m unless --water-v3-flatten
+            # zeroed the feature on the screened mask. Diagnostics only (the on-water
+            # fidelity panel bands by it) -- never a model feature.
+            "fac_rem_dtw_orig_m",
         ]
     else:
         extra_keep.append("target_residual_dtw_m")
@@ -4477,6 +4829,16 @@ def main() -> None:
         "zell_sanford": zell_sanford_block,
         "dupuit_hang": dupuit_hang_block,
         "water": water_meta,
+        "water_v3": water_v3_meta,
+        "modis_wetness": {
+            "feature_cols": MODIS_WETNESS_FEATURE_COLS,
+            "ndvi_raster": MODIS_JJA_NDVI,
+            "ndwi_raster": MODIS_JJA_NDWI,
+            "units": "dimensionless spectral indices, higher = wetter; NDWI is the "
+            "NIR/SWIR-2.1 (NDMI) form",
+        }
+        if args.modis_wetness_features
+        else None,
         "shore": shore_meta,
         "ds_datum": ds_datum_block,
         "mainstem_read": mainstem_read_block,
