@@ -36,6 +36,10 @@ Usage:
         --points pts.parquet --out preds.parquet [--mae-embeddings emb.parquet]
 
 ``--points``: parquet with x5070/y5070 plus any id columns (carried through).
+
+``--water-flatten-inference`` / ``--water-flatten-ramp`` are the renderer's
+inference-time water flatten (shared implementation in infer_conus_gnn), so a
+point run can reproduce exactly what a flattened map gives at those coordinates.
 """
 
 from __future__ import annotations
@@ -60,13 +64,16 @@ from build_conus_graph_inputs import (  # noqa: E402
     attach_lateral_attrs,
     build_lateral_edges,
     sample_gridmet,
+    sample_modis_jja_wetness,
     sample_relief_etrm,
     sample_terrain_multiscale,
     water_query_features,
+    water_v3_inference_block,
 )
 from build_stacker_features import sample_coarse  # noqa: E402
 from fac_rem_registry import sample_fac_rem  # noqa: E402
 from infer_conus_gnn import (  # noqa: E402
+    add_water_flatten_args,
     build_anchors,
     bundle_source_edges,
     ckpt_extensions,
@@ -81,6 +88,7 @@ from infer_conus_gnn import (  # noqa: E402
     prune_for_queries,
     reach_tensors,
     run_folds,
+    water_flatten_override,
     well_pool,
 )
 from train_wte_gnn import fit_stats  # noqa: E402
@@ -268,6 +276,7 @@ def main() -> None:
         "kNN source pool; wte_residual_m must be in the bundle frame "
         "((z_surf - dtw) - r_wte). Controlling-reach basin is attached here.",
     )
+    add_water_flatten_args(ap)
     ap.add_argument("--dem", default=DEM)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--oof-check", action="store_true")
@@ -334,6 +343,14 @@ def main() -> None:
         pool_co, deep_cross, wells_xy, q_co, qxy, k, p, 0.0
     )
     fac_dtw = sample_fac_rem(qx, qy)
+    # screened-water treatment (bundle-driven), same hook and same order as the
+    # renderer: flatten FAC and pin R on the mask before base/anchors are formed.
+    v3_cols, fac_dtw, r_wte, _on_water_v3 = water_v3_inference_block(
+        bman, qxy, z_surf, fac_dtw, r_wte, args.dem
+    )
+    # renderer-side flatten (--water-flatten-inference), shared verbatim with the
+    # raster path so a point check reads the same FAC the map does
+    fac_dtw, _water_flatten = water_flatten_override(args, qxy, fac_dtw)
     base = z_surf - r_wte
     anchors = build_anchors(
         base,
@@ -369,6 +386,11 @@ def main() -> None:
         )
         frame["gsw_occ_pct"] = _sample_gsw_occurrence(lon_q, lat_q)
         for c, v in water_query_features(qxy, z_surf, water_xy, args.dem).items():
+            frame[c] = v
+    for c, v in v3_cols.items():
+        frame[c] = v
+    if bman.get("modis_wetness"):
+        for c, v in sample_modis_jja_wetness(qx, qy).items():
             frame[c] = v
     if "drilled_depth_idw_m" in man["query_feature_cols"]:
         for c, v in dd_dup_features(

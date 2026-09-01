@@ -58,6 +58,17 @@ so the map READS the well pool at inference time. Two consequences:
 ``--extra-sources`` admits an external observation table (e.g. the frozen NDWR
 admission set) into the kNN source pool alongside the bundle wells.
 
+``--water-flatten-inference`` zeroes the FAC-REM input at verified-water cells
+(the V3 mask, /nas/handily/covariates/water_mask_v3) at inference time only,
+weights frozen: over water the gate locks onto the FAC expert, so a wrong
+FAC-REM depth is passed straight through and the map reads metres deep at real
+rivers and lakes. This is a RENDERER-SIDE override, independent of the bundle's
+``water_v3`` block (the production r1e weights come from a bundle that has
+none, and the retrain that baked the treatment into training was NO-GO --
+notes/WATER_V3_EVAL.md); it moves the FAC input only, never R.
+``--water-flatten-ramp`` additionally halves FAC on off-mask cells touching the
+mask, tapering the one-cell shoreline step the hard flatten leaves.
+
 Usage:
     uv run python utils/infer_conus_gnn.py \
         --model-dir /data/ssd2/handily/conus/wte_gnn/gnn_conus_monitoring_gate_mirror_sigma_prod \
@@ -86,6 +97,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_conus_graph_inputs import (  # noqa: E402
     DEM,
     WATER_BLOCKS_PARQUET,
+    WATER_V3_MASK_TIF,
     _relief_coords,
     _sample_gsw_occurrence,
     attach_lateral_attrs,
@@ -93,12 +105,15 @@ from build_conus_graph_inputs import (  # noqa: E402
     deep_well_mask,
     sample_drilled_depth,
     sample_gridmet,
+    sample_modis_jja_wetness,
     sample_relief_etrm,
     sample_terrain_multiscale,
     water_query_features,
+    water_v3_inference_block,
 )
 from build_dupuit_wte import build_boundaries, hang_interp  # noqa: E402
 from build_source_edges import EDGE_COLS as SOURCE_EDGE_COLS  # noqa: E402
+from build_water_mask_v3 import RAMP_FACTOR, water_flatten_factor  # noqa: E402
 from build_stacker_features import sample_coarse  # noqa: E402
 from fac_rem_registry import sample_fac_rem  # noqa: E402
 from train_conus_gnn import _fac_feat, prune_reach_graph  # noqa: E402
@@ -1020,6 +1035,92 @@ def scatter(
     return out
 
 
+def add_water_flatten_args(ap: argparse.ArgumentParser) -> None:
+    """Register the inference-time water-flatten flags (renderer + point path)."""
+    ap.add_argument(
+        "--water-flatten-inference",
+        action="store_true",
+        help="zero fac_rem_dtw_m at verified-water cells (V3 mask) at inference "
+        "time, frozen weights: the FAC input the model gate-locks onto over "
+        "water is wrong there, so the map reads metres deep at real rivers and "
+        "lakes. Renderer-side override, independent of the bundle's water_v3 "
+        "block; FAC input only, no R pin",
+    )
+    ap.add_argument(
+        "--water-flatten-ramp",
+        action="store_true",
+        help="--water-flatten-inference seam mode: off-mask cells with a masked "
+        f"8-neighbour get fac_rem_dtw_m x {RAMP_FACTOR:g} (one-cell shoreline "
+        "taper) instead of the hard mask-edge step",
+    )
+    ap.add_argument(
+        "--water-flatten-mask",
+        default=WATER_V3_MASK_TIF,
+        help="V3 verified-water mask raster backing --water-flatten-inference",
+    )
+
+
+def water_flatten_override(
+    args, qxy: np.ndarray, fac_dtw: np.ndarray
+) -> tuple[np.ndarray, dict | None]:
+    """Inference-time FAC flatten at verified water; returns (fac_dtw, provenance).
+
+    Applied AFTER ``water_v3_inference_block`` and BEFORE the FAC anomaly / the
+    gate's FAC anchor are formed, so the ONE sampled ``fac_dtw`` that feeds both
+    the ``fac_rem_dtw_m`` query feature and the FAC expert anchor is flattened --
+    the same substitution the frozen-weight probe made by swapping the FAC raster
+    (notes/NAIP_WATER_EVIDENCE_PLAN.md section 11, QUALIFIED GO).
+
+    Deliberately NOT bundle-driven: the production r1e weights were trained on
+    graph_conus_monitoring_water_v2, which carries no ``water_v3`` block, and the
+    retrain that baked the treatment into training was evaluated NO-GO
+    (notes/WATER_V3_EVAL.md). Weights stay frozen; only the input moves. No R pin
+    -- that was part of the rejected by-fiat mechanism.
+
+    A no-op returning ``(fac_dtw, None)`` unless ``--water-flatten-inference``.
+    """
+    if not getattr(args, "water_flatten_inference", False):
+        return fac_dtw, None
+    mask_path = str(args.water_flatten_mask)
+    ramp = bool(args.water_flatten_ramp)
+    factor = water_flatten_factor(qxy[:, 0], qxy[:, 1], mask_path, ramp=ramp)
+    on = factor == 0.0
+    tapered = (factor > 0.0) & (factor < 1.0)
+    touched = (factor < 1.0) & np.isfinite(fac_dtw)
+    prov = {
+        "mode": "ramp" if ramp else "hard",
+        "mask_raster": mask_path,
+        "mask_manifest": str(Path(mask_path).with_name("build_manifest.json")),
+        "ramp_factor": RAMP_FACTOR if ramp else None,
+        "n_points": int(len(factor)),
+        "n_on_mask": int(on.sum()),
+        "n_ramp_neighbors": int(tapered.sum()),
+        "n_fac_touched": int(touched.sum()),
+        "median_fac_pre_flatten_m": (
+            float(np.nanmedian(fac_dtw[on]))
+            if (on & np.isfinite(fac_dtw)).any()
+            else None
+        ),
+        "pins_r": False,
+        "note": "renderer-side inference-time override, frozen weights: "
+        "fac_rem_dtw_m only (query feature + FAC anchor), R untouched",
+    }
+    log.info(
+        "water flatten (%s, %s): %d/%d points on mask, %d ramp neighbours, "
+        "%d FAC values moved (median on-mask FAC pre-flatten %s m)",
+        prov["mode"],
+        Path(mask_path).name,
+        prov["n_on_mask"],
+        prov["n_points"],
+        prov["n_ramp_neighbors"],
+        prov["n_fac_touched"],
+        "n/a"
+        if prov["median_fac_pre_flatten_m"] is None
+        else f"{prov['median_fac_pre_flatten_m']:.2f}",
+    )
+    return fac_dtw * factor, prov
+
+
 def leak_gate(
     basin: str,
     dtw_grid: np.ndarray,
@@ -1215,6 +1316,15 @@ def infer_basin(
             args.deep_exclude_km * 1000.0,
         )
     fac_dtw = sample_fac_rem(qx, qy)
+    # screened-water treatment (bundle-driven): flatten FAC and pin R on the mask
+    # BEFORE the base residual and the gate's FAC anchor are formed, so the
+    # lattice sees exactly what the water pseudo-rows saw in training.
+    v3_cols, fac_dtw, r_wte, _on_water_v3 = water_v3_inference_block(
+        bman, qxy, z_surf, fac_dtw, r_wte, args.dem
+    )
+    # renderer-side flatten (--water-flatten-inference), frozen weights: same
+    # single fac_dtw feeds the query feature and the FAC anchor below.
+    fac_dtw, water_flatten = water_flatten_override(args, qxy, fac_dtw)
     base = z_surf - r_wte
     anchors_all = build_anchors(
         base,
@@ -1255,6 +1365,11 @@ def infer_basin(
         )
         frame["gsw_occ_pct"] = _sample_gsw_occurrence(lon_q, lat_q)
         for c, v in water_query_features(qxy, z_surf, water_xy, args.dem).items():
+            frame[c] = v
+    for c, v in v3_cols.items():
+        frame[c] = v
+    if bman.get("modis_wetness"):
+        for c, v in sample_modis_jja_wetness(qx, qy).items():
             frame[c] = v
     if "drilled_depth_idw_m" in man["query_feature_cols"]:
         # deployment semantics: a lattice cell is not a well, so no drilled-depth
@@ -1466,6 +1581,7 @@ def infer_basin(
                 "peak_gpu_alloc_gb": peak_gb,
                 "source_edges": (src_ctx or {}).get("stats"),
                 "extra_sources_path": args.extra_sources,
+                "water_flatten": water_flatten,
                 "leak_gate": gate_panel,
                 **tags,
             },
@@ -1554,6 +1670,7 @@ def main() -> None:
         help="fail a basin whose map MAD at training wells beats the archived "
         "OOF MAD by more than this fraction",
     )
+    add_water_flatten_args(ap)
     ap.add_argument("--leak-gate-min-wells", type=int, default=20)
     ap.add_argument(
         "--leak-gate-track-m",
