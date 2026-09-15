@@ -11,6 +11,8 @@ rasters under ``/data/ssd2/handily/huc8/{basin}/gnn/{model_name}/``:
   gnn_dtw_100m.tif        z_surf - WTE (unclamped; %% negative logged)
   gnn_sigma_100m.tif      fold-median Laplace scale b (m)
   gnn_gate_w_100m.tif     mean gate weights (bands = manifest gate_experts)
+  gnn_p_dtw_lt_100m.tif   (--ordinal-head arms only) P(DTW < t) per class
+                          threshold, bands described p_dtw_lt_{t}m
   gnn_head_wte_100m.tif   fold-median free-head expert WTE
   gnn_deep_wte_100m.tif   deep prior WTE (crossfit-field interpolation)
   gnn_r_wte_100m.tif      base R WTE (crossfit-field interpolation)
@@ -276,13 +278,15 @@ def build_model(
     writeback: bool = False,
     f_src: int | None = None,
     f_srcedge: int | None = None,
+    n_ordinal: int | None = None,
 ) -> WTEGraphNet:
     """Model in the checkpoint's shape.
 
     The extension args default OFF, so a plain prior-gate arm builds exactly the
     network it always did; they are detected from the checkpoint state dict
-    (``ckpt_extensions`` / ``ckpt_f_src`` / ``ckpt_f_srcedge``) because the
-    inference manifest does not record the MAE head or its width.
+    (``ckpt_extensions`` / ``ckpt_f_src`` / ``ckpt_f_srcedge`` /
+    ``ckpt_n_ordinal``) because the inference manifest does not record the MAE
+    head or its width.
     """
     flags = man["flags"]
     return WTEGraphNet(
@@ -302,7 +306,36 @@ def build_model(
         f_src=f_src,
         f_srcedge=f_srcedge,
         srcedge_gated=bool(flags.get("source_edge_gated")),
+        ordinal=n_ordinal is not None,
+        n_ordinal=int(n_ordinal) if n_ordinal is not None else 3,
     ).to(device)
+
+
+def ordinal_thresholds_m(model_dir: Path, n: int) -> list[float]:
+    """Class thresholds (m) of an --ordinal-head arm, from the inference manifest
+    (``flags.ordinal_thresholds_m``) or the run manifest's
+    ``ordinal_head.thresholds_m``; fail loud on a width mismatch."""
+    man = json.loads((model_dir / "models" / "inference_manifest.json").read_text())
+    thr = man["flags"].get("ordinal_thresholds_m")
+    if thr is None:
+        run = json.loads((model_dir / "gnn_run.json").read_text())
+        thr = (run.get("ordinal_head") or {}).get("thresholds_m")
+    if thr is None or len(thr) != n:
+        raise SystemExit(
+            f"ordinal head has {n} cutpoints but the manifests record thresholds {thr}"
+        )
+    return [float(t) for t in thr]
+
+
+def ckpt_n_ordinal(ck: dict) -> int | None:
+    """Number of ordinal cutpoints from a fold checkpoint's state dict.
+
+    ``ordinal_cut_raw`` is (n_thresholds,) and exists only for --ordinal-head
+    arms; the ordinal head is built LAST in WTEGraphNet so its presence never
+    changes any other module's shape.
+    """
+    sd = ck["state_dict"]
+    return int(sd["ordinal_cut_raw"].shape[0]) if "ordinal_cut_raw" in sd else None
 
 
 def ckpt_extensions(ck: dict) -> tuple[int | None, bool]:
@@ -731,6 +764,11 @@ def forward_fold(
     out["head_wte"] = (
         r_wte + model.last_head_out.cpu().numpy().astype("float64") * y_s + y_c
     )
+    if model.ordinal and model.ordinal_logits is not None:
+        # (N, n_thresholds) P(DTW < t_j), nested by construction (ordered cutpoints)
+        out["ordinal_p"] = (
+            torch.sigmoid(model.ordinal_logits).cpu().numpy().astype("float64")
+        )
     return out
 
 
@@ -867,7 +905,14 @@ def run_folds(
             f"src_ctx {'missing' if src_ctx is None else 'supplied'}"
         )
     model = build_model(
-        man, dims, device, f_mae, writeback, f_src=f_src, f_srcedge=f_srcedge
+        man,
+        dims,
+        device,
+        f_mae,
+        writeback,
+        f_src=f_src,
+        f_srcedge=f_srcedge,
+        n_ordinal=ckpt_n_ordinal(ck0),
     )
     per_fold = []
     for f, ck in sorted(models["folds"].items()):
@@ -911,6 +956,11 @@ def run_folds(
     }
     if "sigma" in per_fold[0]:
         agg["sigma"] = np.median(np.stack([o["sigma"] for o in per_fold]), axis=0)
+    if "ordinal_p" in per_fold[0]:
+        # fold-median per threshold; the median of nested vectors stays nested
+        agg["ordinal_p"] = np.median(
+            np.stack([o["ordinal_p"] for o in per_fold]), axis=0
+        )
     return agg
 
 
@@ -1495,6 +1545,12 @@ def infer_basin(
             if key in ch and key in agg:
                 agg[key][i0:i1] = ch[key]
         agg["w"][i0:i1] = ch["w"]
+        if "ordinal_p" in ch:
+            # (n, n_thresholds) P(DTW < t_j) from an --ordinal-head arm; allocated on
+            # the first chunk because the width is only known from the forward
+            if "ordinal_p" not in agg:
+                agg["ordinal_p"] = np.full((n, ch["ordinal_p"].shape[1]), np.nan)
+            agg["ordinal_p"][i0:i1] = ch["ordinal_p"]
         if i1 < n:
             log.info("%s: %d/%d cells done", basin, i1, n)
     if not np.isfinite(agg["wte"]).all():
@@ -1563,6 +1619,23 @@ def infer_basin(
     )
     with rasterio.open(out_dir / "gnn_gate_w_100m.tif", "r+") as dst:
         dst.update_tags(**tags)
+    if "ordinal_p" in agg:
+        thr = ordinal_thresholds_m(args.model_dir, agg["ordinal_p"].shape[1])
+        pord = np.stack(
+            [
+                scatter(agg["ordinal_p"][:, i], rows, cols, height, width)
+                for i in range(agg["ordinal_p"].shape[1])
+            ]
+        )
+        write_tif(
+            out_dir / "gnn_p_dtw_lt_100m.tif",
+            pord,
+            transform,
+            count=pord.shape[0],
+            descs=[f"p_dtw_lt_{t:g}m" for t in thr],
+        )
+        with rasterio.open(out_dir / "gnn_p_dtw_lt_100m.tif", "r+") as dst:
+            dst.update_tags(**tags)
     (out_dir / "infer_run.json").write_text(
         json.dumps(
             {

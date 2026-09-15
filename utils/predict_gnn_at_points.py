@@ -243,6 +243,22 @@ def oof_check_pt(models: dict, model_dir: Path, device: str, tol_m: float, mae_p
     log.info("OOF round-trip PASSED: max |diff| %.2e m < %g m", worst, tol_m)
 
 
+def ordinal_thresholds_m(model_dir: Path, n: int) -> list[float]:
+    """Class thresholds (m) of an --ordinal-head arm, from the inference manifest
+    (``flags.ordinal_thresholds_m``, written by newer trainers) or the run
+    manifest's ``ordinal_head.thresholds_m``; fail loud on a width mismatch."""
+    man = json.loads((model_dir / "models" / "inference_manifest.json").read_text())
+    thr = man["flags"].get("ordinal_thresholds_m")
+    if thr is None:
+        run = json.loads((model_dir / "gnn_run.json").read_text())
+        thr = (run.get("ordinal_head") or {}).get("thresholds_m")
+    if thr is None or len(thr) != n:
+        raise SystemExit(
+            f"ordinal head has {n} cutpoints but the manifests record thresholds {thr}"
+        )
+    return [float(t) for t in thr]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model-dir", required=True)
@@ -490,6 +506,12 @@ def main() -> None:
     out["fold_spread_m"] = agg["fold_spread"]
     if "sigma" in agg:
         out["sigma_m"] = agg["sigma"]
+    if "ordinal_p" in agg:
+        for t, col in zip(
+            ordinal_thresholds_m(model_dir, agg["ordinal_p"].shape[1]),
+            agg["ordinal_p"].T,
+        ):
+            out[f"p_dtw_lt_{t:g}m"] = col
     experts = ["fac", "deep"] + (["mirror"] if man["flags"]["mirror_anchor"] else [])
     for i, e in enumerate(experts + ["head"]):
         out[f"gate_w_{e}"] = agg["w"][:, i]

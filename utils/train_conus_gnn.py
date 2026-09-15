@@ -2917,6 +2917,10 @@ def main() -> None:
                         "water_pseudo_rows": int(water.sum()),
                         "shore_label_weight": float(args.shore_label_weight),
                         "shore_pseudo_rows": int(shore.sum()),
+                        "ordinal_head": bool(args.ordinal_head),
+                        "ordinal_thresholds_m": (
+                            ord_thresh.tolist() if args.ordinal_head else None
+                        ),
                     },
                     "gate_experts": gate_experts,
                     "fac_anchor_col": fac_base_col if use_fac_anchor else None,
