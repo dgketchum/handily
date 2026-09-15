@@ -90,8 +90,21 @@ def main() -> None:
         if "is_water_pseudo" in qn.columns
         else np.zeros(len(qn), bool)
     )
+    # shoreline ring rows (E6 bundles) are pseudo-labels too: the trainer's source
+    # pool is real & finite (real = ~water & ~swl & ~shore) and it fails loud on an
+    # edge sourced from any pseudo row, so exclude them here as well.
+    shore = (
+        qn["is_shore_pseudo"].to_numpy(bool)
+        if "is_shore_pseudo" in qn.columns
+        else np.zeros(len(qn), bool)
+    )
+    swl = (
+        qn["is_swl_aux"].to_numpy(bool)
+        if "is_swl_aux" in qn.columns
+        else np.zeros(len(qn), bool)
+    )
     resid = qn["wte_residual_m"].to_numpy("float64")
-    eligible = ~water & np.isfinite(resid)
+    eligible = ~water & ~shore & ~swl & np.isfinite(resid)
     xy = qn[["x5070", "y5070"]].to_numpy("float64")
     z = qn["z_surf_well_m"].to_numpy("float64")
     basin = controlling_basin(qn, gdir)
