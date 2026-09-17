@@ -232,6 +232,67 @@ class BlockBoot:
         return float(np.percentile(vals[ok], 2.5)), float(np.percentile(vals[ok], 97.5))
 
 
+SLOPE_WINDOWS = ((0.0, 5.0), (0.0, 10.0), (2.0, 10.0))
+
+
+def _ols_slope(x: np.ndarray, y: np.ndarray) -> float:
+    if x.size < 30:
+        return np.nan
+    xc = x - x.mean()
+    return float(np.dot(xc, y - y.mean()) / np.dot(xc, xc))
+
+
+def slope_rows(
+    boot: BlockBoot,
+    obs: np.ndarray,
+    preds: dict[str, np.ndarray],
+    ref: str,
+    strata: dict[str, np.ndarray],
+) -> list[dict]:
+    """OLS slope of predicted on observed DTW inside observed-depth windows.
+
+    Slope 1 = calibrated range; below 1 = range compression. CI95 bounds the
+    slope (and the paired slope difference vs ``ref``) under the same HUC8
+    block bootstrap as the metric panel. Theil-Sen is the robust companion.
+    """
+    from scipy.stats import theilslopes
+
+    rows = []
+    for stratum, base in strata.items():
+        for lo, hi in SLOPE_WINDOWS:
+            m = base & (obs >= lo) & (obs < hi)
+            if m.sum() < 30:
+                continue
+            for name, p in preds.items():
+                row = {
+                    "stratum": stratum,
+                    "window": f"{lo:g}-{hi:g} m",
+                    "predictor": name,
+                    "n": int(m.sum()),
+                    "ols_slope": _ols_slope(obs[m], p[m]),
+                }
+                row["ols_slope_lo"], row["ols_slope_hi"] = boot.ci(
+                    lambda i, p=p: _ols_slope(obs[i], p[i]), m
+                )
+                row["theilsen_slope"] = float(theilslopes(p[m], obs[m])[0])
+                row["intercept_m"] = float(
+                    p[m].mean() - row["ols_slope"] * obs[m].mean()
+                )
+                if name != ref and ref in preds:
+                    r = preds[ref]
+                    row["delta_slope_vs_ref"] = row["ols_slope"] - _ols_slope(
+                        obs[m], r[m]
+                    )
+                    row["delta_slope_lo"], row["delta_slope_hi"] = boot.ci(
+                        lambda i, p=p, r=r: (
+                            _ols_slope(obs[i], p[i]) - _ols_slope(obs[i], r[i])
+                        ),
+                        m,
+                    )
+                rows.append(row)
+    return rows
+
+
 def delta_rows(
     boot: BlockBoot,
     obs: np.ndarray,
@@ -480,6 +541,11 @@ def main() -> None:
         deltas += delta_rows(boot, obs, p, ma, strata, name, "Ma")
         log(f"  deltas done: {name}")
     pd.DataFrame(deltas).to_csv(out / "deltas.csv", index=False)
+    slope_strata = {k: strata[k] for k in ("all", "water-table classes", "irr500")}
+    pd.DataFrame(slope_rows(boot, obs, all_preds, args.ref, slope_strata)).to_csv(
+        out / "slopes.csv", index=False
+    )
+    log("  slopes done")
 
     sweep, modes = [], []
     for name, p in preds.items():
