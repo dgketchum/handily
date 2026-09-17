@@ -145,6 +145,94 @@ def _native_to_dtw(native: np.ndarray, base: np.ndarray, mode: str) -> np.ndarra
     return base - native if mode in HEAD_SPACE_MODES else base + native
 
 
+LOSS_SPACES = ("std", "dtw", "log_dtw")
+
+
+def loss_transform(x, space: str):
+    """Map a DTW (m) into the point-loss space. ``log_dtw`` is the signed log1p,
+    odd and monotone, so a negative predicted DTW is still pushed back toward
+    its label instead of being clamped. Works on torch tensors and numpy."""
+    if space == "log_dtw":
+        if isinstance(x, torch.Tensor):
+            return torch.sign(x) * torch.log1p(torch.abs(x))
+        return np.sign(x) * np.log1p(np.abs(x))
+    if space in ("std", "dtw"):
+        return x
+    raise ValueError(f"unknown loss space {space!r}")
+
+
+def sigma_to_m(log_b, space: str, y_s: float, dtw_pred=None):
+    """Laplace scale b (loss-space units) -> metres. ``std``: b*y_s (standardized
+    residual target); ``dtw``: b is already metres; ``log_dtw``: delta method
+    b*(1+|dtw|), the local slope of the inverse signed-log1p at the prediction."""
+    b = np.exp(np.asarray(log_b, dtype="float64"))
+    if space == "std":
+        return b * y_s
+    if space == "dtw":
+        return b
+    if space == "log_dtw":
+        if dtw_pred is None:
+            raise ValueError("log_dtw sigma needs the predicted DTW")
+        return b * (1.0 + np.abs(np.asarray(dtw_pred, dtype="float64")))
+    raise ValueError(f"unknown loss space {space!r}")
+
+
+def density_label_weights(
+    obs_dtw: np.ndarray,
+    real: np.ndarray,
+    alpha: float,
+    bandwidth: float,
+    clip_lo: float,
+    clip_hi: float,
+) -> tuple[np.ndarray, dict]:
+    """LDS-style inverse-density label weights on the REAL wells.
+
+    A Gaussian kernel density of log1p(DTW) (``bandwidth`` in log1p units) is
+    evaluated at every real label; w = rho^-alpha, mean-normalised over real rows,
+    clipped to [clip_lo, clip_hi] and re-normalised so the total real label mass
+    is unchanged. Pseudo rows (water/shore/swl) get exactly 1.0 so their own
+    label weights are untouched. Returns (weights, diagnostics)."""
+    t = np.log1p(np.maximum(obs_dtw, 0.0))
+    tr = t[real]
+    grid = np.linspace(float(tr.min()), float(tr.max()), 512)
+    dens = np.zeros(len(grid))
+    for i in range(0, len(tr), 4096):
+        chunk = tr[i : i + 4096]
+        dens += np.exp(-0.5 * ((grid[None, :] - chunk[:, None]) / bandwidth) ** 2).sum(
+            0
+        )
+    dens /= dens.sum() * (grid[1] - grid[0])
+    rho = np.interp(t, grid, dens)
+    wr = rho[real] ** (-alpha)
+    wr /= wr.mean()
+    wr = np.clip(wr, clip_lo, clip_hi)
+    wr /= wr.mean()
+    w = np.ones(len(obs_dtw), dtype="float64")
+    w[real] = wr
+    d = obs_dtw[real]
+    info = {
+        "alpha": alpha,
+        "bandwidth_log1p": bandwidth,
+        "clip": [clip_lo, clip_hi],
+        "n_real": int(real.sum()),
+        "w_min": float(wr.min()),
+        "w_max": float(wr.max()),
+        "w_median_by_band": {
+            lab: float(np.median(wr[(d >= lo) & (d < hi)]))
+            if ((d >= lo) & (d < hi)).any()
+            else None
+            for lab, lo, hi in (
+                ("0-2", 0, 2),
+                ("2-5", 2, 5),
+                ("5-10", 5, 10),
+                ("10-30", 10, 30),
+                ("30+", 30, np.inf),
+            )
+        },
+    }
+    return w.astype("float32"), info
+
+
 def _fac_feat(
     fac_raw,
     fac_present,
@@ -321,6 +409,39 @@ def train_fold(
             sample_w_t = torch.ones(len(sv), dtype=torch.float32, device=device)
     weighted = sample_w_t is not None
     pair_delta = _huber_delta_std(args, mode, y_s)
+    # Range-compression levers (notes/RANGE_COMPRESSION_PLAN.md): the point loss
+    # can be taken in native DTW metres or signed-log1p DTW instead of the
+    # standardized residual, and rows that are shallow-labelled but predicted too
+    # deep can carry an extra multiplier. Flag-off keeps the legacy arithmetic.
+    loss_space = getattr(args, "loss_space", "std")
+    asym_k = float(getattr(args, "asym_deep_weight", 1.0))
+    asym_t = float(getattr(args, "asym_shallow_thresh_m", 0.0))
+    native_loss = loss_space != "std" or asym_k != 1.0
+    if native_loss:
+        base_t = torch.as_tensor(base, dtype=torch.float32, device=device)
+        obs_t = torch.as_tensor(obs_dtw, dtype=torch.float32, device=device)
+        obs_loss_t = loss_transform(obs_t, loss_space)
+
+    def _pred_dtw_t(out_std):
+        nat = out_std * y_s + y_c
+        return base_t - nat if mode in HEAD_SPACE_MODES else base_t + nat
+
+    def _point_err(out_std):
+        """Signed per-row error in the loss space over ALL rows."""
+        if loss_space == "std":
+            return out_std - y_std
+        return loss_transform(_pred_dtw_t(out_std), loss_space) - obs_loss_t
+
+    def _asym_mult(out_std):
+        """Row multiplier on the error term: asym_k where the label is shallower
+        than the threshold AND the prediction is too deep (mask detached)."""
+        if asym_k == 1.0:
+            return None
+        too_deep = (obs_t < asym_t) & (_pred_dtw_t(out_std).detach() > obs_t)
+        return torch.where(
+            too_deep, torch.full_like(obs_t, asym_k), torch.ones_like(obs_t)
+        )
+
     huber = nn.HuberLoss(
         delta=pair_delta,
         reduction="none" if weighted else "mean",
@@ -355,7 +476,14 @@ def train_fold(
             # spends variance-budget on wells it cannot fit (deep-regional), which
             # implicitly downweights them -- and the OOF b is the selective-call score.
             lb = model.sigma_log_b[tr_t]
-            nll = torch.abs(out[tr_t] - y_std[tr_t]) * torch.exp(-lb) + lb
+            if native_loss:
+                ae = torch.abs(_point_err(out)[tr_t])
+                mult = _asym_mult(out)
+                if mult is not None:
+                    ae = ae * mult[tr_t]
+                nll = ae * torch.exp(-lb) + lb
+            else:
+                nll = torch.abs(out[tr_t] - y_std[tr_t]) * torch.exp(-lb) + lb
             loss = (nll * w_tr).sum() / w_tr.sum() if weighted else nll.mean()
             pred_point = out
         elif getattr(args, "two_surface", False):
@@ -394,6 +522,16 @@ def train_fold(
                 )
                 row = row + args.assign_weight * (2.0 * a - 1.0).abs() * bce
             loss = (row * w_tr).sum() / w_tr.sum() if weighted else row.mean()
+            pred_point = out
+        elif native_loss:
+            err = _point_err(out)[tr_t]
+            hl = nn.functional.huber_loss(
+                err, torch.zeros_like(err), delta=pair_delta, reduction="none"
+            )
+            mult = _asym_mult(out)
+            if mult is not None:
+                hl = hl * mult[tr_t]
+            loss = (hl * w_tr).sum() / w_tr.sum() if weighted else hl.mean()
             pred_point = out
         else:
             hl = huber(out[tr_t], y_std[tr_t])
@@ -709,6 +847,52 @@ def main() -> None:
         "the OOF lam column is a shallow terrain-coupled-zone map. Head-space "
         "targets only; exclusive with --fac-skip/--fac-gate/--pinball",
     )
+    # range-compression levers (notes/RANGE_COMPRESSION_PLAN.md) -----------------
+    p.add_argument(
+        "--loss-space",
+        choices=LOSS_SPACES,
+        default="std",
+        help="space of the POINT loss residual: std = standardized native target "
+        "(legacy); dtw = native DTW metres (pred_dtw = base -/+ native); log_dtw = "
+        "signed log1p(DTW), which weights relative rather than absolute error and "
+        "so stretches the 0-10 m band in loss space. The sigma head's scale then "
+        "lives in that space and is converted to metres for OOF/inference "
+        "(delta method for log_dtw). Not with --pinball / --two-surface",
+    )
+    p.add_argument(
+        "--density-weight-alpha",
+        type=float,
+        default=0.0,
+        help="LDS-style inverse-density label weighting on real wells: w = rho^-alpha "
+        "with rho a Gaussian-kernel density of log1p(obs DTW); mean-normalised, "
+        "clipped (--density-clip), multiplied into the existing weight vector; "
+        "pseudo rows keep their own weights. 0 = off",
+    )
+    p.add_argument(
+        "--density-bandwidth",
+        type=float,
+        default=0.25,
+        help="kernel bandwidth of the label density, in log1p(DTW) units",
+    )
+    p.add_argument(
+        "--density-clip",
+        default="0.1,10",
+        help="lo,hi clip on the density weight before re-normalisation",
+    )
+    p.add_argument(
+        "--asym-shallow-thresh-m",
+        type=float,
+        default=0.0,
+        help="asymmetric shallow penalty: rows with obs DTW below this AND a "
+        "too-deep prediction have their point-loss error term multiplied by "
+        "--asym-deep-weight (mask detached, recomputed each epoch). 0 = off",
+    )
+    p.add_argument(
+        "--asym-deep-weight",
+        type=float,
+        default=1.0,
+        help="multiplier for --asym-shallow-thresh-m (1 = off)",
+    )
     p.add_argument(
         "--sigma-head",
         action="store_true",
@@ -1002,6 +1186,16 @@ def main() -> None:
         action="store_false",
     )
     args = p.parse_args()
+    if (args.asym_deep_weight != 1.0) != (args.asym_shallow_thresh_m > 0.0):
+        raise SystemExit(
+            "--asym-shallow-thresh-m and --asym-deep-weight must be set together"
+        )
+    if (args.loss_space != "std" or args.asym_deep_weight != 1.0) and (
+        args.pinball or args.two_surface
+    ):
+        raise SystemExit(
+            "--loss-space / --asym-* are not implemented for --pinball or --two-surface"
+        )
 
     gdir = Path(args.graph_dir)
     out_dir = Path(args.out_dir)
@@ -2171,6 +2365,35 @@ def main() -> None:
             args.shore_label_weight,
         )
 
+    density_info = None
+    if args.density_weight_alpha > 0.0:
+        clip_lo, clip_hi = (float(v) for v in args.density_clip.split(","))
+        dw, density_info = density_label_weights(
+            obs_dtw,
+            real,
+            args.density_weight_alpha,
+            args.density_bandwidth,
+            clip_lo,
+            clip_hi,
+        )
+        w_np = (
+            sample_w_t.detach().cpu().numpy().astype("float64")
+            if sample_w_t is not None
+            else np.ones(len(qn), "float64")
+        )
+        sample_w_t = torch.as_tensor(
+            (w_np * dw).astype("float32"), dtype=torch.float32, device=device
+        )
+        log.info(
+            "inverse-density label weights (alpha=%.2f, bw=%.2f log1p): real rows "
+            "w in [%.2f, %.2f], median by band %s",
+            args.density_weight_alpha,
+            args.density_bandwidth,
+            density_info["w_min"],
+            density_info["w_max"],
+            density_info["w_median_by_band"],
+        )
+
     f_ch, f_lat = ch_ea.shape[1], lat_ea.shape[1]
     f_ms = ms_ea.shape[1] if use_ms else None  # width incl. missingness flags
     f_pf = pf_ea.shape[1] if use_pf else None  # portfolio edge-attr width (6B)
@@ -2741,8 +2964,11 @@ def main() -> None:
             lambda_oof[test] = model.last_fac_lambda.cpu().numpy().reshape(-1)[test]
         if args.sigma_head and model.sigma_log_b is not None:
             # Laplace scale b in METERS (de-standardized by this fold's y_s).
-            sigma_oof[test] = (
-                np.exp(model.sigma_log_b.detach().cpu().numpy().reshape(-1)[test]) * y_s
+            sigma_oof[test] = sigma_to_m(
+                model.sigma_log_b.detach().cpu().numpy().reshape(-1)[test],
+                args.loss_space,
+                y_s,
+                _native_to_dtw(native, base, target_mode)[test],
             )
         if args.ordinal_head and model.ordinal_logits is not None:
             # nested shallow-class probabilities from the final full-batch forward.
@@ -2817,6 +3043,7 @@ def main() -> None:
                     },
                     "y_c": y_c,
                     "y_s": y_s,
+                    "loss_space": args.loss_space,
                     "q_stats": q_stats,
                     "fac_stats": {"pc": pc, "ps": ps},
                     "deep_stats": {"dc": dc, "ds": ds},
@@ -2891,6 +3118,7 @@ def main() -> None:
                         "mirror_depth_m": float(args.mirror_depth_m),
                         "hang_anchor": bool(args.hang_anchor),
                         "sigma_head": bool(args.sigma_head),
+                        "loss_space": args.loss_space,
                         "fac_skip": bool(fac_skip),
                         "fac_gate": bool(fac_gate),
                         "fac_lambda": bool(fac_lambda),
@@ -3214,6 +3442,18 @@ def main() -> None:
         "device": device,
         "torch": torch.__version__,
         "hyperparams": vars(args),
+        "range_compression_levers": {
+            "loss_space": args.loss_space,
+            "density_weighting": density_info,
+            "asym_shallow": (
+                {
+                    "thresh_m": args.asym_shallow_thresh_m,
+                    "deep_weight": args.asym_deep_weight,
+                }
+                if args.asym_deep_weight != 1.0
+                else None
+            ),
+        },
         "effective_hidden": int(hidden),
         "feature_dims": {
             "reach": int(reach_x.shape[1]),
