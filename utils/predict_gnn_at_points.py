@@ -292,6 +292,15 @@ def main() -> None:
         "kNN source pool; wte_residual_m must be in the bundle frame "
         "((z_surf - dtw) - r_wte). Controlling-reach basin is attached here.",
     )
+    ap.add_argument(
+        "--exclude-source-name",
+        action="append",
+        default=[],
+        help="drop bundle wells whose `source` column matches (repeatable) from "
+        "the R/deep crossfit-field interpolation pool and, on --source-edges arms, "
+        "from the deployment source pool: the trained-on-but-not-read-at-inference "
+        "arms of the NDWR labels-vs-sources experiment",
+    )
     add_water_flatten_args(ap)
     ap.add_argument("--dem", default=DEM)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -346,6 +355,14 @@ def main() -> None:
 
     # R + deep prior: crossfit-field interpolation (leak-free deployment path)
     qn = well_pool(pd.read_parquet(gdir / "query_nodes.parquet"))
+    if args.exclude_source_name:
+        drop = qn["source"].isin(args.exclude_source_name).to_numpy(bool)
+        log.info(
+            "R/deep interpolation pool: excluding %d bundle wells with source in %s",
+            int(drop.sum()),
+            args.exclude_source_name,
+        )
+        qn = qn[~drop].reset_index(drop=True)
     wells_xy = qn[["x5070", "y5070"]].to_numpy("float64")
     wells_z = qn[man["surface_elev_col"]].to_numpy("float64")
     vw = float(bman["r_relief_vw"])
@@ -484,6 +501,7 @@ def main() -> None:
             args.device,
             exclude_m=float(args.source_exclude_m),
             extra=extra,
+            exclude_sources=tuple(args.exclude_source_name),
         )
     agg = run_folds(
         models,

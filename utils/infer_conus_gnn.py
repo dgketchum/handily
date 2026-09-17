@@ -118,7 +118,7 @@ from build_source_edges import EDGE_COLS as SOURCE_EDGE_COLS  # noqa: E402
 from build_water_mask_v3 import RAMP_FACTOR, water_flatten_factor  # noqa: E402
 from build_stacker_features import sample_coarse  # noqa: E402
 from fac_rem_registry import sample_fac_rem  # noqa: E402
-from train_conus_gnn import _fac_feat, prune_reach_graph  # noqa: E402
+from train_conus_gnn import _fac_feat, prune_reach_graph, sigma_to_m  # noqa: E402
 from train_wte_gnn import WTEGraphNet, apply_stats, fit_stats  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -511,6 +511,7 @@ def deployment_source_ctx(
     device: str,
     exclude_m: float = 0.0,
     extra: pd.DataFrame | None = None,
+    exclude_sources: tuple[str, ...] = (),
 ) -> dict:
     """Deployment source context for query points OUTSIDE the bundle.
 
@@ -535,6 +536,10 @@ def deployment_source_ctx(
     and basin is the controlling-reach FAC basin label (NaN -> never
     same_basin). Extra sources join the kNN pool on equal footing.
 
+    ``exclude_sources`` drops bundle wells whose ``source`` column is in the
+    tuple from the deployment pool (labels-only arms: wells that trained the
+    model but must not be read as observations at inference).
+
     ``lat`` must be the PRE-prune lateral attachment: prune_for_queries remaps
     reach_node_idx to the pruned numbering, but the basin lookup is keyed on
     ``rn_full``'s original ids.
@@ -554,6 +559,14 @@ def deployment_source_ctx(
     )
     resid_all = qn["wte_residual_m"].to_numpy("float64")
     elig = ~water & np.isfinite(resid_all)
+    if exclude_sources:
+        drop = qn["source"].isin(list(exclude_sources)).to_numpy(bool)
+        log.info(
+            "deployment sources: excluding %d bundle wells with source in %s",
+            int((elig & drop).sum()),
+            list(exclude_sources),
+        )
+        elig &= ~drop
     w = qn[elig].reset_index(drop=True)
     wxy = w[["x5070", "y5070"]].to_numpy("float64")
     wz = np.nan_to_num(w["z_surf_well_m"].to_numpy("float64"), nan=0.0)
@@ -748,9 +761,17 @@ def fold_tensors(ck: dict, frame: pd.DataFrame, anchors: dict, device: str) -> d
 
 
 def forward_fold(
-    model: WTEGraphNet, ck: dict, graph: dict, feat: dict, r_wte: np.ndarray
+    model: WTEGraphNet,
+    ck: dict,
+    graph: dict,
+    feat: dict,
+    r_wte: np.ndarray,
+    z_surf: np.ndarray | None = None,
 ) -> dict:
-    """One fold's eval forward -> physical (meters) surfaces + gate weights."""
+    """One fold's eval forward -> physical (meters) surfaces + gate weights.
+
+    ``z_surf`` is needed only for checkpoints trained with ``--loss-space
+    log_dtw`` (sigma to metres by the delta method at the predicted DTW)."""
     y_c, y_s = float(ck["y_c"]), float(ck["y_s"])
     model.load_state_dict(ck["state_dict"])
     model.eval()
@@ -759,7 +780,15 @@ def forward_fold(
     wte = r_wte + native * y_s + y_c
     out = {"wte": wte, "native": native}
     if model.sigma_log_b is not None:
-        out["sigma"] = np.exp(model.sigma_log_b.cpu().numpy().reshape(-1)) * y_s
+        space = ck.get("loss_space", "std")
+        if space == "log_dtw" and z_surf is None:
+            raise SystemExit("log_dtw checkpoint: forward_fold needs z_surf for sigma")
+        out["sigma"] = sigma_to_m(
+            model.sigma_log_b.cpu().numpy().reshape(-1),
+            space,
+            y_s,
+            None if z_surf is None else z_surf - wte,
+        )
     out["w"] = model.last_prior_gate.cpu().numpy().astype("float64")
     out["head_wte"] = (
         r_wte + model.last_head_out.cpu().numpy().astype("float64") * y_s + y_c
@@ -895,6 +924,12 @@ def run_folds(
     man = models["manifest"]
     dims = dict(man["feature_dims"])
     ck0 = next(iter(models["folds"].values()))
+    z_surf = None
+    if ck0.get("loss_space", "std") == "log_dtw":
+        # the mirror anchor is (z_surf - d) - R, so z_surf is exact from it
+        if "mirror_raw" not in anchors:
+            raise SystemExit("log_dtw checkpoint without a mirror anchor: no z_surf")
+        z_surf = r_wte + anchors["mirror_raw"] + float(man["flags"]["mirror_depth_m"])
     f_src = ckpt_f_src(ck0, dims["query"])
     f_srcedge = ckpt_f_srcedge(ck0)
     need_src = f_src is not None or f_srcedge is not None
@@ -939,7 +974,7 @@ def run_folds(
                 feat["srcedge_ei"] = ed["ei"][:, keep]
                 feat["srcedge_ea"] = ed["ea"][keep]
                 feat["srcedge_val"] = val
-        out = forward_fold(model, ck, graph, feat, r_wte)
+        out = forward_fold(model, ck, graph, feat, r_wte, z_surf=z_surf)
         assert_mixture_identity(out, r_wte, anchors, f, where)
         per_fold.append(out)
         del feat
@@ -1486,6 +1521,7 @@ def infer_basin(
             device,
             exclude_m=float(args.source_exclude_m),
             extra=extra_sources,
+            exclude_sources=tuple(args.exclude_source_name),
         )
         src_dst = src_ctx["edges"]["ei"][1]
 
@@ -1654,6 +1690,7 @@ def infer_basin(
                 "peak_gpu_alloc_gb": peak_gb,
                 "source_edges": (src_ctx or {}).get("stats"),
                 "extra_sources_path": args.extra_sources,
+                "exclude_source_name": list(args.exclude_source_name),
                 "water_flatten": water_flatten,
                 "leak_gate": gate_panel,
                 **tags,
@@ -1707,6 +1744,17 @@ def main() -> None:
         "(x5070/y5070/wte_residual_m/z_surf_m) joining the bundle wells in the "
         "kNN source pool; wte_residual_m must be in the bundle frame "
         "((z_surf - dtw) - r_wte). Controlling-reach basin is attached here.",
+    )
+    ap.add_argument(
+        "--exclude-source-name",
+        action="append",
+        default=[],
+        help="drop bundle wells whose `source` column matches (repeatable) from "
+        "the lattice R/deep crossfit-field interpolation pool and, on "
+        "--source-edges arms, from the deployment kNN source pool. Required on "
+        "bundles with appended labelled wells (append_labelled_wells.py) so the "
+        "render reads the same pools as the base bundle; the appended rows "
+        "then act as sources only through --extra-sources.",
     )
     ap.add_argument("--save-lattice", action="store_true")
     ap.add_argument(
@@ -1795,6 +1843,14 @@ def main() -> None:
     gdir = Path(man["graph_dir"])
     bman = json.loads((gdir / "graph_manifest.json").read_text())
     qn = well_pool(pd.read_parquet(gdir / "query_nodes.parquet"))
+    if args.exclude_source_name:
+        drop = qn["source"].isin(args.exclude_source_name).to_numpy(bool)
+        log.info(
+            "R/deep interpolation pool: excluding %d bundle wells with source in %s",
+            int(drop.sum()),
+            args.exclude_source_name,
+        )
+        qn = qn[~drop].reset_index(drop=True)
     oof = well_pool(pd.read_parquet(args.model_dir / "gnn_oof_predictions.parquet"))
     water_xy = None
     if man["flags"].get("water_features"):
