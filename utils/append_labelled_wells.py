@@ -199,15 +199,30 @@ def main() -> None:
     cz = np.r_[mz, az]
     cwte = np.r_[mwte, a_wte]
     cfold = np.r_[mfold, afold]
-    pool = np.r_[np.ones(n_mon, bool), np.zeros(n_aux, bool)]
+    # Chained appends: rows an earlier append added are real labelled rows but
+    # were NOT in the pool that produced the archived R (pool = the original
+    # monitoring wells), so they stay out of the pool here too or parity fails.
+    prev_sources = list(man.get("appended_sources", []))
+    if not prev_sources and man.get("appended_wells"):
+        prev_sources = [man["appended_wells"]["source_name"]]
+    pool_mon = ~mon["source"].astype(str).isin(prev_sources).to_numpy(bool)
+    if prev_sources:
+        print(
+            f"R pool excludes earlier appended sources {prev_sources}: "
+            f"{int((~pool_mon).sum()):,} of {n_mon:,} real rows"
+        )
+    pool = np.r_[pool_mon, np.zeros(n_aux, bool)]
     r_all = B.crossfit_idw(cxy, cwte, cfold, idw_k, idw_p, z=cz, vw=vw, pool=pool)
     r_mon, r_aux = r_all[:n_mon], r_all[n_mon:]
     dr = np.abs(r_mon - mon["regional_wte_idw_oof_m"].to_numpy("float64"))
     print(f"R parity (base real): max|dR|={np.nanmax(dr):.6g} m")
     if np.nanmax(dr) > 1e-3:
         raise SystemExit(f"R parity FAILED: max|dR|={np.nanmax(dr):.4g} m")
-    deep_mask = B.deep_well_mask(
-        mon[["mean_dtw", "huc8"]].assign(huc8=mon["huc8"].astype(str)),
+    deep_mask = np.zeros(n_mon, bool)
+    deep_mask[pool_mon] = B.deep_well_mask(
+        mon.loc[pool_mon, ["mean_dtw", "huc8"]].assign(
+            huc8=mon.loc[pool_mon, "huc8"].astype(str)
+        ),
         dd["quantile"],
         dd["unit"],
         dd["min_per_unit"],
@@ -381,6 +396,7 @@ def main() -> None:
     man2["well_class_filter"] = list(man.get("well_class_filter", [])) + [
         args.well_class
     ]
+    man2["appended_sources"] = prev_sources + [args.source_name]
     man2["appended_wells"] = {
         "base_bundle": str(bundle),
         "wells": args.wells,
@@ -394,8 +410,8 @@ def main() -> None:
             int(k): int(v)
             for k, v in out["cv_fold"].value_counts().sort_index().items()
         },
-        "r_contract": "crossfit relief-IDW on [base real U new], pool=base real; "
-        "base R parity <= 1e-3 m",
+        "r_contract": "crossfit relief-IDW on [base real U new], pool=base real "
+        "minus earlier appended sources; base R parity <= 1e-3 m",
     }
     (out_dir / "graph_manifest.json").write_text(json.dumps(man2, indent=1))
 
