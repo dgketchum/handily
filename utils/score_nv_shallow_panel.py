@@ -89,9 +89,15 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 # inputs
 # ---------------------------------------------------------------------------
-def load_targets(path: str) -> pd.DataFrame:
+def load_targets(path: str, target_filter: str) -> pd.DataFrame:
+    """Targets file rows selected by a pandas ``query`` expression. The default
+    (``is_admission_eligible``) is the primary held-out panel; any other
+    expression over the file's flag columns scores a secondary stratum, e.g.
+    ``"not use_ok and class_ok and era_ok and basin_ok and relief_ok"``."""
     t = pd.read_parquet(path)
-    t = t[t["is_admission_eligible"].to_numpy(bool)].reset_index(drop=True)
+    n0 = len(t)
+    t = t.query(target_filter, engine="python").reset_index(drop=True)
+    log(f"target filter `{target_filter}`: {len(t):,} of {n0:,} sites")
     for c in ("obs_dtw_m", "ma_dtw_m"):
         if c not in t.columns:
             raise SystemExit(f"targets file lacks {c}")
@@ -137,8 +143,16 @@ def join_arm(t: pd.DataFrame, path: str, name: str) -> pd.DataFrame:
     return m.drop(columns=["x5070", "y5070"]).add_prefix(f"{name}__")
 
 
-def confinement_class(t: pd.DataFrame) -> np.ndarray:
-    g = gpd.read_file(WELLS_FGB, columns=["confinement_class"])
+def confinement_class(t: pd.DataFrame, wells_fgb: str | None) -> np.ndarray:
+    """Per-site confinement class: the targets' own column when the admission
+    builder carried one (NM OSE), else the nearest attributed well (NV)."""
+    if wells_fgb is None:
+        if "confinement_class" not in t.columns:
+            raise SystemExit(
+                "targets carry no confinement_class and no --wells-fgb given"
+            )
+        return t["confinement_class"].astype(object).to_numpy()
+    g = gpd.read_file(wells_fgb, columns=["confinement_class"])
     tree = cKDTree(np.c_[g.geometry.x.to_numpy(), g.geometry.y.to_numpy()])
     d, i = tree.query(t[["x5070", "y5070"]].to_numpy("float64"), k=1)
     cls = g["confinement_class"].to_numpy(object)[i]
@@ -441,16 +455,30 @@ def main() -> None:
     )
     ap.add_argument("--ref", required=True, help="arm NAME used as the reference")
     ap.add_argument("--targets", default=TARGETS)
+    ap.add_argument(
+        "--target-filter",
+        default="is_admission_eligible",
+        help="pandas query over the targets file selecting the sites to score "
+        "(default = the primary held-out panel)",
+    )
     ap.add_argument("--sources", default=SOURCES)
+    ap.add_argument(
+        "--wells-fgb",
+        default=WELLS_FGB,
+        help="attributed well file for the confinement class; 'none' = use the "
+        "targets' own confinement_class column",
+    )
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--n-boot", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    if args.wells_fgb.lower() == "none":
+        args.wells_fgb = None
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    t = load_targets(args.targets)
-    log(f"primary sites: {len(t)}")
+    t = load_targets(args.targets, args.target_filter)
+    log(f"sites scored: {len(t)}")
     arms = dict(a.split("=", 1) for a in args.arm)
     if args.ref not in arms:
         raise SystemExit(f"--ref {args.ref} is not an --arm")
@@ -463,7 +491,7 @@ def main() -> None:
         t[["x5070", "y5070"]].to_numpy("float64")
     )
     t["dist_source_km"] = d_src / 1000.0
-    t["confinement_class"] = confinement_class(t)
+    t["confinement_class"] = confinement_class(t, args.wells_fgb)
     t["dist_irr_m"] = dist_to_irrigation_m(t)
     log(
         "  confinement: "
