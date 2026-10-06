@@ -456,6 +456,7 @@ def dd_dup_features(
     z_surf: np.ndarray,
     self_exclude_m: float = 0.0,
     boundaries: pd.DataFrame | None = None,
+    dd_dist_floor_m: float = 1.0,
 ) -> dict[str, np.ndarray]:
     """drilled-depth + Dupuit-hang query features (dd/dup arms), shared recipe.
 
@@ -476,6 +477,7 @@ def dd_dup_features(
             int(dd["k"]),
             float(dd["power"]),
             self_exclude_m=float(self_exclude_m),
+            dist_floor_m=float(dd_dist_floor_m),
         )
     )
     dh = bman["dupuit_hang"]
@@ -607,21 +609,55 @@ def deployment_source_ctx(
         pd.Series(np.arange(len(qxy), dtype="int64")).map(pctrl).map(basin_of_reach)
     )
 
-    pad = 8 if exclude_m > 0 else 0
-    kq = min(k + pad, len(resid))
+    n_pool = len(resid)
     tree = cKDTree(_relief_coords(wxy, wz, vw))
-    rd, loc = tree.query(_relief_coords(qxy, z_surf, vw), k=kq, workers=-1)
+    q_co = _relief_coords(qxy, z_surf, vw)
+    kq = min(k + (8 if exclude_m > 0 else 0), n_pool)
+    rd, loc = tree.query(q_co, k=kq, workers=-1)
     if kq == 1:
         rd, loc = rd[:, None], loc[:, None]
     dest = np.repeat(np.arange(len(qxy), dtype="int64"), kq)
     src = loc.ravel().astype("int64")
+    rdist = rd.ravel()
+    if exclude_m > 0:
+        # A fixed candidate pad under-fills dense well clusters: with a wide disk
+        # most of the k+8 nearest wells sit inside it and the cell is left with
+        # fewer than k (or zero) edges, a density-dependent read the trainer never
+        # saw. Re-query the deficient cells with a doubled candidate count until k
+        # wells survive outside the disk or the pool is exhausted ("k nearest of
+        # the allowed pool", as idw_exclude_at_points does for R).
+        geo_m = np.sqrt(((qxy[dest] - wxy[src]) ** 2).sum(axis=1))
+        surv = np.bincount(dest[geo_m >= exclude_m], minlength=len(qxy))
+        deficient = np.flatnonzero((surv < k) & (kq < n_pool))
+        n_pass = 0
+        while len(deficient):
+            kq = min(kq * 2, n_pool)
+            n_pass += 1
+            rd2, loc2 = tree.query(q_co[deficient], k=kq, workers=-1)
+            keep = ~np.isin(dest, deficient)
+            d2 = np.repeat(deficient.astype("int64"), kq)
+            dest = np.concatenate([dest[keep], d2])
+            src = np.concatenate([src[keep], loc2.ravel().astype("int64")])
+            rdist = np.concatenate([rdist[keep], rd2.ravel()])
+            geo_m = np.sqrt(((qxy[d2] - wxy[loc2.ravel()]) ** 2).sum(axis=1))
+            surv = np.bincount(d2[geo_m >= exclude_m], minlength=len(qxy))[deficient]
+            deficient = deficient[(surv < k) & (kq < n_pool)]
+        if n_pass:
+            log.info(
+                "source edges: exclusion disk %.0f m needed %d re-query pass(es) "
+                "(candidate count up to %d) to fill k=%d survivors per cell",
+                exclude_m,
+                n_pass,
+                kq,
+                k,
+            )
     geo_km = np.sqrt(((qxy[dest] - wxy[src]) ** 2).sum(axis=1)) / 1000.0
     ed = pd.DataFrame(
         {
             "dest": dest,
             "src": src,
             "log1p_geo_dist_km": np.log1p(geo_km),
-            "log1p_relief_dist_km": np.log1p(rd.ravel() / 1000.0),
+            "log1p_relief_dist_km": np.log1p(rdist / 1000.0),
             "rel_elev_m": z_surf[dest] - wz[src],
             "same_basin": (
                 dest_basin.iloc[dest].notna().to_numpy()
@@ -631,6 +667,10 @@ def deployment_source_ctx(
     )
     if exclude_m > 0:
         ed = ed[geo_km * 1000.0 >= exclude_m]
+    # candidates arrive dest-grouped in ascending metric distance; the re-query
+    # appends deficient cells out of order, so restore (dest, distance) before the
+    # per-dest rank cut
+    ed = ed.sort_values(["dest", "log1p_relief_dist_km"], kind="stable")
     ed = ed[ed.groupby("dest").cumcount() < k].reset_index(drop=True)
     deg = ed.groupby("dest").size()
     stats_panel = {
@@ -1460,7 +1500,12 @@ def infer_basin(
         # deployment semantics: a lattice cell is not a well, so no drilled-depth
         # self/nest exclusion (build_conus_graph_inputs.sample_drilled_depth).
         for c, v in dd_dup_features(
-            bman, Path(man["graph_dir"]), qxy, z_surf, boundaries=boundaries
+            bman,
+            Path(man["graph_dir"]),
+            qxy,
+            z_surf,
+            boundaries=boundaries,
+            dd_dist_floor_m=args.dd_dist_floor_m,
         ).items():
             frame[c] = v
     missing = [c for c in man["query_feature_cols"] if c not in frame.columns]
@@ -1689,6 +1734,7 @@ def infer_basin(
                 "query_chunk": int(chunk),
                 "peak_gpu_alloc_gb": peak_gb,
                 "source_edges": (src_ctx or {}).get("stats"),
+                "dd_dist_floor_m": float(args.dd_dist_floor_m),
                 "extra_sources_path": args.extra_sources,
                 "exclude_source_name": list(args.exclude_source_name),
                 "water_flatten": water_flatten,
@@ -1761,6 +1807,21 @@ def main() -> None:
         "--overwrite", action="store_true", help="re-run basins with existing output"
     )
     ap.add_argument(
+        "--dd-dist-floor-m",
+        type=float,
+        default=1.0,
+        help="(dd arms) distance floor in the drilled-depth IDW weight, m; 1 = the "
+        "training construction (nearest record dominates -> well-centred spots in "
+        "the feature field), ~1000 = render-time flattening of those spots",
+    )
+    ap.add_argument(
+        "--out-name",
+        default=None,
+        help="render directory name under <huc8>/<basin>/gnn/ (default: the model "
+        "dir name); use for inference-time variants of one model, e.g. a "
+        "--source-exclude-m sweep, so they do not overwrite the arm's render",
+    )
+    ap.add_argument(
         "--r-source",
         choices=("crossfit", "obs-exclude"),
         default="crossfit",
@@ -1803,7 +1864,7 @@ def main() -> None:
     )
     args = ap.parse_args()
     args.model_dir = Path(args.model_dir)
-    args.model_name = args.model_dir.name
+    args.model_name = args.out_name or args.model_dir.name
     models = load_models(args.model_dir)
     man = models["manifest"]
     f_mae, writeback = ckpt_extensions(models["folds"][0])

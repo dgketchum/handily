@@ -665,8 +665,15 @@ def sample_drilled_depth(
     power: float,
     query_ids: np.ndarray | None = None,
     self_exclude_m: float = 0.0,
+    dist_floor_m: float = 1.0,
 ) -> dict[str, np.ndarray]:
     """Drilled-depth field: kNN IDW-mean + p90 of neighbor CONSTRUCTION depths.
+
+    ``dist_floor_m`` floors the distance in the inverse-distance weight
+    (``1 / max(d, floor)**power``). The training construction is 1 m, which lets
+    the nearest record dominate within a few hundred metres and makes the field
+    a set of well-centred spots; a render-time floor of ~1 km flattens the spots
+    into a local average without changing the pool, k or power.
 
     The pool is the GWX unconfined drilled-depth product
     (``build_drilled_depth_points.py``). Depth is construction metadata, not an
@@ -696,7 +703,7 @@ def sample_drilled_depth(
         dist, idx = tree.query(query_xy, k=kk)
         if kk == 1:
             dist, idx = dist[:, None], idx[:, None]
-        w = 1.0 / np.maximum(dist, 1.0) ** power
+        w = 1.0 / np.maximum(dist, dist_floor_m) ** power
         return {
             "drilled_depth_idw_m": (w * pval[idx]).sum(1) / w.sum(1),
             "drilled_depth_p90_m": np.percentile(pval[idx], 90.0, axis=1),
@@ -720,7 +727,7 @@ def sample_drilled_depth(
             "sample_drilled_depth: a query lost ALL candidates to self-exclusion "
             "-- pool too sparse near a well; investigate (do not patch)"
         )
-    w = np.where(kept, 1.0 / np.maximum(dist_k, 1.0) ** power, 0.0)
+    w = np.where(kept, 1.0 / np.maximum(dist_k, dist_floor_m) ** power, 0.0)
     idw = (w * np.where(kept, val_k, 0.0)).sum(1) / w.sum(1)
     p90 = np.nanpercentile(np.where(kept, val_k, np.nan), 90.0, axis=1)
     return {"drilled_depth_idw_m": idw, "drilled_depth_p90_m": p90}
