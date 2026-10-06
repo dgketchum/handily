@@ -2,6 +2,11 @@
 72-basin Nevada HUC8 footprint (``notes/nv_validation_plan.md`` section 3,
 protocol and metric definitions from ``notes/NV_STATEWIDE_RASTER_EVAL.md``).
 
+State-generic: ``--targets`` / ``--sources`` / ``--block-col`` / ``--label``
+point it at another state's admission split (NM: ``ose_*`` files and
+``pod_basin``). Scored sets use ``is_pumping`` where the targets carry it (NV)
+and fall back to ``not use_ok`` (wrong use class) otherwise (NM).
+
 Arm-parameterised: ``--arms name=<render dir name>`` names the render
 directories under ``<huc8-root>/<basin>/gnn/``; ``--primary-arm`` is the arm
 under evaluation and ``--reference-arm`` the previously shipped map it is
@@ -239,9 +244,10 @@ def scan_basins(
     primary: str,
     reference: str,
     sites: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """One pass over all basins: verification rows, sampled site values, and
-    statewide counts of map cells called at each probability cut."""
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """One pass over all basins: verification rows, sampled site values,
+    statewide counts of map cells called at each probability cut, and the
+    sites that hit no valid cell."""
     dirs = {a: basin_dirs(root, d) for a, d in arms.items()}
     basins = sorted(dirs[primary])
     log(
@@ -267,8 +273,12 @@ def scan_basins(
         for a in arms:
             d = dirs[a].get(basin)
             if d is None:
-                raise SystemExit(f"{basin}: arm {a} missing")
+                if a == primary:
+                    raise SystemExit(f"{basin}: primary arm {a} missing")
+                log(f"  {basin}: arm {a} not rendered here (reference fields NaN)")
+                continue
             arrs[a], profs[a] = read_layers(d, with_ordinal=(a == primary))
+        has_ref = reference in arrs
         pdir = dirs[primary][basin]
         man = json.loads((pdir / "infer_run.json").read_text())
 
@@ -276,7 +286,7 @@ def scan_basins(
         expect = set(EXPECTED_TIFS_BASE) | {ORDINAL_TIF}
         with rasterio.open(pdir / "gnn_gate_w_100m.tif") as ds:
             gate_bands = list(ds.descriptions)
-        grid_same = all(
+        grid_same = has_ref and all(
             profs[primary][k] == profs[reference][k]
             for k in ("crs", "transform", "shape", "nodata")
         )
@@ -285,7 +295,7 @@ def scan_basins(
         sig = arrs[primary]["sigma"]
         valid = np.isfinite(dtw)
         v = dtw[valid]
-        ref_dtw = arrs[reference]["dtw"]
+        ref_dtw = arrs[reference]["dtw"] if has_ref else np.full(dtw.shape, np.nan)
         ref_valid = np.isfinite(ref_dtw)
         row = {
             "basin": basin,
@@ -313,8 +323,11 @@ def scan_basins(
             "neg_cells": int((v < 0).sum()),
             "pct_neg_dtw": float((v < 0).mean() * 100.0),
             "manifest_pct_neg_dtw": float(man.get("pct_negative_dtw", np.nan)) * 100.0,
-            "ref_pct_neg_dtw": float((ref_dtw[ref_valid] < 0).mean() * 100.0),
-            "ref_dtw_min_m": float(ref_dtw[ref_valid].min()),
+            "ref_rendered": has_ref,
+            "ref_pct_neg_dtw": float((ref_dtw[ref_valid] < 0).mean() * 100.0)
+            if has_ref
+            else np.nan,
+            "ref_dtw_min_m": float(ref_dtw[ref_valid].min()) if has_ref else np.nan,
             "leak_gate_status": (man.get("leak_gate") or {}).get("status", "-"),
             "leak_gate_n_wells": (man.get("leak_gate") or {}).get("n_wells", 0),
             "water_flatten_mode": (man.get("water_flatten") or {}).get("mode", "-"),
@@ -336,7 +349,7 @@ def scan_basins(
 
         # statewide called-cell counts (basin valid footprints are disjoint)
         plateau = valid & (dtw >= PLATEAU[0]) & (dtw < PLATEAU[1])
-        for a in arms:
+        for a in arrs:
             for var in ("laplace", "ordinal"):
                 if var == "ordinal" and a != primary:
                     continue
@@ -382,7 +395,7 @@ def scan_basins(
             idx = idx[ok]
             hits[idx] += 1
             basin_of[idx] = basin
-            for a in arms:
+            for a in arrs:
                 for k in ("dtw", "sigma", "fold_spread"):
                     samp[f"{a}__{k}"][idx] = arrs[a][k][r[idx], col[idx]]
             for t in (2.0, 5.0, 10.0):
@@ -397,10 +410,18 @@ def scan_basins(
 
     dist = pd.Series(hits).value_counts().sort_index()
     log(f"n_basin_hits distribution: {dist.to_dict()}")
-    if (hits != 1).any():
+    if (hits > 1).any():
         raise SystemExit(
-            f"{int((hits != 1).sum())} sites do not hit exactly one basin raster "
+            f"{int((hits > 1).sum())} sites hit more than one basin raster "
             f"(distribution {dist.to_dict()}) - the sampling join is ambiguous"
+        )
+    unsampled = sites[hits == 0].copy()
+    if len(unsampled):
+        # a site inside the basin polygon whose 100 m cell is nodata (basin-edge
+        # rasterisation); dropped from every panel and written out for the record
+        log(
+            f"{len(unsampled)} sites fall on a nodata cell of every basin raster "
+            f"(eligible: {int(unsampled['is_admission_eligible'].sum())}) - dropped"
         )
 
     out = sites.copy()
@@ -408,7 +429,8 @@ def scan_basins(
     out["n_basin_hits"] = hits
     for k, vv in samp.items():
         out[k] = vv
-    return pd.DataFrame(verify_rows), out, pd.DataFrame(cell_rows)
+    out = out[hits == 1].reset_index(drop=True)
+    return pd.DataFrame(verify_rows), out, pd.DataFrame(cell_rows), unsampled
 
 
 def cross_machine_check(a_dir: Path, b_dir: Path) -> pd.DataFrame:
@@ -449,11 +471,14 @@ def cross_machine_check(a_dir: Path, b_dir: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def scored_sets(s: pd.DataFrame) -> dict[str, np.ndarray]:
     elig = s["is_admission_eligible"].to_numpy(bool)
-    pump = s["is_pumping"].to_numpy(bool)
-    pre80 = (~pump) & (s["por_end_yr"].to_numpy("float64") < 1980)
+    if "is_pumping" in s.columns:
+        b_name, b = "B_secondary_pumping", s["is_pumping"].to_numpy(bool)
+    else:
+        b_name, b = "B_secondary_wrong_use", ~s["use_ok"].to_numpy(bool)
+    pre80 = (~b) & (s["por_end_yr"].to_numpy("float64") < 1980)
     return {
         "A_primary_eligible": elig,
-        "B_secondary_pumping": pump,
+        b_name: b,
         "C_secondary_pre1980": pre80,
         "D_context_all_targets": np.ones(len(s), bool),
     }
@@ -750,6 +775,12 @@ def main() -> None:
     ap.add_argument("--ma-dir", default=MA_DIR)
     ap.add_argument("--pilot-basin", default="16040103")
     ap.add_argument(
+        "--block-col",
+        default="w25r_basin",
+        help="target column for the regional blocking (NV w25r_basin, NM pod_basin)",
+    )
+    ap.add_argument("--label", default="NV", help="state label for the report header")
+    ap.add_argument(
         "--pilot-dir", default=None, help="second render of the pilot basin"
     )
     ap.add_argument("--out-dir", required=True)
@@ -796,10 +827,11 @@ def main() -> None:
         f">1 m {int((np.abs(ma_res[both] - stored[both]) > 1.0).sum())}"
     )
 
-    verify, s, cells = scan_basins(
+    verify, s, cells, unsampled = scan_basins(
         Path(args.huc8_root), arms, primary, reference, sites
     )
     verify.to_csv(out / "verify_per_basin.csv", index=False)
+    unsampled.to_csv(out / "unsampled_sites.csv", index=False)
     cells.to_csv(out / "calling_cells_per_basin.csv", index=False)
 
     for name, path in points.items():
@@ -858,15 +890,16 @@ def main() -> None:
     ):
         finite_core &= np.isfinite(preds[name])
 
-    blocks_w25r = s["w25r_basin"].fillna("__null__").astype(str).to_numpy()
+    bc = args.block_col
+    blocks_reg = s[bc].fillna("__null__").astype(str).to_numpy()
     blocks_huc8 = s["basin_hit"].astype(str).to_numpy()
     log(
-        f"w25r_basin null on {int(s['w25r_basin'].isna().sum())} of {len(s)} targets "
-        f"({100 * s['w25r_basin'].isna().mean():.2f} %)"
+        f"{bc} null on {int(s[bc].isna().sum())} of {len(s)} targets "
+        f"({100 * s[bc].isna().mean():.2f} %); {len(np.unique(blocks_reg))} blocks"
     )
-    boot_w25r = BlockBoot(blocks_w25r, args.n_boot, args.seed)
+    boot_reg = BlockBoot(blocks_reg, args.n_boot, args.seed)
     boot_huc8 = BlockBoot(blocks_huc8, args.n_boot, args.seed)
-    boot_map = {"w25r": (boot_w25r, blocks_w25r), "huc8": (boot_huc8, blocks_huc8)}
+    boot_map = {bc: (boot_reg, blocks_reg), "huc8": (boot_huc8, blocks_huc8)}
 
     sets = scored_sets(s)
     depth = band_masks(obs, [b[0] for b in DEPTH_BANDS] + [np.inf], DEPTH_LABELS)
@@ -1044,7 +1077,9 @@ def main() -> None:
 
     # ---------------- report ----------------
     with open(out / "report.md", "w") as fh:
-        fh.write(f"# NV statewide raster eval: {primary} vs {reference} vs Ma\n\n")
+        fh.write(
+            f"# {args.label} statewide raster eval: {primary} vs {reference} vs Ma\n\n"
+        )
         fh.write(f"sites {len(s)}; basins {len(verify)}; n_boot {args.n_boot}\n\n")
         fh.write("## verification (per basin)\n\n")
         fh.write(verify.to_csv(index=False))
