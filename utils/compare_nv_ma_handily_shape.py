@@ -522,7 +522,7 @@ def part_a(
     d_adm = nearest_km(adm_tree, x, y)
 
     qn = pd.read_parquet(BUNDLE_QN, columns=["well_class", "x5070", "y5070", "is_nwis"])
-    train = qn[qn["well_class"] == "monitoring"]
+    train = qn[qn["well_class"] != "water_pseudo"]
     d_train = nearest_km(cKDTree(train[["x5070", "y5070"]].to_numpy("float64")), x, y)
 
     both = np.isfinite(obs) & np.isfinite(hand) & np.isfinite(ma_native)
@@ -1275,6 +1275,7 @@ def figures(out_dir, grid, diff, common, curve, dist_tab, hist, d) -> None:
 
 
 def main() -> None:
+    global RENDER_ARM, BUNDLE_QN
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out-dir", default=OUT_DIR)
     ap.add_argument("--n-boot", type=int, default=2000)
@@ -1286,7 +1287,19 @@ def main() -> None:
         default=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
     )
     ap.add_argument("--skip-part-a", action="store_true")
+    ap.add_argument(
+        "--render-arm",
+        default=RENDER_ARM,
+        help="arm directory name under /data/ssd2/handily/huc8/<huc8>/gnn/",
+    )
+    ap.add_argument(
+        "--bundle-qn",
+        default=BUNDLE_QN,
+        help="query_nodes.parquet of the bundle the arm was trained on",
+    )
     args = ap.parse_args()
+    RENDER_ARM = args.render_arm
+    BUNDLE_QN = args.bundle_qn
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
