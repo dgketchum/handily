@@ -13,6 +13,7 @@ graph smoothness operate on extra depth, not absolute hydraulic head.
 from __future__ import annotations
 
 import logging
+import time
 
 import geopandas as gpd
 import numpy as np
@@ -44,8 +45,18 @@ def _build_residual_targets(
     gamma: float = 2.0,
     rmax_min_m: float = 2.0,
     rmax_max_m: float = 60.0,
+    relief_cap_k: float = 0.0,
 ) -> gpd.GeoDataFrame:
-    """Derive per-reach sag targets and bounds from propagated wet influence."""
+    """Derive per-reach sag targets and bounds from propagated wet influence.
+
+    With ``relief_cap_k > 0`` the sag ceiling is also bounded by local relief:
+    ``r_max = max(rmax_min_m, min(r_max, relief_cap_k * relief_local_m))``, using
+    the per-reach ``relief_local_m`` column (see :func:`reach_local_relief_m`).
+    A water surface cannot sit 60 m below a playa with 5 m of relief. The
+    uncapped ceiling is kept as ``r_max_precap_m``; ``r_target_m`` is bounded by
+    the capped ceiling. Reaches with no relief estimate (NaN) keep the uncapped
+    ceiling.
+    """
     if not (0.0 < area_sag_lo_km2 < area_sag_hi_km2):
         raise ValueError("require 0 < area_sag_lo_km2 < area_sag_hi_km2")
     out = streams.copy()
@@ -92,11 +103,74 @@ def _build_residual_targets(
     r_max = rmax_min_m + (rmax_max_m - rmax_min_m) * g
     r_target = r_max * np.power(g, gamma)
 
+    if relief_cap_k > 0.0:
+        if "relief_local_m" not in out.columns:
+            raise ValueError("relief_cap_k > 0 requires a 'relief_local_m' column")
+        relief = out["relief_local_m"].values.astype(np.float64)
+        out["r_max_precap_m"] = r_max
+        # fmin ignores NaN relief (no DEM in the window) -> uncapped ceiling.
+        r_max = np.maximum(rmax_min_m, np.fmin(r_max, relief_cap_k * relief))
+        r_target = np.minimum(r_target, r_max)
+
     out["sag_driver"] = g
     out["r_target_m"] = r_target
     out["r_max_m"] = r_max
 
     return out
+
+
+def reach_local_relief_m(
+    streams: gpd.GeoDataFrame,
+    elev_da: xr.DataArray,
+    *,
+    window_m: float = 1500.0,
+    coarse_res_m: float = 100.0,
+) -> np.ndarray:
+    """Local DEM relief (m) around each reach midpoint: p98 - p2 of the DEM in a
+    ``window_m`` square window.
+
+    The DEM is block-mean coarsened to ~``coarse_res_m`` first (10 m -> 100 m:
+    100x fewer cells), then the window (``round(window_m / res)`` cells, forced
+    odd; 15 cells at 100 m) is gathered only at the reach midpoints and reduced
+    with ``nanpercentile`` -- no full focal raster is built, so the cost is the
+    coarsen pass plus n_reaches x window cells. Midpoints whose window holds no
+    finite DEM cell (off the DEM grid) return NaN.
+    """
+    n_reach = len(streams)
+    if n_reach == 0:
+        return np.array([], dtype=np.float64)
+    da = elev_da.transpose("y", "x")
+    xres = float(abs(da.x.values[1] - da.x.values[0]))
+    yres = float(abs(da.y.values[1] - da.y.values[0]))
+    fx = max(1, int(round(coarse_res_m / xres)))
+    fy = max(1, int(round(coarse_res_m / yres)))
+    coarse = da.coarsen(x=fx, y=fy, boundary="trim").mean(skipna=True)
+    arr = np.asarray(coarse.values, dtype=np.float64)
+    cx = np.asarray(coarse.x.values, dtype=np.float64)
+    cy = np.asarray(coarse.y.values, dtype=np.float64)
+    dx = cx[1] - cx[0]
+    dy = cy[1] - cy[0]
+    nwin = max(3, int(round(window_m / abs(dx))))
+    if nwin % 2 == 0:
+        nwin += 1
+    half = nwin // 2
+
+    mids = streams.geometry.interpolate(0.5, normalized=True)
+    col = np.round((mids.x.values - cx[0]) / dx).astype(np.int64)
+    row = np.round((mids.y.values - cy[0]) / dy).astype(np.int64)
+    inside = (row >= 0) & (row < arr.shape[0]) & (col >= 0) & (col < arr.shape[1])
+
+    padded = np.pad(arr, half, mode="constant", constant_values=np.nan)
+    windows = np.lib.stride_tricks.sliding_window_view(padded, (nwin, nwin))
+    relief = np.full(n_reach, np.nan, dtype=np.float64)
+    idx = np.flatnonzero(inside)
+    if idx.size:
+        win = windows[row[idx], col[idx]].reshape(idx.size, -1)
+        has = np.isfinite(win).any(axis=1)
+        if has.any():
+            lo, hi = np.nanpercentile(win[has], [2.0, 98.0], axis=1)
+            relief[idx[has]] = hi - lo
+    return relief
 
 
 def solve_channel_heads(
@@ -360,6 +434,8 @@ def build_channel_heads(
     gamma: float = 2.0,
     rmax_min_m: float = 2.0,
     rmax_max_m: float = 60.0,
+    relief_cap_k: float = 0.0,
+    relief_window_m: float = 1500.0,
     max_iter: int = 500,
     tol: float = 0.01,
 ) -> gpd.GeoDataFrame:
@@ -457,6 +533,20 @@ def build_channel_heads(
         strahler_distance_scale=strahler_distance_scale,
     )
 
+    if relief_cap_k > 0.0:
+        t_rel = time.perf_counter()
+        relief = reach_local_relief_m(topo.streams, elev_da, window_m=relief_window_m)
+        topo.streams["relief_local_m"] = relief
+        LOGGER.info(
+            "Local relief (p98-p2, %.0f m window): %d reaches, median %.1f m, "
+            "%d without DEM, %.1fs",
+            relief_window_m,
+            len(relief),
+            float(np.nanmedian(relief)) if np.isfinite(relief).any() else np.nan,
+            int((~np.isfinite(relief)).sum()),
+            time.perf_counter() - t_rel,
+        )
+
     LOGGER.info("Building residual sag targets")
     topo.streams = _build_residual_targets(
         topo.streams,
@@ -470,7 +560,20 @@ def build_channel_heads(
         gamma=gamma,
         rmax_min_m=rmax_min_m,
         rmax_max_m=rmax_max_m,
+        relief_cap_k=relief_cap_k,
     )
+    if relief_cap_k > 0.0:
+        pre = topo.streams["r_max_precap_m"].values
+        post = topo.streams["r_max_m"].values
+        LOGGER.info(
+            "Relief cap (k=%.2f): r_max lowered on %d / %d reaches "
+            "(median r_max %.1f -> %.1f m)",
+            relief_cap_k,
+            int((post < pre - 1e-9).sum()),
+            len(pre),
+            float(np.nanmedian(pre)),
+            float(np.nanmedian(post)),
+        )
 
     # The solver's wetness weight pulls toward r=0 with the strongest
     # evidence from either direction (g already took the per-source min).

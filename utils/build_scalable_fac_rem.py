@@ -121,7 +121,7 @@ DONE_MARKER = ".fac_rem_done"  # per-HUC8 completion sentinel (JSON)
 
 # Large, fully re-derivable intermediates deleted after a HUC8 succeeds (statewide
 # disk control). Products (REM depth + water surface), the generated config,
-# fac_rem_run.json, the seed/support evidence rasters, streams_regional.fgb, and
+# fac_rem_run.json, the seed/support evidence rasters, streams_regional[_<recipe>].fgb, and
 # basin_boundary.fgb are KEPT. The shared dem_tiles/ cache is kept until the whole
 # batch finishes (it is not per-HUC8).
 _CLEANUP_REGION = (
@@ -147,6 +147,13 @@ _CLEANUP_REM = (
     "fac_normals_smoothed_dem.tif",
     "fac_normals_cross_sections.fgb",
 )
+
+
+def streams_fgb_name(recipe: str) -> str:
+    """Per-recipe persisted stream network name (baseline keeps the plain name)."""
+    if recipe == "scalable":
+        return "streams_regional.fgb"
+    return f"streams_regional_{recipe}.fgb"
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +437,9 @@ def build_canal_support(
     combined = ((gsw > 0) | gated).astype("uint8")
 
     profile.update(dtype="uint8", compress="deflate")
-    if min(shape) >= 256:  # GDAL clamps blocks to raster dims; <16-px blocks are invalid
+    if (
+        min(shape) >= 256
+    ):  # GDAL clamps blocks to raster dims; <16-px blocks are invalid
         profile.update(tiled=True)
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(combined, 1)
@@ -606,14 +615,18 @@ def build_one_region(
     # dominant outlet so the persisted network is the basin's own connected
     # drainage -- including the trunk where it assembles below the HUC pour point
     # out in the halo -- not the foreign catchments that exit other window edges).
+    # The persisted network is recipe-suffixed for variants so a variant whose
+    # stream clip differs never overwrites the baseline network the shipped
+    # ``_scalable`` REM was built from.
+    streams_path = out_dir / streams_fgb_name(args.recipe)
     regional_fac.compute_regional_fac(
         dem_path,
         out_dir,
         threshold=args.stream_threshold,
         max_procs=args.workers,
         basin_poly=poly,
+        streams_name=streams_path.name,
     )
-    streams_path = out_dir / "streams_regional.fgb"
     fac_path = out_dir / "flow_accumulation.tif"
 
     # 3-4. Seed + support. Evidence stays under evidence/scalable regardless of
@@ -765,7 +778,7 @@ def _write_marker(marker: Path, huc8: str, profile: str, rem_path: Path) -> None
 def _cleanup_region(out_dir: Path, rem_path: Path) -> None:
     """Delete large re-derivable intermediates after a HUC8 succeeds. Keeps the
     products, generated config, fac_rem_run.json, seed/support evidence,
-    streams_regional.fgb, and basin_boundary.fgb."""
+    streams_regional[_<recipe>].fgb, and basin_boundary.fgb."""
     removed = 0
     for name in _CLEANUP_REGION:
         p = out_dir / name
@@ -931,7 +944,7 @@ def main(argv: list[str] | None = None) -> None:
         default="scalable",
         help="product label: rem/<name>_<recipe>/, <name>_<recipe>.toml and the batch "
         "marker are recipe-suffixed so variants coexist with the baseline "
-        "(fac_rem_registry discovers only *_scalable)",
+        "(fac_rem_registry reads *_scalable unless HANDILY_FAC_RECIPE points at the variant)",
     )
     p.add_argument(
         "--canal-support",

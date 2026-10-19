@@ -2261,6 +2261,23 @@ def main(argv: list[str] | None = None) -> None:
             "head_depth_mean_m": float(depth.mean()),
             "head_depth_max_m": float(depth.max()),
         }
+        if "r_max_precap_m" in heads.columns:
+            pre = heads["r_max_precap_m"].to_numpy(dtype=float)
+            post = heads["r_max_m"].to_numpy(dtype=float)
+            relief = heads["relief_local_m"].to_numpy(dtype=float)
+            n_capped = int((post < pre - 1e-9).sum())
+            print(
+                f"  relief cap: r_max lowered on {n_capped}/{len(heads)} reaches; "
+                f"median relief {np.nanmedian(relief):.1f} m, "
+                f"median r_max {np.nanmedian(pre):.1f} -> {np.nanmedian(post):.1f} m"
+            )
+            diagnostics["heads"]["relief_cap"] = {
+                "n_capped": n_capped,
+                "n_no_relief": int((~np.isfinite(relief)).sum()),
+                "relief_local_median_m": float(np.nanmedian(relief)),
+                "r_max_precap_median_m": float(np.nanmedian(pre)),
+                "r_max_median_m": float(np.nanmedian(post)),
+            }
     else:
         strips_depth = None
 

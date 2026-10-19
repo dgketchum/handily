@@ -68,6 +68,8 @@ CONFIG_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "alpha_z",
         "area_sag_lo_km2",
         "area_sag_hi_km2",
+        "relief_cap_k",
+        "relief_window_m",
     ),
     "solver": (
         "d_min_off_support_m",
@@ -203,6 +205,12 @@ class FacRemConfig:
     alpha_z: float = 1.0
     area_sag_lo_km2: float = 50.0
     area_sag_hi_km2: float = 500.0
+    # Relief-aware r_max cap: r_max <= relief_cap_k * local DEM relief (p98 - p2
+    # within a relief_window_m square around the reach midpoint), floored at
+    # rmax_min_m. Stops flat-resolved D8 "channels" on playas from taking a
+    # 60 m sag on a surface with a few m of relief. 0 disables (legacy).
+    relief_cap_k: float = 0.0
+    relief_window_m: float = 1500.0
 
     # --- Head-solve: residual solver ---
     d_min_off_support_m: float = 0.5
@@ -283,6 +291,8 @@ class FacRemConfig:
             "alpha_z": self.alpha_z,
             "area_sag_lo_km2": self.area_sag_lo_km2,
             "area_sag_hi_km2": self.area_sag_hi_km2,
+            "relief_cap_k": self.relief_cap_k,
+            "relief_window_m": self.relief_window_m,
             "d_min_off_support_m": self.d_min_off_support_m,
             "support_fraction_threshold": self.support_fraction_threshold,
             "strahler_pin_min": self.strahler_pin_min,

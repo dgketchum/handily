@@ -247,6 +247,9 @@ def clip_streams_to_fac_watershed(
     min_outlet_fraction: float = 0.5,
     min_in_basin_fraction: float = 0.9,
     min_secondary_fraction: float = 0.05,
+    dem_path: str | Path | None = None,
+    closed_rise_m: float = 5.0,
+    min_in_basin_fraction_closed: float = 0.5,
 ) -> gpd.GeoDataFrame:
     """Clip reaches to the FAC-delineated watershed(s) of the dominant outlet(s).
 
@@ -276,6 +279,33 @@ def clip_streams_to_fac_watershed(
       connectivity. Requires ``basin_poly``; with no polygon only the outlet-FAC
       rule applies.
 
+    **Closed (internally drained) HUCs.** WBT fills every depression, so in a
+    closed basin each internally drained sub-basin is filled to its spill point
+    and routed over a divide to the window edge: every component's max-FAC cell
+    sits on the window edge whether the HUC is open or closed, and the 5 % rule
+    above drops whole sub-basins (Dixie Valley 16060001: the Jersey / Pleasant
+    Valley sub-basins, 2,324 + 1,649 km2, were dropped). Closure is therefore
+    read from the raw DEM along the dominant component's own stream cells: the
+    in-basin exit cell (max FAC among the component's stream cells inside
+    ``basin_poly``) is where the trunk leaves the HUC. In an open HUC the trunk
+    descends to that exit, so it is (near) the lowest in-basin stream cell; in a
+    closed HUC the trunk has to climb out of the sink over the spill, so the exit
+    sits far above the sink. The HUC is called **closed** when ``z_exit - p1 >
+    closed_rise_m``, with ``p1`` the 1st percentile of the raw DEM over the
+    dominant component's in-basin stream cells (robust to a single pit cell).
+    Calibration (2026-10-07): rise -9.5 m on open 16040105 (Middle Humboldt),
+    +7.3 m on 16050203 (Carson Sink, low sill to the Humboldt Sink), +382 m on
+    16060001 (Dixie Valley); the 5 m default separates them.
+    When closed, every component with ``>= min_in_basin_fraction_closed`` of its
+    stream cells inside ``basin_poly`` is kept regardless of outlet FAC (the
+    secondary FAC floor is 0). The majority rule (0.5, not the 0.9 tributary
+    rule) is deliberate: a closed sub-basin's fill-spill path leaves the HUC and
+    runs through the halo to the window edge, so its in-basin share falls with
+    the spill-path length (0.87 and 0.81 for the two Dixie sub-basins) while
+    neighbours that only clip the halo stay near 0 (<= 0.01 in Dixie). Requires
+    ``dem_path`` and ``basin_poly``; without them the open-basin rules apply
+    unchanged.
+
     Reaches are assigned to the kept watershed(s) by majority vote of their
     vertices over the kept-cell mask. ``stream_id`` is reset to a contiguous range
     over the kept reaches.
@@ -303,6 +333,7 @@ def clip_streams_to_fac_watershed(
     max_fac = outlet_fac[order[0]]
 
     in_basin_frac: dict[int, float] = {}
+    cell_in = None
     if basin_poly is not None:
         bpoly = basin_poly
         if isinstance(bpoly, gpd.GeoDataFrame):
@@ -318,6 +349,53 @@ def clip_streams_to_fac_watershed(
                 break
             in_basin_frac[int(k)] = float(cell_in[labels == k].mean())
 
+    px, py = abs(transform.a), abs(transform.e)
+    cell_km2 = px * py / 1e6
+
+    # Closed-basin verdict from the raw DEM along the dominant component.
+    closed = False
+    if cell_in is not None and dem_path is not None:
+        k0 = int(order[0])
+        dom_in = (labels == k0) & cell_in
+        if dom_in.any():
+            with rasterio.open(dem_path) as src:
+                if src.shape != shp or src.transform != transform:
+                    raise ValueError(
+                        f"DEM grid {src.shape} {src.transform} does not match the "
+                        f"streams grid {shp} {transform}"
+                    )
+                dem_arr = src.read(1, masked=True)
+            z = dem_arr[rows[dom_in], cols[dom_in]]
+            z = np.ma.filled(z.astype(np.float64), np.nan)
+            j = int(np.argmax(cell_fac[dom_in]))
+            z_exit = float(z[j])
+            z_low = float(np.nanpercentile(z, 1.0))
+            ex, ey = transform * (cols[dom_in][j] + 0.5, rows[dom_in][j] + 0.5)
+            closed = (z_exit - z_low) > closed_rise_m
+            log.info(
+                "  fac-watershed clip: basin %s -- dominant trunk leaves the HUC at "
+                "(%.0f,%.0f) z=%.1f m; in-basin trunk p1 z=%.1f m; rise %.1f m "
+                "(closed if > %.1f m)",
+                "CLOSED" if closed else "OPEN",
+                ex,
+                ey,
+                z_exit,
+                z_low,
+                z_exit - z_low,
+                closed_rise_m,
+            )
+        else:
+            log.info(
+                "  fac-watershed clip: basin OPEN -- dominant component has no "
+                "in-basin stream cell"
+            )
+    if closed:
+        ib_all = np.bincount(
+            labels, weights=cell_in.astype(np.float64), minlength=ncomp
+        )
+        ib_all = ib_all / np.maximum(sizes, 1)
+        in_basin_frac = {int(k): float(ib_all[k]) for k in range(ncomp)}
+
     # Keep the dominant outlet (and any comparable outlet), plus any substantial,
     # unambiguously in-HUC tributary whose out-of-window confluence made it a
     # separate component here.
@@ -329,22 +407,36 @@ def clip_streams_to_fac_watershed(
             in_basin_frac.get(k, 0.0) >= min_in_basin_fraction
             and outlet_fac[k] >= min_secondary_fraction * max_fac
         )
-        if is_dominant or is_in_basin_trib:
+        is_closed_member = (
+            closed and in_basin_frac.get(k, 0.0) >= min_in_basin_fraction_closed
+        )
+        if is_dominant or is_in_basin_trib or is_closed_member:
             keep_labels.add(k)
 
-    px, py = abs(transform.a), abs(transform.e)
-    cell_km2 = px * py / 1e6
-    log.info(
-        "  fac-watershed clip: %d components; keeping %d "
-        "(outlet >= %.0f%% of max, or >= %.0f%% in-basin and >= %.0f%% of max)",
-        ncomp,
-        len(keep_labels),
-        100 * min_outlet_fraction,
-        100 * min_in_basin_fraction,
-        100 * min_secondary_fraction,
-    )
+    if closed:
+        log.info(
+            "  fac-watershed clip: %d components; keeping %d (closed basin: outlet "
+            ">= %.0f%% of max, or >= %.0f%% in-basin at any outlet FAC)",
+            ncomp,
+            len(keep_labels),
+            100 * min_outlet_fraction,
+            100 * min_in_basin_fraction_closed,
+        )
+    else:
+        log.info(
+            "  fac-watershed clip: %d components; keeping %d "
+            "(outlet >= %.0f%% of max, or >= %.0f%% in-basin and >= %.0f%% of max)",
+            ncomp,
+            len(keep_labels),
+            100 * min_outlet_fraction,
+            100 * min_in_basin_fraction,
+            100 * min_secondary_fraction,
+        )
     for rank, k in enumerate(order):
-        if outlet_fac[k] < 0.01 * max_fac:
+        below_floor = outlet_fac[k] < 0.01 * max_fac
+        if below_floor and not (closed and in_basin_frac.get(int(k), 0.0) > 0.0):
+            if closed:
+                continue
             break
         sub = labels == k
         oi = int(np.argmax(cell_fac[sub]))
@@ -361,7 +453,7 @@ def clip_streams_to_fac_watershed(
             ib,
             "KEEP" if int(k) in keep_labels else "drop",
         )
-    if len(keep_labels) > 1:
+    if len(keep_labels) > 1 and not closed:
         log.warning(
             "  fac-watershed clip: %d outlets kept (multi-outlet window) -- review",
             len(keep_labels),
@@ -414,6 +506,7 @@ def compute_regional_fac(
     threshold: int = 5000,
     max_procs: int = 32,
     basin_poly=None,
+    streams_name: str = "streams_regional.fgb",
 ) -> Path:
     """Run D8 flow accumulation and stream extraction on a regional DEM.
 
@@ -422,11 +515,19 @@ def compute_regional_fac(
     the dominant window outlet via :func:`clip_streams_to_fac_watershed` — keeping
     the basin's own connected drainage (including its trunk where it assembles
     below the HUC pour point, out in the halo) and dropping foreign catchments
-    that exit a different window edge. ``basin_poly`` is also used for the
-    in-basin diagnostic log only. It defaults to ``None`` (no clip), preserving
+    that exit a different window edge; in a closed (internally drained) HUC every
+    majority-in-basin sub-basin is kept (closure read from ``dem_path``, see
+    :func:`clip_streams_to_fac_watershed`). ``basin_poly`` is also used for the
+    in-basin diagnostic log. It defaults to ``None`` (no clip), preserving
     behavior for callers with no associated basin polygon.
 
-    Returns the path to the final ``streams_regional.fgb``.
+    ``streams_name`` is the file name of the persisted network inside
+    ``out_dir``; recipe variants pass a suffixed name (e.g.
+    ``streams_regional_scalable_v2.fgb``) so they never clobber the baseline
+    network another recipe's REM was built from. The WBT intermediates
+    (filled/d8/acc/streams raster) are recipe-independent and shared.
+
+    Returns the path to the persisted network.
     """
     dem_path = str(dem_path)
     out_dir = Path(out_dir)
@@ -443,7 +544,7 @@ def compute_regional_fac(
     streams_ras = str(out_dir / "streams_10m.tif")
     strahler = str(out_dir / "stream_order.tif")
     streams_shp = str(out_dir / "streams_raw.shp")
-    streams_fgb = str(out_dir / "streams_regional.fgb")
+    streams_fgb = str(out_dir / streams_name)
 
     t0 = time.time()
 
@@ -524,7 +625,7 @@ def compute_regional_fac(
     gdf["length_m"] = gdf.geometry.length
     if basin_poly is not None:
         gdf = clip_streams_to_fac_watershed(
-            gdf, fdir, streams_ras, acc, basin_poly=basin_poly
+            gdf, fdir, streams_ras, acc, basin_poly=basin_poly, dem_path=dem_path
         )
     gdf.to_file(streams_fgb, driver="FlatGeobuf")
     log.info(

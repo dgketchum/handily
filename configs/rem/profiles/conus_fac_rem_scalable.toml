@@ -47,3 +47,13 @@ strahler_distance_scale = 1.0
 # minimum off-support depth so dry uplands don't pin to 0.
 below_bed_offset_m = 1.5
 d_min_off_support_m = 1.0
+
+[sag]
+# Relief-aware sag ceiling (2026-10-07, NV fix round item E): r_max is capped at
+# relief_cap_k x local DEM relief (p98 - p2 in a relief_window_m square at the
+# reach midpoint), floored at rmax_min_m. On flat playas WBT D8 resolves ties into
+# straight axis-aligned "channels" that otherwise take the full 60 m sag on a
+# surface with ~5 m of relief (Carson Sink striping). Mountain reaches (relief
+# >> 60 m) are untouched.
+relief_cap_k = 1.0
+relief_window_m = 1500.0

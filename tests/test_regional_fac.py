@@ -206,3 +206,145 @@ def test_clip_keeps_in_basin_tributary_with_polygon(tmp_path):
         basin_poly=basin_poly,
     )
     assert len(kept) == 2
+
+
+# --- closed-basin clip ------------------------------------------------------
+
+_CODE_FOR_OFFSET = {v: k for k, v in _D8_OFFSETS.items()}
+
+
+def _closed_window(open_basin: bool = False):
+    """A 12 x 24 window (1 m cells) holding a HUC box plus a halo.
+
+    - Chain A (dominant, outlet FAC 1000): runs east along row 5 inside the HUC
+      down to a sink, then climbs NE over a spill and leaves the HUC through the
+      halo to the window edge (in-basin share 15/17 = 0.88). ``open_basin=True``
+      makes the raw DEM descend monotonically to the exit instead (no sink).
+    - Chain B (small internally drained sub-basin, outlet FAC 30 = 3 % of max):
+      row 8 inside the HUC, spill path leaves south through the halo (6/8 = 0.75
+      in-basin) -- dropped by the open-basin rules (< 5 % of max, < 90 % in).
+    - Chain C (neighbour clipping the halo, outlet FAC 100): fully outside.
+    """
+    shape = (12, 24)
+    streams = np.zeros(shape, dtype=np.int16)
+    d8 = np.zeros(shape, dtype=np.int16)
+    fac = np.zeros(shape, dtype=np.float32)
+    dem = np.full(shape, 200.0, dtype=np.float32)
+
+    chain_a = [(5, c) for c in range(3, 15)] + [
+        (4, 15),
+        (3, 16),
+        (2, 17),
+        (1, 18),
+        (0, 19),
+    ]
+    if open_basin:
+        z_a = np.linspace(150.0, 20.0, len(chain_a))
+    else:
+        # descend to the sink at col 10 (z 10), then climb to the spill (65 at
+        # the last in-basin cell (2,17)), then drop off the divide in the halo.
+        z_a = [100, 90, 80, 60, 40, 20, 15, 10, 20, 30, 40, 50, 55, 60, 65, 40, 30]
+    fac_a = np.linspace(10.0, 1000.0, len(chain_a))
+    chain_b = [(8, c) for c in range(5, 10)] + [(9, 10), (10, 11), (11, 12)]
+    z_b = [60, 50, 40, 30, 20, 25, 22, 18]
+    fac_b = np.linspace(2.0, 30.0, len(chain_b))
+    chain_c = [(11, c) for c in range(15, 21)]
+    z_c = [90, 80, 70, 60, 50, 40]
+    fac_c = np.linspace(20.0, 100.0, len(chain_c))
+
+    for chain, zs, fs in (
+        (chain_a, z_a, fac_a),
+        (chain_b, z_b, fac_b),
+        (chain_c, z_c, fac_c),
+    ):
+        for i, ((r, c), z, f) in enumerate(zip(chain, zs, fs)):
+            streams[r, c] = 1
+            dem[r, c] = z
+            fac[r, c] = f
+            if i + 1 < len(chain):
+                nr, nc = chain[i + 1]
+                d8[r, c] = _CODE_FOR_OFFSET[(nr - r, nc - c)]
+    basin_poly = box(2, 2, 22, 10)  # cells rows 2..9, cols 2..21
+    return streams, d8, fac, dem, basin_poly, (chain_a, chain_b, chain_c)
+
+
+def _write_window(tmp_path, streams, d8, fac, dem):
+    transform = from_origin(0, streams.shape[0], 1, 1)
+    paths = {}
+    for name, arr, dtype, nodata in [
+        ("streams_10m.tif", streams, "int16", 0),
+        ("d8_pointer.tif", d8, "int16", 0),
+        ("flow_accumulation.tif", fac, "float32", -1),
+        ("dem_10m.tif", dem, "float32", -9999),
+    ]:
+        p = tmp_path / name
+        with rasterio.open(
+            p,
+            "w",
+            driver="GTiff",
+            height=arr.shape[0],
+            width=arr.shape[1],
+            count=1,
+            dtype=dtype,
+            crs="EPSG:5070",
+            transform=transform,
+            nodata=nodata,
+        ) as dst:
+            dst.write(arr.astype(dtype), 1)
+        paths[name] = p
+    return paths, transform
+
+
+def _window_reaches(chains, transform):
+    return gpd.GeoDataFrame(
+        {"stream_id": [0, 1, 2], "strahler": [3, 1, 2]},
+        geometry=[_reach_on_cells(ch, transform) for ch in chains],
+        crs="EPSG:5070",
+    )
+
+
+def _clip(paths, gdf, basin_poly, with_dem):
+    return clip_streams_to_fac_watershed(
+        gdf,
+        paths["d8_pointer.tif"],
+        paths["streams_10m.tif"],
+        paths["flow_accumulation.tif"],
+        basin_poly=basin_poly,
+        dem_path=paths["dem_10m.tif"] if with_dem else None,
+    )
+
+
+def test_clip_closed_basin_keeps_small_internal_subbasin(tmp_path, caplog):
+    """Closed HUC: the small sub-basin (3 % of max FAC, 75 % in-basin) is dropped
+    by the open-basin rules but kept once closure is detected from the DEM; the
+    halo-only neighbour is still dropped."""
+    streams, d8, fac, dem, basin_poly, chains = _closed_window()
+    paths, transform = _write_window(tmp_path, streams, d8, fac, dem)
+    gdf = _window_reaches(chains, transform)
+
+    legacy = _clip(paths, gdf, basin_poly, with_dem=False)
+    assert len(legacy) == 1  # old rule: sub-basin B dropped
+
+    with caplog.at_level("INFO", logger="handily.regional_fac"):
+        kept = _clip(paths, gdf, basin_poly, with_dem=True)
+    assert "basin CLOSED" in caplog.text
+    assert len(kept) == 2
+    assert kept.geometry.iloc[0].equals(gdf.geometry.iloc[0])  # A
+    assert kept.geometry.iloc[1].equals(gdf.geometry.iloc[1])  # B
+    assert list(kept["stream_id"]) == [0, 1]
+
+
+def test_clip_open_basin_unchanged_by_closure_check(tmp_path, caplog):
+    """Open HUC (trunk descends to its exit): the closure check is a no-op and
+    the kept set is identical to the legacy open-basin rules."""
+    streams, d8, fac, dem, basin_poly, chains = _closed_window(open_basin=True)
+    paths, transform = _write_window(tmp_path, streams, d8, fac, dem)
+    gdf = _window_reaches(chains, transform)
+
+    legacy = _clip(paths, gdf, basin_poly, with_dem=False)
+    with caplog.at_level("INFO", logger="handily.regional_fac"):
+        new = _clip(paths, gdf, basin_poly, with_dem=True)
+    assert "basin OPEN" in caplog.text
+    assert len(new) == len(legacy) == 1
+    assert new.geometry.iloc[0].equals(legacy.geometry.iloc[0])
+    assert new.to_wkb().equals(legacy.to_wkb())

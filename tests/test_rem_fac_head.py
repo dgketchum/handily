@@ -632,3 +632,79 @@ def test_build_channel_heads_overrides_realign_by_stream_id():
             f"reach {sid} depth differs by input order "
             f"({ordered[sid]:.4f} vs {shuffled[sid]:.4f}) -> override misaligned"
         )
+
+
+def _dry_reach_table(relief_m):
+    """Fully dry reaches (no wet evidence, far from any seed) -> g = 1, r_max = max."""
+    n = len(relief_m)
+    return gpd.GeoDataFrame(
+        {
+            "stream_id": np.arange(n),
+            "topo_pin_weight": np.zeros(n),
+            "topo_dist_to_seed_m": np.full(n, np.nan),
+            "topo_gain_to_seed_m": np.full(n, np.nan),
+            "relief_local_m": np.asarray(relief_m, dtype=np.float64),
+        },
+        geometry=[LineString([(i, 0), (i, 1)]) for i in range(n)],
+        crs="EPSG:5070",
+    )
+
+
+def test_relief_cap_caps_playa_reach_and_leaves_mountain_reach():
+    """r_max <= k * local relief: a playa reach (5 m relief) is capped from 60 m
+    to 5 m, a mountain reach (400 m relief) keeps 60 m, a dead-flat reach is
+    floored at rmax_min_m, and a reach with no relief estimate is left uncapped."""
+    from handily.rem_fac_head import _build_residual_targets
+
+    table = _dry_reach_table([5.0, 400.0, 0.3, np.nan])
+    out = _build_residual_targets(
+        table, rmax_min_m=2.0, rmax_max_m=60.0, relief_cap_k=1.0
+    )
+    np.testing.assert_allclose(out["r_max_precap_m"], [60.0, 60.0, 60.0, 60.0])
+    np.testing.assert_allclose(out["r_max_m"], [5.0, 60.0, 2.0, 60.0])
+    # target never exceeds the capped ceiling
+    assert (out["r_target_m"] <= out["r_max_m"] + 1e-9).all()
+    np.testing.assert_allclose(out["r_target_m"], [5.0, 60.0, 2.0, 60.0])
+
+
+def test_relief_cap_disabled_is_legacy():
+    """relief_cap_k = 0 (the baseline default) reproduces the legacy targets."""
+    from handily.rem_fac_head import _build_residual_targets
+
+    table = _dry_reach_table([5.0, 400.0])
+    legacy = _build_residual_targets(table.drop(columns="relief_local_m"))
+    off = _build_residual_targets(table, relief_cap_k=0.0)
+    np.testing.assert_array_equal(off["r_max_m"], legacy["r_max_m"])
+    np.testing.assert_array_equal(off["r_target_m"], legacy["r_target_m"])
+    assert "r_max_precap_m" not in off.columns
+
+
+def test_reach_local_relief_flat_vs_mountain():
+    """p98 - p2 of a 1.5 km window at the reach midpoint, on a 10 m DEM."""
+    from handily.rem_fac_head import reach_local_relief_m
+
+    nx, ny = 800, 400  # 8 km x 4 km at 10 m
+    x = np.arange(nx) * 10.0 + 5.0
+    y = (ny - 1 - np.arange(ny)) * 10.0 + 5.0
+    xx = np.broadcast_to(x, (ny, nx))
+    # west half: playa tilting 5 m over 4 km; east half: 0.2 m/m mountain slope
+    dem = np.where(
+        xx < 4000.0, 1180.0 + 5.0 * xx / 4000.0, 1185.0 + 0.2 * (xx - 4000.0)
+    )
+    da = _grid(dem)
+    da = da.assign_coords(x=x, y=y)
+    streams = gpd.GeoDataFrame(
+        {"stream_id": [0, 1]},
+        geometry=[
+            LineString([(1500.0, 1000.0), (2500.0, 1000.0)]),  # playa, mid (2000, 1000)
+            LineString(
+                [(6000.0, 1000.0), (6000.0, 3000.0)]
+            ),  # mountain, mid (6000, 2000)
+        ],
+        crs="EPSG:5070",
+    )
+    relief = reach_local_relief_m(streams, da, window_m=1500.0)
+    # playa: 1.5 km of a 5 m / 4 km tilt -> ~1.9 m (minus the 2-98 % trim)
+    assert 1.0 < relief[0] < 2.5
+    # mountain: 1.5 km of a 0.2 slope -> ~300 m (minus trim)
+    assert relief[1] > 250.0

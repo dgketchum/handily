@@ -22,6 +22,7 @@ are non-finite, so ``np.isfinite`` is the in-band-gap filter (the same rule
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -32,8 +33,27 @@ log = logging.getLogger("fac_rem_registry")
 _SCALABLE_ROOT = "/data/ssd2/handily/huc8"
 
 
+# FAC-REM recipe pointer. Each basin resolves to
+# rem/{basin}_{HANDILY_FAC_RECIPE}/ when that product exists and falls back to the
+# baseline rem/{basin}_scalable/ otherwise, so a variant recipe rebuilt on a
+# subset of basins (e.g. scalable_v2 on the NV closed basins) overlays the
+# baseline without touching it. Read once at import (the registry is built at
+# import); set the env var before importing.
+FAC_RECIPE_BASELINE = "scalable"
+FAC_RECIPE = os.environ.get("HANDILY_FAC_RECIPE", "").strip() or FAC_RECIPE_BASELINE
+
+
+def _fac_recipe_path(basin: str, recipe: str) -> str:
+    return f"{_SCALABLE_ROOT}/{basin}/rem/{basin}_{recipe}/fac_head_depth_rem_10m.tif"
+
+
 def _fac_path(basin: str) -> str:
-    return f"{_SCALABLE_ROOT}/{basin}/rem/{basin}_scalable/fac_head_depth_rem_10m.tif"
+    """Preferred-recipe raster when it exists, else the baseline ``_scalable`` one."""
+    if FAC_RECIPE != FAC_RECIPE_BASELINE:
+        pref = _fac_recipe_path(basin, FAC_RECIPE)
+        if Path(pref).exists():
+            return pref
+    return _fac_recipe_path(basin, FAC_RECIPE_BASELINE)
 
 
 # The 5 native-10 m EPSG:5070 pilots that back the wall-to-wall product. Listed
@@ -73,8 +93,90 @@ def _discover(path_fn) -> list[str]:
     return out
 
 
+def _recipe_of(path: str) -> tuple[str, str]:
+    """(basin, recipe) from ``.../{basin}/rem/{basin}_{recipe}/<raster>``."""
+    p = Path(path)
+    basin = p.parents[2].name
+    return basin, p.parent.name[len(basin) + 1 :]
+
+
+# Registry pin. The registry is auto-discovered from whatever is on disk, so two
+# machines with different basin sets staged render DIFFERENT maps at raster
+# overlaps (first finite sample wins). HANDILY_FAC_PIN names a manifest written
+# by utils/pin_fac_registry.py (``basin<TAB>recipe`` per line, '#' comments):
+# the registry is restricted to exactly those basins, in discovery order, and
+# import fails if any pinned basin is missing or resolves to another recipe.
+# Same manifest on both machines => same registry => same map.
+FAC_PIN = os.environ.get("HANDILY_FAC_PIN", "").strip() or None
+
+
+def read_pin(path: str) -> dict[str, str]:
+    """``{basin: recipe}`` from a pin manifest (order = file order)."""
+    out: dict[str, str] = {}
+    for line in Path(path).read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        basin, recipe = line.split("\t")[:2]
+        out[basin] = recipe
+    return out
+
+
+def _apply_pin(registry: list[str], pin_path: str) -> list[str]:
+    pin = read_pin(pin_path)
+    found = {_recipe_of(p)[0]: p for p in registry}
+    missing = sorted(b for b in pin if b not in found)
+    wrong = sorted(
+        f"{b}: pinned {r}, resolved {_recipe_of(found[b])[1]}"
+        for b, r in pin.items()
+        if b in found and _recipe_of(found[b])[1] != r
+    )
+    if missing or wrong:
+        raise SystemExit(
+            f"HANDILY_FAC_PIN={pin_path}: registry does not satisfy the pin; "
+            f"missing {len(missing)} {missing[:10]}; recipe mismatch {len(wrong)} {wrong[:10]}"
+        )
+    kept = [p for p in registry if _recipe_of(p)[0] in pin]
+    log.info(
+        "FAC-REM registry pinned to %s: %d of %d discovered basins kept",
+        pin_path,
+        len(kept),
+        len(registry),
+    )
+    return kept
+
+
 # Ordered best -> worst. First finite sample wins where basins overlap.
 FAC_REM_REGISTRY: list[str] = _discover(_fac_path)
+if FAC_PIN:
+    FAC_REM_REGISTRY = _apply_pin(FAC_REM_REGISTRY, FAC_PIN)
+
+# basin -> recipe each registry entry resolved to (for run records / renderers).
+FAC_REM_RECIPES: dict[str, str] = dict(_recipe_of(p) for p in FAC_REM_REGISTRY)
+
+
+def fac_rem_recipe(basin: str) -> str | None:
+    """Recipe the registry resolved ``basin`` to, or None if it has no FAC-REM."""
+    return FAC_REM_RECIPES.get(basin)
+
+
+def _log_recipe_resolution() -> None:
+    n_pref = sum(r == FAC_RECIPE for r in FAC_REM_RECIPES.values())
+    if FAC_RECIPE != FAC_RECIPE_BASELINE:
+        for basin, recipe in FAC_REM_RECIPES.items():
+            log.info("FAC-REM recipe %s -> %s", basin, recipe)
+    log.info(
+        "FAC-REM recipe pointer HANDILY_FAC_RECIPE=%s: %d basins on it, "
+        "%d fell back to %s (%d total)",
+        FAC_RECIPE,
+        n_pref,
+        len(FAC_REM_RECIPES) - n_pref,
+        FAC_RECIPE_BASELINE,
+        len(FAC_REM_RECIPES),
+    )
+
+
+_log_recipe_resolution()
 
 
 def existing_registry(registry: list[str] | None = None) -> list[str]:
