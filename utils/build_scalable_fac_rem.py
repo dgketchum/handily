@@ -944,7 +944,7 @@ def main(argv: list[str] | None = None) -> None:
         default="scalable",
         help="product label: rem/<name>_<recipe>/, <name>_<recipe>.toml and the batch "
         "marker are recipe-suffixed so variants coexist with the baseline "
-        "(fac_rem_registry reads *_scalable unless HANDILY_FAC_RECIPE points at the variant)",
+        "(a bundle picks a recipe explicitly via --fac-recipe / its fac_rem_manifest.json)",
     )
     p.add_argument(
         "--canal-support",

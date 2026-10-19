@@ -71,7 +71,12 @@ from build_conus_graph_inputs import (  # noqa: E402
     water_v3_inference_block,
 )
 from build_stacker_features import sample_coarse  # noqa: E402
-from fac_rem_registry import sample_fac_rem  # noqa: E402
+from fac_rem_registry import (  # noqa: E402
+    load_manifest,
+    manifest_for_model,
+    sample_fac_rem,
+    select_paths,
+)
 from infer_conus_gnn import (  # noqa: E402
     add_water_flatten_args,
     build_anchors,
@@ -303,11 +308,20 @@ def main() -> None:
     )
     add_water_flatten_args(ap)
     ap.add_argument("--dem", default=DEM)
+    ap.add_argument(
+        "--fac-manifest",
+        default=None,
+        help="FAC-REM raster manifest (default: the arm's fac_rem_manifest.json; "
+        "override only for arms trained before manifests existed)",
+    )
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--oof-check", action="store_true")
     ap.add_argument("--oof-tol-m", type=float, default=1e-3)
     args = ap.parse_args()
     model_dir = Path(args.model_dir)
+    fac_manifest = manifest_for_model(model_dir, args.fac_manifest)
+    fac_entries = load_manifest(fac_manifest)["entries"]
+    log.info("FAC-REM manifest %s: %d rasters", fac_manifest, len(fac_entries))
     models = load_models(model_dir)
     man = models["manifest"]
 
@@ -375,7 +389,12 @@ def main() -> None:
     deep_wte = idw_exclude_at_points(
         pool_co, deep_cross, wells_xy, q_co, qxy, k, p, 0.0
     )
-    fac_dtw = sample_fac_rem(qx, qy)
+    fac_paths = select_paths(
+        fac_entries,
+        bounds=(float(qx.min()), float(qy.min()), float(qx.max()), float(qy.max())),
+        strict=True,
+    )
+    fac_dtw = sample_fac_rem(qx, qy, fac_paths)
     # screened-water treatment (bundle-driven), same hook and same order as the
     # renderer: flatten FAC and pin R on the mask before base/anchors are formed.
     v3_cols, fac_dtw, r_wte, _on_water_v3 = water_v3_inference_block(

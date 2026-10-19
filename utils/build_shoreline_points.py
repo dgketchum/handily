@@ -228,16 +228,17 @@ def state_candidates(shp: Path) -> tuple[pd.DataFrame, dict]:
     return pd.DataFrame({"x5070": land[:, 0], "y5070": land[:, 1]}), meta
 
 
-def finiteness_screen(df: pd.DataFrame) -> pd.DataFrame:
+def finiteness_screen(df: pd.DataFrame, fac_reg: list[str]) -> pd.DataFrame:
     """Keep rows finite on fac_rem, DEM z_surf, and the all-finite relief/terrain cols.
 
-    Reuses the EXACT builder samplers so the injected rows match the bundle's feature
-    finiteness (feat dim stays 46). Adds z_surf (DEM) for the label + audit. Called
-    ONCE globally (sample_fac_rem reopens all 997 registry basins per call).
+    Reuses the EXACT builder samplers (``fac_reg`` = the bundle's FAC-REM manifest
+    paths) so the injected rows match the bundle's feature finiteness (feat dim
+    stays 46). Adds z_surf (DEM) for the label + audit. Called ONCE globally
+    (sample_fac_rem reopens every manifest raster per call).
     """
     x = df["x5070"].to_numpy("float64")
     y = df["y5070"].to_numpy("float64")
-    fac = bcg.sample_fac_rem(x, y)
+    fac = bcg.sample_fac_rem(x, y, fac_reg)
     zsurf = bcg.sample_coarse(bcg.DEM, x, y)
     keep = np.isfinite(fac) & np.isfinite(zsurf)
     x, y, zsurf = x[keep], y[keep], zsurf[keep]
@@ -427,7 +428,11 @@ def main() -> None:
     allc = allc[d <= DOSE_MAX_WELL_KM * 1000.0].reset_index(drop=True)
     log.info("after within-%gkm-of-well: %d", DOSE_MAX_WELL_KM, len(allc))
     # finiteness screen (fac_rem + DEM + relief/terrain; adds z_surf) -- ONCE
-    allc = finiteness_screen(allc)
+    fac_reg = bcg.select_paths(
+        bcg.load_manifest(Path(args.bundle) / bcg.MANIFEST_NAME)["entries"],
+        strict=True,
+    )
+    allc = finiteness_screen(allc, fac_reg)
     log.info("after finiteness screen (feat dim stays 46): %d", len(allc))
     # dose 2: per-HUC8 cap (seeded)
     rng = np.random.RandomState(SEED)

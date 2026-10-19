@@ -135,10 +135,10 @@ from build_source_edges import EDGE_COLS as SOURCE_EDGE_COLS  # noqa: E402
 from build_water_mask_v3 import RAMP_FACTOR, water_flatten_factor  # noqa: E402
 from build_stacker_features import sample_coarse  # noqa: E402
 from fac_rem_registry import (  # noqa: E402
-    FAC_PIN,
-    FAC_RECIPE,
-    FAC_REM_REGISTRY,
+    load_manifest,
+    manifest_for_model,
     sample_fac_rem,
+    select_paths,
 )
 from train_conus_gnn import _fac_feat, prune_reach_graph, sigma_to_m  # noqa: E402
 from train_wte_gnn import WTEGraphNet, apply_stats, fit_stats  # noqa: E402
@@ -1566,7 +1566,26 @@ def infer_basin(
             p,
             args.deep_exclude_km * 1000.0,
         )
-    fac_dtw = sample_fac_rem(qx, qy)
+    # FAC-REM from the arm's manifest: only the rasters touching this lattice window,
+    # each required present with the recorded size (train/serve parity across machines)
+    fac_paths = select_paths(
+        args.fac_entries,
+        bounds=(
+            transform.c,
+            transform.f - height * RES,
+            transform.c + width * RES,
+            transform.f,
+        ),
+        strict=True,
+    )
+    fac_basins_used = [args.fac_basin_of[p] for p in fac_paths]
+    log.info(
+        "%s: FAC-REM from %d manifest rasters: %s",
+        basin,
+        len(fac_paths),
+        fac_basins_used,
+    )
+    fac_dtw = sample_fac_rem(qx, qy, fac_paths)
     # screened-water treatment (bundle-driven): flatten FAC and pin R on the mask
     # BEFORE the base residual and the gate's FAC anchor are formed, so the
     # lattice sees exactly what the water pseudo-rows saw in training.
@@ -1917,9 +1936,10 @@ def infer_basin(
                 "pct_clamped": n_clamped / n,
                 "pct_clamped_note": "fraction (0-1) of lattice cells clamped",
                 "coarse_surface": str(args.coarse_surface),
-                "fac_recipe": FAC_RECIPE,
-                "fac_registry_pin": FAC_PIN,
-                "fac_registry_n": len(FAC_REM_REGISTRY),
+                "fac_recipe": args.fac_recipe,
+                "fac_rem_manifest": str(args.fac_manifest_path),
+                "fac_rem_manifest_n": len(args.fac_entries),
+                "fac_rasters_used": fac_basins_used,
                 "water_zero_output": water_zero,
                 "mixture_identity_tol_m": MIX_TOL_M,
                 "r_source": args.r_source,
@@ -2004,6 +2024,13 @@ def main() -> None:
         "--overwrite", action="store_true", help="re-run basins with existing output"
     )
     ap.add_argument(
+        "--fac-manifest",
+        default=None,
+        help="FAC-REM raster manifest to source fac_rem_dtw_m from (default: the one "
+        "the arm carries, <model-dir>/fac_rem_manifest.json; override only for arms "
+        "trained before manifests existed)",
+    )
+    ap.add_argument(
         "--dd-dist-floor-m",
         type=float,
         default=1.0,
@@ -2080,6 +2107,18 @@ def main() -> None:
     args = ap.parse_args()
     args.model_dir = Path(args.model_dir)
     args.model_name = args.out_name or args.model_dir.name
+    args.fac_manifest_path = manifest_for_model(args.model_dir, args.fac_manifest)
+    fac_doc = load_manifest(args.fac_manifest_path)
+    args.fac_entries = fac_doc["entries"]
+    args.fac_recipe = fac_doc["recipe"]
+    args.fac_basin_of = {e["path"]: e["basin"] for e in args.fac_entries}
+    log.info(
+        "FAC-REM manifest %s: %d rasters, recipe %s (fallback %s)",
+        args.fac_manifest_path,
+        len(args.fac_entries),
+        args.fac_recipe,
+        fac_doc.get("fallback_recipe"),
+    )
     models = load_models(args.model_dir)
     man = models["manifest"]
     f_mae, writeback = ckpt_extensions(models["folds"][0])

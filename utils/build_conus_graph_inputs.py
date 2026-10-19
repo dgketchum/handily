@@ -62,7 +62,15 @@ from build_stacker_features import (  # noqa: E402
 )
 from build_dupuit_wte import build_boundaries, hang_interp  # noqa: E402
 from build_water_mask_v3 import sample_water_mask as sample_water_mask_v3  # noqa: E402
-from fac_rem_registry import sample_fac_rem, sample_str_top2_wte  # noqa: E402
+from fac_rem_registry import (  # noqa: E402
+    MANIFEST_NAME,
+    discover,
+    load_manifest,
+    sample_fac_rem,
+    sample_str_top2_wte,
+    select_paths,
+    write_manifest,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("build_conus_graph_inputs")
@@ -2400,6 +2408,25 @@ def main() -> None:
         "build fac_rem_wte_m in --target wte mode (only those two cols are read)",
     )
     ap.add_argument(
+        "--fac-recipe",
+        default="scalable",
+        help="FAC-REM product recipe to discover under huc8/ (rem/<b>_<recipe>/); the "
+        "ordered raster list is written to <graph-dir>/fac_rem_manifest.json and "
+        "travels with every arm trained on this bundle",
+    )
+    ap.add_argument(
+        "--fac-fallback-recipe",
+        default=None,
+        help="basins lacking --fac-recipe are listed on this recipe instead (explicit, "
+        "counted in the manifest); default: left out",
+    )
+    ap.add_argument(
+        "--fac-manifest",
+        default=None,
+        help="use this existing FAC-REM manifest instead of discovering (copied into "
+        "the bundle); e.g. the one the reach graph was built from",
+    )
+    ap.add_argument(
         "--require-fac",
         action="store_true",
         help="train where you serve: keep ONLY wells inside FAC-REM raster coverage "
@@ -2826,6 +2853,22 @@ def main() -> None:
     )
     args = ap.parse_args()
     gdir = Path(args.graph_dir)
+    # FAC-REM sourcing is an explicit artefact of the bundle (fac_rem_registry docs):
+    # fix the ordered raster list now, sample every FAC column from it, write it.
+    if args.fac_manifest:
+        fac_doc = load_manifest(args.fac_manifest)
+        fac_entries, fac_recipe = fac_doc["entries"], fac_doc["recipe"]
+        fac_fallback = fac_doc.get("fallback_recipe")
+    else:
+        fac_recipe, fac_fallback = args.fac_recipe, args.fac_fallback_recipe
+        fac_entries = discover(fac_recipe, fallback=fac_fallback)
+    FAC_REG = select_paths(fac_entries, strict=True)
+    log.info(
+        "FAC-REM manifest: %d rasters, recipe %s (fallback %s)",
+        len(FAC_REG),
+        fac_recipe,
+        fac_fallback,
+    )
     if args.evidence_features and args.target != TARGET_WTE_RESIDUAL:
         raise SystemExit(
             "--evidence-features is wired into the wte_residual query bank only; "
@@ -2952,7 +2995,9 @@ def main() -> None:
     # feature, no train/serve footprint mismatch).
     if args.require_fac:
         fac_probe = sample_fac_rem(
-            wells["x5070"].to_numpy("float64"), wells["y5070"].to_numpy("float64")
+            wells["x5070"].to_numpy("float64"),
+            wells["y5070"].to_numpy("float64"),
+            FAC_REG,
         )
         keep = np.isfinite(fac_probe)
         n0 = len(wells)
@@ -3108,7 +3153,7 @@ def main() -> None:
             len(bxy),
             args.water_max_well_dist_km,
         )
-        fac_p = sample_fac_rem(cand[:, 0], cand[:, 1])
+        fac_p = sample_fac_rem(cand[:, 0], cand[:, 1], FAC_REG)
         zs_p = sample_coarse(args.dem, cand[:, 0], cand[:, 1])
         on_footprint = np.isfinite(fac_p) & np.isfinite(zs_p)
         log.info(
@@ -3356,7 +3401,7 @@ def main() -> None:
         # (no shard concat, no lexical-sort precedence); finite for every retained well
         # under --require-fac. Sampled up front because it is either an anomaly feature
         # (str_top2 base) or the residual BASE itself (fac_rem base).
-        fac_dtw = sample_fac_rem(xy[:, 0], xy[:, 1])
+        fac_dtw = sample_fac_rem(xy[:, 0], xy[:, 1], FAC_REG)
         wells["fac_rem_dtw_orig_m"] = fac_dtw.copy()  # pre-flatten, diagnostics only
         # --water-v3-flatten: hydro-flatten the FAC prior on screened surface water
         # BEFORE the anomaly is formed, so fac_rem_dtw_m AND fac_rem_wte_anom_m (and
@@ -4822,6 +4867,10 @@ def main() -> None:
         "reach_structural_nan_cols": reach_manifest["reach_structural_nan_cols"],
         "channel_edge_feature_cols": reach_manifest["channel_edge_feature_cols"],
         "query_feature_cols": query_feature_cols,
+        "fac_recipe": fac_recipe,
+        "fac_fallback_recipe": fac_fallback,
+        "fac_rem_manifest": MANIFEST_NAME,
+        "fac_rem_n_rasters": len(FAC_REG),
         "query_diagnostic_cols": QUERY_DIAGNOSTIC_COLS,
         "lateral_edge_feature_cols": LATERAL_EDGE_FEATURE_COLS,
         "relief_etrm_features": bool(args.relief_etrm_features),
@@ -4909,8 +4958,16 @@ def main() -> None:
         "sources": {"hand": args.hand, "geom": args.geom, "reach_graph": str(gdir)},
     }
     (gdir / "graph_manifest.json").write_text(json.dumps(manifest, indent=2))
+    write_manifest(
+        gdir / MANIFEST_NAME,
+        fac_entries,
+        fac_recipe,
+        note=f"written by build_conus_graph_inputs for {gdir.name}",
+        fallback_recipe=fac_fallback,
+    )
     log.info(
-        "wrote query_nodes.parquet, lateral_edges.parquet, graph_manifest.json -> %s",
+        "wrote query_nodes.parquet, lateral_edges.parquet, graph_manifest.json, %s -> %s",
+        MANIFEST_NAME,
         gdir,
     )
 

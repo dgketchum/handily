@@ -101,7 +101,10 @@ def main() -> None:
     )
 
     # --- fac_rem_dtw (require finite -- mirrors the base --require-fac contract) -
-    fac_dtw = B.sample_fac_rem(ax, ay)
+    fac_reg = B.select_paths(
+        B.load_manifest(BUNDLE / B.MANIFEST_NAME)["entries"], strict=True
+    )
+    fac_dtw = B.sample_fac_rem(ax, ay, fac_reg)
     finite_fac = np.isfinite(fac_dtw)
     funnel["dropped_nonfinite_fac_rem"] = int((~finite_fac).sum())
     print(

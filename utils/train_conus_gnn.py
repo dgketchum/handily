@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 from pathlib import Path
 
@@ -659,6 +660,12 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--graph-dir", default="/data/ssd2/handily/conus/wte_gnn/graph")
     p.add_argument("--out-dir", default="/data/ssd2/handily/conus/wte_gnn/gnn")
+    p.add_argument(
+        "--fac-manifest",
+        default=None,
+        help="FAC-REM raster manifest to carry into the arm (default: the bundle's "
+        "fac_rem_manifest.json; required so inference sources FAC from the same list)",
+    )
     p.add_argument("--hidden", type=int, default=48)
     p.add_argument("--channel-layers", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.1)
@@ -1200,6 +1207,28 @@ def main() -> None:
     gdir = Path(args.graph_dir)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # the arm carries the bundle's FAC-REM raster list; infer/render read it there
+    from fac_rem_registry import MANIFEST_NAME, load_manifest, manifest_for_bundle
+
+    fac_manifest_src = (
+        Path(args.fac_manifest) if args.fac_manifest else manifest_for_bundle(gdir)
+    )
+    if not fac_manifest_src.is_file():
+        raise SystemExit(
+            f"{gdir.name} carries no {MANIFEST_NAME}: bundles built before 2026-10-18 "
+            "need one written first (utils/write_fac_manifest.py --recipe scalable "
+            f"--legacy-pilots --out {gdir / MANIFEST_NAME}) or pass --fac-manifest"
+        )
+    fac_manifest_doc = load_manifest(fac_manifest_src)
+    if fac_manifest_src.resolve() != (out_dir / MANIFEST_NAME).resolve():
+        shutil.copyfile(fac_manifest_src, out_dir / MANIFEST_NAME)
+    log.info(
+        "FAC-REM manifest %s -> %s (%d rasters, recipe %s)",
+        fac_manifest_src,
+        out_dir / MANIFEST_NAME,
+        fac_manifest_doc["n"],
+        fac_manifest_doc["recipe"],
+    )
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     rng = np.random.RandomState(args.seed)
@@ -3439,6 +3468,9 @@ def main() -> None:
 
     run = {
         "graph_dir": str(gdir),
+        "fac_rem_manifest": str(fac_manifest_src),
+        "fac_recipe": fac_manifest_doc["recipe"],
+        "fac_rem_n_rasters": fac_manifest_doc["n"],
         "device": device,
         "torch": torch.__version__,
         "hyperparams": vars(args),

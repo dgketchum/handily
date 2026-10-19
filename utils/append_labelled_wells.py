@@ -40,6 +40,12 @@ from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_conus_graph_inputs as B  # noqa: E402
+from fac_rem_registry import (  # noqa: E402
+    MANIFEST_NAME,
+    load_manifest,
+    manifest_for_bundle,
+    select_paths,
+)
 
 DEM = B.DEM
 GEOM = "/data/ssd2/handily/conus/wte_gnn/fac_flowline_geom_conus.parquet"
@@ -51,6 +57,7 @@ SYMLINK = [
     "channel_edges.parquet",
     "permanent_water_blocks.parquet",
     "reach_graph_manifest.json",
+    MANIFEST_NAME,
 ]
 BLOCK_SIZE_M = 40000.0
 DD_SELF_EXCLUDE_M = 100.0
@@ -105,6 +112,10 @@ def main() -> None:
     out_dir = Path(args.out_bundle)
     out_dir.mkdir(parents=True, exist_ok=True)
     man = json.loads((bundle / "graph_manifest.json").read_text())
+    # appended rows sample FAC from the SAME raster list the base bundle was built on
+    fac_reg = select_paths(
+        load_manifest(manifest_for_bundle(bundle))["entries"], strict=True
+    )
     idw_k, idw_p, vw = man["idw_k"], man["idw_power"], man["r_relief_vw"]
     dd = man["deep_datum"]
     dh = man["dupuit_hang"]
@@ -152,7 +163,7 @@ def main() -> None:
     fz = np.isfinite(az)
     funnel["dropped_nonfinite_z_surf"] = int((~fz).sum())
     ax, ay, a_dtw, az = ax[fz], ay[fz], a_dtw[fz], az[fz]
-    fac_dtw = B.sample_fac_rem(ax, ay)
+    fac_dtw = B.sample_fac_rem(ax, ay, fac_reg)
     ff = np.isfinite(fac_dtw)
     funnel["dropped_nonfinite_fac_rem"] = int((~ff).sum())
     ax, ay, a_dtw, az, fac_dtw = ax[ff], ay[ff], a_dtw[ff], az[ff], fac_dtw[ff]

@@ -330,11 +330,20 @@ def main() -> None:
         "fragmented FAC channel network; the rest stay structural-NaN.",
     )
     ap.add_argument("--conductance-p", type=float, default=0.5)
+    ap.add_argument(
+        "--fac-manifest",
+        required=True,
+        help="FAC-REM raster manifest (utils/write_fac_manifest.py); the reach graph "
+        "is built from the channel networks beside exactly these rasters, and the "
+        "same manifest should feed build_conus_graph_inputs --fac-manifest",
+    )
     args = ap.parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    registry = fac_rem_registry.existing_registry()
+    registry = fac_rem_registry.select_paths(
+        fac_rem_registry.load_manifest(args.fac_manifest)["entries"], strict=True
+    )
     basins = [_basin_of(p) for p in registry]
     log.info("loading %d FAC basins: %s", len(basins), basins)
     df = load_reaches(registry)

@@ -56,7 +56,11 @@ from rasterio.warp import Resampling, reproject
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_water_mask_v3 import water_flatten_factor  # noqa: E402
-from fac_rem_registry import existing_registry  # noqa: E402
+from fac_rem_registry import (  # noqa: E402
+    load_manifest,
+    manifest_for_model,
+    select_paths,
+)
 from infer_conus_gnn import (  # noqa: E402
     HUC8_ROOT,
     RES,
@@ -106,24 +110,23 @@ def warp_band(
     return dst
 
 
-def composite_fac(transform, width: int, height: int) -> np.ndarray:
-    """FAC-REM depth on the master window: registry precedence, first finite wins.
+def composite_fac(
+    transform, width: int, height: int, fac_entries: list[dict]
+) -> np.ndarray:
+    """FAC-REM depth on the master window: manifest precedence, first finite wins.
 
-    Same sourcing contract as ``sample_fac_rem`` at the training wells (named
-    pilots first, then sorted HUC8s), so the fine expert matches what the coarse
-    gate conditioned on. NEAREST resampling: the strip-fill footprint is sparse
-    and bilinear against NaN would erode channel edges.
+    Same sourcing contract as ``sample_fac_rem`` at the training wells (the arm's
+    ``fac_rem_manifest.json``, list order), so the fine expert matches what the
+    coarse gate conditioned on. NEAREST resampling: the strip-fill footprint is
+    sparse and bilinear against NaN would erode channel edges.
     """
     left = transform.c
     top = transform.f
     right = left + width * RES10
     bottom = top - height * RES10
     out = np.full((height, width), np.nan, dtype="float32")
-    for path in existing_registry(None):
-        with rasterio.open(path) as src:
-            b = src.bounds
-        if b.left >= right or b.right <= left or b.bottom >= top or b.top <= bottom:
-            continue
+    paths = select_paths(fac_entries, bounds=(left, bottom, right, top), strict=True)
+    for path in paths:
         need = ~np.isfinite(out)
         if not need.any():
             break
@@ -164,7 +167,11 @@ def recompose(
 
 
 def render_basin(
-    basin: str, man: dict, model_name: str, write_dem: bool = False
+    basin: str,
+    man: dict,
+    model_name: str,
+    fac_entries: list[dict],
+    write_dem: bool = False,
 ) -> None:
     gdirb = HUC8_ROOT / basin / "gnn" / model_name
     coarse_wte = gdirb / "gnn_wte_100m.tif"
@@ -183,7 +190,7 @@ def render_basin(
         height,
         Resampling.bilinear,
     )
-    fac10 = composite_fac(transform, width, height)
+    fac10 = composite_fac(transform, width, height, fac_entries)
     up = lambda p, band=1: warp_band(  # noqa: E731
         p, band, transform, width, height, Resampling.bilinear
     )
@@ -316,15 +323,20 @@ def render_basin(
     log.info("%s: wrote %d 10 m layers -> %s", basin, len(layers), gdirb)
 
 
-def build_mosaic(basins: list[str], model_name: str, state: str, out_root: Path):
-    """Per-state VRTs over the per-basin 10 m COGs, registry-precedence overlap.
+def build_mosaic(
+    basins: list[str],
+    model_name: str,
+    state: str,
+    out_root: Path,
+    fac_entries: list[dict],
+):
+    """Per-state VRTs over the per-basin 10 m COGs, manifest-precedence overlap.
 
     gdalbuildvrt paints later-listed sources on top, so the list is ordered
-    LOWEST precedence first -- the highest-precedence basin (named pilots, per
-    ``existing_registry``) wins overlaps, matching sample_fac_rem's
-    first-finite-wins.
+    LOWEST precedence first -- the basin listed first in the arm's FAC-REM
+    manifest wins overlaps, matching sample_fac_rem's first-finite-wins.
     """
-    precedence = [Path(p).parents[1].name for p in existing_registry(None)]
+    precedence = [e["basin"] for e in fac_entries]
     rank = {b: i for i, b in enumerate(precedence)}
     ordered = sorted(basins, key=lambda b: rank.get(b, len(rank)), reverse=True)
     out_dir = out_root / "mosaics" / model_name
@@ -368,16 +380,25 @@ def main() -> None:
         action="store_true",
         help="also write gnn_dem_10m.tif (aligned 3DEP DEM) for a downstream hillshade",
     )
+    ap.add_argument(
+        "--fac-manifest",
+        default=None,
+        help="FAC-REM raster manifest (default: the arm's fac_rem_manifest.json; "
+        "override only for arms trained before manifests existed)",
+    )
     args = ap.parse_args()
     model_dir = Path(args.model_dir)
     model_name = args.out_name or model_dir.name
     man = json.loads((model_dir / "models" / "inference_manifest.json").read_text())
+    fac_manifest = manifest_for_model(model_dir, args.fac_manifest)
+    fac_entries = load_manifest(fac_manifest)["entries"]
+    log.info("FAC-REM manifest %s: %d rasters", fac_manifest, len(fac_entries))
     if not args.basins and not args.state:
         raise SystemExit("pass --basins or --state")
     basins = args.basins or nm_basins(args.state)
 
     if args.mosaic:
-        build_mosaic(basins, model_name, args.state or "custom", HUC8_ROOT)
+        build_mosaic(basins, model_name, args.state or "custom", HUC8_ROOT, fac_entries)
         return
     done = skipped = 0
     for b in basins:
@@ -385,7 +406,7 @@ def main() -> None:
         if not args.overwrite and out.exists():
             skipped += 1
             continue
-        render_basin(b, man, model_name, write_dem=args.write_dem)
+        render_basin(b, man, model_name, fac_entries, write_dem=args.write_dem)
         done += 1
     log.info("render complete: %d basins, %d skipped (existing)", done, skipped)
 

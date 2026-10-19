@@ -15,9 +15,11 @@ file it does not change), rewrites ``query_nodes.parquet`` and edits
    pool).
 2. **Ground cap.** R := min(R, z_surf - cap) on EVERY row (water pseudo-rows
    included; this bundle has no water-v3 pins). Mirrors ``--r-ground-cap-m``.
-3. **FAC recipe.** ``fac_rem_dtw_m`` resampled under the current
-   ``HANDILY_FAC_RECIPE`` (set the env var before running; recorded in the
-   manifest). Rows outside the rebuilt basins must come back unchanged.
+3. **FAC recipe.** ``fac_rem_dtw_m`` resampled from an explicit FAC-REM raster
+   list (``--fac-recipe`` [+ ``--fac-fallback-recipe``] discovered on disk, or
+   ``--fac-manifest``); the list is written to the out bundle as
+   ``fac_rem_manifest.json`` and the trainer carries it into the arm. Rows
+   outside ``--fac-basins`` are expected unchanged and reported.
 4. **Drilled-depth floor.** ``drilled_depth_idw_m``/``_p90_m`` rebuilt with the
    same 100 m self-exclusion guard plus ``--dd-dist-floor-m`` (render passes the
    same floor). The 1 m construction is first re-run and must reproduce the
@@ -64,11 +66,27 @@ def parse() -> argparse.Namespace:
         "to parity-check the recomputed lattice R against",
     )
     ap.add_argument("--r-ground-cap-m", type=float, default=None)
-    ap.add_argument("--resample-fac", action="store_true")
+    ap.add_argument(
+        "--fac-recipe",
+        default=None,
+        help="resample fac_rem_dtw_m from the rasters of this recipe (discovered under "
+        "huc8/); writes fac_rem_manifest.json into the out bundle",
+    )
+    ap.add_argument(
+        "--fac-fallback-recipe",
+        default=None,
+        help="with --fac-recipe: basins lacking it are listed on this recipe instead",
+    )
+    ap.add_argument(
+        "--fac-manifest",
+        default=None,
+        help="resample fac_rem_dtw_m from this existing manifest instead of discovering",
+    )
     ap.add_argument(
         "--fac-basins",
         default=None,
-        help="text file of HUC8s whose FAC may change; rows outside must be unchanged",
+        help="text file of HUC8s whose FAC is expected to change; changes outside are "
+        "reported per basin (report only)",
     )
     ap.add_argument("--dd-dist-floor-m", type=float, default=None)
     ap.add_argument("--drop-feature", action="append", default=[])
@@ -89,10 +107,21 @@ def _stats(d: np.ndarray) -> str:
 
 def main() -> None:
     args = parse()
-    # registry is built at import: the recipe env var must already be set
     from build_conus_graph_inputs import _relief_coords, sample_drilled_depth
-    from fac_rem_registry import FAC_RECIPE, sample_fac_rem
+    from fac_rem_registry import (
+        MANIFEST_NAME,
+        count_by_recipe,
+        discover,
+        load_manifest,
+        sample_fac_rem,
+        select_paths,
+        write_manifest,
+    )
     from infer_conus_gnn import cap_r_ground, idw_exclude_at_points, well_pool
+
+    if args.fac_recipe and args.fac_manifest:
+        raise SystemExit("pass --fac-recipe or --fac-manifest, not both")
+    resample_fac = bool(args.fac_recipe or args.fac_manifest)
 
     base = Path(args.base_bundle)
     out = Path(args.out_bundle)
@@ -216,8 +245,19 @@ def main() -> None:
         }
 
     # --- 3. FAC recipe ---------------------------------------------------------------
-    if args.resample_fac:
-        fac_new = sample_fac_rem(xy[:, 0], xy[:, 1])
+    if resample_fac:
+        if args.fac_manifest:
+            fac_doc = load_manifest(args.fac_manifest)
+            fac_entries, fac_recipe = fac_doc["entries"], fac_doc["recipe"]
+            fac_fallback = fac_doc.get("fallback_recipe")
+        else:
+            fac_recipe, fac_fallback = args.fac_recipe, args.fac_fallback_recipe
+            fac_entries = discover(fac_recipe, fallback=fac_fallback)
+        fac_reg = select_paths(fac_entries, strict=True)
+        print(
+            f"[3] FAC-REM manifest: {len(fac_reg)} rasters {count_by_recipe(fac_entries)}"
+        )
+        fac_new = sample_fac_rem(xy[:, 0], xy[:, 1], fac_reg)
         same = (
             np.isfinite(fac_new)
             & np.isfinite(fac)
@@ -230,21 +270,17 @@ def main() -> None:
             inside = np.ones(n, bool)
         n_out_changed = int((~same & ~inside).sum())
         print(
-            f"[3] FAC recipe {FAC_RECIPE}: {int((~same).sum())} rows changed, {n_out_changed} of them OUTSIDE the allowed basins"
+            f"[3] FAC recipe {fac_recipe}: {int((~same).sum())} rows changed, {n_out_changed} of them OUTSIDE the expected basins"
         )
         if n_out_changed:
-            # a rebuilt basin's raster can overlap a neighbouring basin's edge;
-            # first-finite-wins precedence means the renderer samples the same
-            # value there, so this is parity, not an error -- but it must be rare
+            # a rebuilt basin's raster can overlap a neighbouring basin's edge, and
+            # dropping the legacy pilots re-sources their footprint; the renderer
+            # samples the same manifest, so this is parity -- reported, not fatal
             bad = qn.loc[~same & ~inside, "huc8"].astype(str).value_counts()
             print(
                 "    outside-basin changes by huc8: "
                 + ", ".join(f"{h} {c}" for h, c in bad.items())
             )
-            if n_out_changed > 20:
-                raise SystemExit(
-                    "FAC changed at many rows outside the allowed basins -- investigate"
-                )
         new_nan = ~np.isfinite(fac_new) & np.isfinite(fac)
         new_fin = np.isfinite(fac_new) & ~np.isfinite(fac)
         d = fac_new - fac
@@ -265,7 +301,10 @@ def main() -> None:
                 f"      {grp:13s} n={int(g.sum())} newly NaN {int((new_nan & g).sum())} delta {_stats(d[g])}"
             )
         rewrite["fac"] = {
-            "recipe": FAC_RECIPE,
+            "recipe": fac_recipe,
+            "fallback_recipe": fac_fallback,
+            "n_rasters": len(fac_reg),
+            "n_by_recipe": count_by_recipe(fac_entries),
             "n_changed": int((~same).sum()),
             "n_newly_nan": int(new_nan.sum()),
             "n_newly_finite": int(new_fin.sum()),
@@ -355,14 +394,22 @@ def main() -> None:
     )
     if args.r_ground_cap_m is not None:
         man["r_ground_cap_m"] = float(args.r_ground_cap_m)
-    man["fac_recipe"] = (
-        FAC_RECIPE if args.resample_fac else man.get("fac_recipe", "scalable")
-    )
+    if resample_fac:
+        man["fac_recipe"] = fac_recipe
+        man["fac_fallback_recipe"] = fac_fallback
+        man["fac_rem_manifest"] = MANIFEST_NAME
+        man["fac_rem_n_rasters"] = len(fac_reg)
+    elif not (base / MANIFEST_NAME).exists():
+        raise SystemExit(
+            f"{base.name} carries no {MANIFEST_NAME} and no FAC resample was requested: "
+            "pass --fac-recipe/--fac-manifest so the out bundle carries an explicit "
+            "FAC-REM raster list"
+        )
     rewrite["dropped_features"] = list(args.drop_feature)
     rewrite["render_contract"] = {
         "r_ground_cap_m": args.r_ground_cap_m,
         "dd_dist_floor_m": args.dd_dist_floor_m,
-        "fac_recipe_env": FAC_RECIPE if args.resample_fac else None,
+        "fac_rem_manifest": MANIFEST_NAME,
         "exclude_source_name": app,
     }
     man["parity_rewrite"] = rewrite
@@ -374,12 +421,23 @@ def main() -> None:
         print("dry run: nothing written")
         return
     out.mkdir(parents=True, exist_ok=False)
+    skip = {"query_nodes.parquet", "graph_manifest.json"}
+    if resample_fac:
+        skip.add(MANIFEST_NAME)
     for f in sorted(base.iterdir()):
-        if f.name in ("query_nodes.parquet", "graph_manifest.json"):
+        if f.name in skip:
             continue
         os.symlink(f.resolve(), out / f.name)
     qn.to_parquet(out / "query_nodes.parquet", index=False)
     (out / "graph_manifest.json").write_text(json.dumps(man, indent=2, default=str))
+    if resample_fac:
+        write_manifest(
+            out / MANIFEST_NAME,
+            fac_entries,
+            fac_recipe,
+            note=f"written by build_parity_bundle for {out.name} (base {base.name})",
+            fallback_recipe=fac_fallback,
+        )
     print(f"wrote {out}")
 
 
