@@ -69,6 +69,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import geopandas as gpd
 import pandas as pd
 import rasterio
 from scipy.spatial import cKDTree
@@ -94,6 +95,7 @@ from score_nv_shallow_panel import (  # noqa: E402
 )
 
 HUC8_ROOT = "/data/ssd2/handily/huc8"
+WBD_HU8 = "/nas/hydrography/HUC_Boundaries/wbd_national/wbdhu8_5070.parquet"
 TARGETS = "/data/ssd2/handily/nv/regional/wells/ndwr_admission_targets.parquet"
 SOURCES = "/data/ssd2/handily/nv/regional/wells/ndwr_admitted_sources_frozen.parquet"
 MA_DIR = "/nas/gwx/wtd_states"
@@ -268,6 +270,7 @@ def scan_basins(
         samp[f"{primary}__p_dtw_lt_{t:g}m"] = np.full(n, np.nan)
 
     verify_rows, cell_rows = [], []
+    multi: dict[int, list] = {}
     for basin in basins:
         arrs, profs = {}, {}
         for a in arms:
@@ -300,7 +303,7 @@ def scan_basins(
         row = {
             "basin": basin,
             "n_tifs": len(tif_names),
-            "tifs_complete": tif_names == expect,
+            "tifs_complete": expect <= set(tif_names),
             "manifest": (pdir / "infer_run.json").exists(),
             "gate_bands": "|".join(gate_bands),
             "ordinal_bands": "|".join(profs[primary].get("ordinal_bands", [])),
@@ -395,15 +398,23 @@ def scan_basins(
             idx = idx[ok]
             hits[idx] += 1
             basin_of[idx] = basin
+            vals = {}
             for a in arrs:
                 for k in ("dtw", "sigma", "fold_spread"):
-                    samp[f"{a}__{k}"][idx] = arrs[a][k][r[idx], col[idx]]
+                    vals[f"{a}__{k}"] = arrs[a][k][r[idx], col[idx]]
             for t in (2.0, 5.0, 10.0):
                 key = f"ord_p_dtw_lt_{t:g}m"
                 if key in arrs[primary]:
-                    samp[f"{primary}__p_dtw_lt_{t:g}m"][idx] = arrs[primary][key][
+                    vals[f"{primary}__p_dtw_lt_{t:g}m"] = arrs[primary][key][
                         r[idx], col[idx]
                     ]
+            for k, vv in vals.items():
+                samp[k][idx] = vv
+            # keep every basin's read for sites that turn out to hit >1 raster
+            for j, i in enumerate(idx):
+                multi.setdefault(int(i), []).append(
+                    (basin, {k: float(vv[j]) for k, vv in vals.items()})
+                )
         log(
             f"  {basin}: valid {int(valid.sum())} cells, sites so far {int((hits > 0).sum())}"
         )
@@ -411,10 +422,45 @@ def scan_basins(
     dist = pd.Series(hits).value_counts().sort_index()
     log(f"n_basin_hits distribution: {dist.to_dict()}")
     if (hits > 1).any():
-        raise SystemExit(
-            f"{int((hits > 1).sum())} sites hit more than one basin raster "
-            f"(distribution {dist.to_dict()}) - the sampling join is ambiguous"
+        # adjacent FAC-watershed rasters can overlap by a cell or two at a
+        # divide; resolve each multi-hit site to the WBD HUC8 that contains it
+        amb = np.where(hits > 1)[0]
+        wbd = gpd.read_parquet(WBD_HU8, columns=["huc8", "geometry"])
+        cand = {b for i in amb for b, _ in multi[int(i)]}
+        wbd = wbd[wbd["huc8"].astype(str).isin(cand)].to_crs(5070)
+        pts = gpd.GeoDataFrame(
+            {"i": amb},
+            geometry=gpd.points_from_xy(x[amb], y[amb]),
+            crs=5070,
         )
+        own = gpd.sjoin(pts, wbd, predicate="within", how="left")
+        own = own.groupby("i")["huc8"].agg(
+            lambda v: sorted(set(v.dropna().astype(str)))
+        )
+        unresolved = []
+        for i in amb:
+            reads = dict(multi[int(i)])
+            pick = [b for b in own.get(int(i), []) if b in reads]
+            if len(pick) != 1:
+                unresolved.append(int(i))
+                continue
+            basin_of[i] = pick[0]
+            for k, vv in reads[pick[0]].items():
+                samp[k][i] = vv
+            hits[i] = 1
+        pairs = pd.Series(
+            [" + ".join(sorted(b for b, _ in multi[int(i)])) for i in amb]
+        ).value_counts()
+        log(
+            f"{len(amb)} sites hit more than one basin raster; resolved by WBD "
+            f"containment to one basin each (overlap pairs: {pairs.to_dict()})"
+        )
+        if unresolved:
+            raise SystemExit(
+                f"{len(unresolved)} sites hit more than one basin raster and no "
+                f"single WBD HUC8 among the hits contains them - the sampling "
+                f"join is ambiguous"
+            )
     unsampled = sites[hits == 0].copy()
     if len(unsampled):
         # a site inside the basin polygon whose 100 m cell is nodata (basin-edge
