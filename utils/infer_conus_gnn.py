@@ -7,8 +7,10 @@ to the canonical CONUS origin), replays the trainer's exact standardization /
 anchor / forward contract for all folds, and writes the fold-median coarse
 rasters under ``/data/ssd2/handily/huc8/{basin}/gnn/{model_name}/``:
 
-  gnn_wte_100m.tif        fold-median recomposed WTE (m absolute head)
-  gnn_dtw_100m.tif        z_surf - WTE (unclamped; %% negative logged)
+  gnn_wte_100m.tif        fold-median recomposed WTE (m absolute head),
+                          lowered to z_surf where the mixture sat above ground
+  gnn_dtw_100m.tif        z_surf - WTE, clamped at >= 0 m (the pre-clamp
+                          negative share is logged and kept in infer_run.json)
   gnn_sigma_100m.tif      fold-median Laplace scale b (m)
   gnn_gate_w_100m.tif     mean gate weights (bands = manifest gate_experts)
   gnn_p_dtw_lt_100m.tif   (--ordinal-head arms only) P(DTW < t) per class
@@ -70,6 +72,21 @@ none, and the retrain that baked the treatment into training was NO-GO --
 notes/WATER_V3_EVAL.md); it moves the FAC input only, never R.
 ``--water-flatten-ramp`` additionally halves FAC on off-mask cells touching the
 mask, tapering the one-cell shoreline step the hard flatten leaves.
+``--water-flatten-mask`` picks the mask raster (V3 default; V4 = V3 + NHD
+lake / reservoir / marsh polygons, utils/build_water_mask_v4.py).
+``--water-zero-output`` (reserve step, OFF by default) zeroes the OUTPUT DTW
+on that mask after the mixture (ramp ring halved with --water-flatten-ramp);
+render_gnn_10m.py replays it from infer_run.json.
+
+``--coarse-surface`` overrides the reference surface of the query feature
+``elev_above_coarse_m = z_surf - coarse`` (renderer only; the bundle keeps the
+2 km block raster it was built with). Default = the 2 km moving-window mean on
+the 100 m lattice (utils/build_coarse_surface_mw2km.py), which removes the 2 km
+block steps the block raster prints into flat valley floors.
+
+Non-negative guard: after the gate mixture DTW is clamped at >= 0 m and WTE set
+to z_surf - DTW so the written layers agree (``clamp_dtw_nonneg``; no other
+clamp). ``pct_negative_dtw`` in infer_run.json stays the PRE-clamp fraction.
 
 Usage:
     uv run python utils/infer_conus_gnn.py \
@@ -117,7 +134,12 @@ from build_dupuit_wte import build_boundaries, hang_interp  # noqa: E402
 from build_source_edges import EDGE_COLS as SOURCE_EDGE_COLS  # noqa: E402
 from build_water_mask_v3 import RAMP_FACTOR, water_flatten_factor  # noqa: E402
 from build_stacker_features import sample_coarse  # noqa: E402
-from fac_rem_registry import sample_fac_rem  # noqa: E402
+from fac_rem_registry import (  # noqa: E402
+    FAC_PIN,
+    FAC_RECIPE,
+    FAC_REM_REGISTRY,
+    sample_fac_rem,
+)
 from train_conus_gnn import _fac_feat, prune_reach_graph, sigma_to_m  # noqa: E402
 from train_wte_gnn import WTEGraphNet, apply_stats, fit_stats  # noqa: E402
 
@@ -125,6 +147,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("infer_conus_gnn")
 
 HUC8_ROOT = Path("/data/ssd2/handily/huc8")
+COARSE_SURFACE_MW2KM = (
+    "/data/ssd2/handily/conus/hydrography90m/coarse_surface_mw2km_100m.tif"
+)
+CLAMP_DTW_MIN_M = 0.0
 WBD_HU8 = "/nas/hydrography/HUC_Boundaries/wbd_national/wbdhu8_5070.parquet"
 # canonical CONUS 100 m lattice origin (GNN_INFERENCE_10M_PLAN.md section 0)
 X0, Y0 = -2_540_000.0, 3_258_000.0
@@ -237,6 +263,73 @@ def idw_exclude_at_points(
                 break
             kk = min(n_pool, kk * 2)
     return out
+
+
+def clamp_dtw_nonneg(
+    surface: np.ndarray, wte: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Non-negative DTW guard: ``(dtw, wte, n_clamped)`` with dtw >= 0 m.
+
+    Where the mixture WTE sits above the land surface (DTW < 0) the WTE is
+    lowered to the surface, so ``dtw == surface - wte`` still holds for the
+    written pair. NaN cells stay NaN and are not counted. Shared by the 100 m
+    renderer and the 10 m recomposition (render_gnn_10m.py) so both apply the
+    identical guard.
+    """
+    dtw = surface - wte
+    neg = dtw < CLAMP_DTW_MIN_M
+    wte_c = np.where(neg, surface - CLAMP_DTW_MIN_M, wte)
+    return surface - wte_c, wte_c, int(neg.sum())
+
+
+def cap_r_ground(
+    r_wte: np.ndarray, z_surf: np.ndarray, cap_m: float, keep: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """R ground cap (``--r-ground-cap-m``): ``(r_capped, bound)``.
+
+    The base R (archived crossfit WTE interpolated onto the lattice) sits ABOVE
+    the land surface at ~17 % of CONUS monitoring wells and ~30 % of NV NDWR
+    labels (notes/NV_FIX_ROUND_2_PLAN_2026-10-07.md, item 2), so z_surf - R is
+    a negative DTW the head then has to undo. The cap lowers R to
+    ``z_surf - cap_m`` wherever it is higher and leaves it alone elsewhere; it
+    is well-free and leak-free (ground only). ``keep`` exempts cells (the water
+    V3 pin ``R := z_surf``). NaN R stays NaN and does not count as bound.
+    """
+    lim = z_surf - float(cap_m)
+    bound = np.isfinite(r_wte) & np.isfinite(lim) & (r_wte > lim)
+    if keep is not None:
+        bound &= ~np.asarray(keep, bool)
+    return np.where(bound, lim, r_wte), bound
+
+
+def reframe_source_resid(
+    resid: np.ndarray, r_src: np.ndarray, z_src: np.ndarray, cap_m: float
+) -> np.ndarray:
+    """Source residuals in the capped R frame (``--r-ground-cap-m``).
+
+    A source edge carries ``wte_obs - R_at_well``; the observed WTE is frame
+    invariant, so when the lattice R is capped the well-side R must be capped
+    the same way or the residual the model reads is in a different frame from
+    the residual it predicts. ``resid' = wte_obs - min(R, z - cap)`` =
+    ``resid + max(0, R - (z - cap))``. Non-finite R or z leaves resid as is.
+    """
+    shift = np.asarray(r_src, "float64") - (np.asarray(z_src, "float64") - float(cap_m))
+    shift = np.where(np.isfinite(shift), np.maximum(shift, 0.0), 0.0)
+    return np.asarray(resid, "float64") + shift
+
+
+def apply_water_zero(
+    surface: np.ndarray, dtw: np.ndarray, factor: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Output-side water zeroing (``--water-zero-output``): ``(dtw, wte)``.
+
+    ``factor`` is ``water_flatten_factor`` at the same cells: 0 on the mask
+    (DTW := 0), ``RAMP_FACTOR`` on the one-cell shoreline ramp (DTW halved), 1
+    elsewhere (untouched). WTE is re-derived as ``surface - dtw`` so the written
+    pair agrees. Applied after the mixture and the non-negative clamp.
+    """
+    dtw_z = dtw * factor
+    return dtw_z, surface - dtw_z
 
 
 def snapped_window(bounds: tuple, res: float) -> tuple:
@@ -431,7 +524,8 @@ def load_extra_sources(
     exy = extra[["x5070", "y5070"]].to_numpy("float64")
     elat = build_lateral_edges(exy, geom, None, 1)
     basin_of_reach = rn_full.set_index("reach_node_idx")["basin"]
-    extra = extra[need].copy()
+    keep_cols = need + [c for c in ("r_wte_m",) if c in extra.columns]
+    extra = extra[keep_cols].copy()
     extra["basin"] = (
         elat[elat["is_controlling"].astype(bool)]
         .drop_duplicates("query_node_idx")
@@ -514,6 +608,7 @@ def deployment_source_ctx(
     exclude_m: float = 0.0,
     extra: pd.DataFrame | None = None,
     exclude_sources: tuple[str, ...] = (),
+    r_ground_cap_m: float | None = None,
 ) -> dict:
     """Deployment source context for query points OUTSIDE the bundle.
 
@@ -588,6 +683,14 @@ def deployment_source_ctx(
     )
     src_basin = w["query_node_idx"].map(bctrl).map(basin_of_reach)
     resid = w["wte_residual_m"].to_numpy("float64")
+    if r_ground_cap_m is not None:
+        # bundle wells: archived crossfit R + well z, same frame as the lattice
+        resid = reframe_source_resid(
+            resid,
+            w["regional_wte_idw_oof_m"].to_numpy("float64"),
+            w["z_surf_well_m"].to_numpy("float64"),
+            r_ground_cap_m,
+        )
     n_extra = 0
     if extra is not None and len(extra):
         n_extra = len(extra)
@@ -595,7 +698,20 @@ def deployment_source_ctx(
         wz = np.concatenate(
             [wz, np.nan_to_num(extra["z_surf_m"].to_numpy("float64"), nan=0.0)]
         )
-        resid = np.concatenate([resid, extra["wte_residual_m"].to_numpy("float64")])
+        extra_resid = extra["wte_residual_m"].to_numpy("float64")
+        if r_ground_cap_m is not None:
+            if "r_wte_m" not in extra.columns:
+                raise SystemExit(
+                    "--r-ground-cap-m with --extra-sources needs r_wte_m (the R the "
+                    "frozen wte_residual_m is relative to) in the sources table"
+                )
+            extra_resid = reframe_source_resid(
+                extra_resid,
+                extra["r_wte_m"].to_numpy("float64"),
+                extra["z_surf_m"].to_numpy("float64"),
+                r_ground_cap_m,
+            )
+        resid = np.concatenate([resid, extra_resid])
         src_basin = pd.concat(
             [src_basin.reset_index(drop=True), extra["basin"].reset_index(drop=True)],
             ignore_index=True,
@@ -1181,7 +1297,17 @@ def add_water_flatten_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "--water-flatten-mask",
         default=WATER_V3_MASK_TIF,
-        help="V3 verified-water mask raster backing --water-flatten-inference",
+        help="verified-water mask raster backing --water-flatten-inference and "
+        "--water-zero-output (V3 default; V4 = build_water_mask_v4.py)",
+    )
+    ap.add_argument(
+        "--water-zero-output",
+        action="store_true",
+        help="reserve step (NV fix round, item F): after the mixture and the "
+        "non-negative clamp set DTW = 0 on --water-flatten-mask cells (WTE = "
+        "z_surf); with --water-flatten-ramp the one-cell shoreline ring gets DTW "
+        "x 0.5. Recorded in infer_run.json; render_gnn_10m.py replays it. OFF by "
+        "default",
     )
 
 
@@ -1450,6 +1576,36 @@ def infer_basin(
     # renderer-side flatten (--water-flatten-inference), frozen weights: same
     # single fac_dtw feeds the query feature and the FAC anchor below.
     fac_dtw, water_flatten = water_flatten_override(args, qxy, fac_dtw)
+    r_cap = None
+    if args.r_ground_cap_m is not None:
+        # renderer-side R ground cap, frozen weights (round-2 item 2): the ONE
+        # r_wte below feeds the base residual, every anchor and the written
+        # gnn_r_wte_100m layer; source residuals are reframed to match in
+        # deployment_source_ctx. Water V3 pinned cells keep R := z_surf.
+        r_pre = r_wte
+        r_wte, r_bound = cap_r_ground(
+            r_wte, z_surf, float(args.r_ground_cap_m), keep=_on_water_v3
+        )
+        r_cap = {
+            "cap_m": float(args.r_ground_cap_m),
+            "n_bound": int(r_bound.sum()),
+            "pct_bound": float(r_bound.mean()),
+            "median_lowering_m": (
+                float(np.median(r_pre[r_bound] - r_wte[r_bound]))
+                if r_bound.any()
+                else 0.0
+            ),
+            "note": "R lowered to z_surf - cap_m where above it; source "
+            "residuals reframed to the capped R at the well",
+        }
+        log.info(
+            "%s: R ground cap %.1f m bound %d/%d cells (%.1f%%)",
+            basin,
+            float(args.r_ground_cap_m),
+            r_cap["n_bound"],
+            n,
+            100 * r_cap["pct_bound"],
+        )
     base = z_surf - r_wte
     anchors_all = build_anchors(
         base,
@@ -1475,8 +1631,14 @@ def infer_basin(
             "fac_rem_dtw_m": fac_dtw,
         }
     )
+    relief = sample_relief_etrm(qx, qy, z_surf)
+    # renderer-side reference surface for elev_above_coarse_m (the bank's
+    # constant is the 2 km block raster; the bundle is not rebuilt).
+    relief["elev_above_coarse_m"] = z_surf - sample_coarse(
+        str(args.coarse_surface), qx, qy
+    )
     for d_cov in (
-        sample_relief_etrm(qx, qy, z_surf),
+        relief,
         sample_terrain_multiscale(qx, qy),
         sample_gridmet(qx, qy),
     ):
@@ -1567,6 +1729,7 @@ def infer_basin(
             exclude_m=float(args.source_exclude_m),
             extra=extra_sources,
             exclude_sources=tuple(args.exclude_source_name),
+            r_ground_cap_m=args.r_ground_cap_m,
         )
         src_dst = src_ctx["edges"]["ei"][1]
 
@@ -1647,12 +1810,34 @@ def infer_basin(
 
     dtw = z_surf - agg["wte"]
     neg = float((dtw < 0).mean())
+    dtw, agg["wte"], n_clamped = clamp_dtw_nonneg(z_surf, agg["wte"])
     log.info(
-        "%s: DTW median %.2f m, %.1f%% negative (predicted artesian/inundation)",
+        "%s: DTW median %.2f m, %.1f%% negative pre-clamp (%d cells clamped to %g m)",
         basin,
         float(np.median(dtw)),
         100 * neg,
+        n_clamped,
+        CLAMP_DTW_MIN_M,
     )
+    water_zero = None
+    if getattr(args, "water_zero_output", False):
+        zf = water_flatten_factor(
+            qx, qy, str(args.water_flatten_mask), ramp=bool(args.water_flatten_ramp)
+        )
+        dtw, agg["wte"] = apply_water_zero(z_surf, dtw, zf)
+        water_zero = {
+            "mask_raster": str(args.water_flatten_mask),
+            "ramp": bool(args.water_flatten_ramp),
+            "ramp_factor": RAMP_FACTOR if args.water_flatten_ramp else None,
+            "n_zeroed": int((zf == 0.0).sum()),
+            "n_ramp_halved": int(((zf > 0.0) & (zf < 1.0)).sum()),
+        }
+        log.info(
+            "%s: water zero output: %d cells DTW := 0, %d ramp cells halved",
+            basin,
+            water_zero["n_zeroed"],
+            water_zero["n_ramp_halved"],
+        )
     gate_panel = None
     if oof is not None:
         gate_panel = leak_gate(
@@ -1725,6 +1910,17 @@ def infer_basin(
                 "n_cells": n,
                 "window": [width, height],
                 "pct_negative_dtw": neg,
+                "pct_negative_dtw_note": "fraction (0-1) of cells with DTW < 0 "
+                "BEFORE the non-negative clamp",
+                "clamp_dtw_min_m": CLAMP_DTW_MIN_M,
+                "n_clamped": n_clamped,
+                "pct_clamped": n_clamped / n,
+                "pct_clamped_note": "fraction (0-1) of lattice cells clamped",
+                "coarse_surface": str(args.coarse_surface),
+                "fac_recipe": FAC_RECIPE,
+                "fac_registry_pin": FAC_PIN,
+                "fac_registry_n": len(FAC_REM_REGISTRY),
+                "water_zero_output": water_zero,
                 "mixture_identity_tol_m": MIX_TOL_M,
                 "r_source": args.r_source,
                 "r_exclude_km": args.r_exclude_km,
@@ -1735,6 +1931,7 @@ def infer_basin(
                 "peak_gpu_alloc_gb": peak_gb,
                 "source_edges": (src_ctx or {}).get("stats"),
                 "dd_dist_floor_m": float(args.dd_dist_floor_m),
+                "r_ground_cap": r_cap,
                 "extra_sources_path": args.extra_sources,
                 "exclude_source_name": list(args.exclude_source_name),
                 "water_flatten": water_flatten,
@@ -1815,6 +2012,15 @@ def main() -> None:
         "the feature field), ~1000 = render-time flattening of those spots",
     )
     ap.add_argument(
+        "--r-ground-cap-m",
+        type=float,
+        default=None,
+        help="render-side R ground cap: lower the base R to z_surf - M wherever "
+        "it sits higher (R above ground at ~30%% of NV NDWR labels -> negative "
+        "DTW the head must undo); source-edge residuals are reframed to the "
+        "capped R at the well. Off by default (training frame = uncapped).",
+    )
+    ap.add_argument(
         "--out-name",
         default=None,
         help="render directory name under <huc8>/<basin>/gnn/ (default: the model "
@@ -1853,6 +2059,15 @@ def main() -> None:
         "OOF MAD by more than this fraction",
     )
     add_water_flatten_args(ap)
+    ap.add_argument(
+        "--coarse-surface",
+        default=COARSE_SURFACE_MW2KM,
+        help="reference surface for the query feature elev_above_coarse_m = "
+        "z_surf - coarse (nearest sample). Default: 2 km moving-window mean on "
+        "the 100 m lattice (build_coarse_surface_mw2km.py); the bundle's 2 km "
+        "block raster (hydrography90m/coarse_surface.tif) reproduces the "
+        "pre-fix renders and their 2 km block steps",
+    )
     ap.add_argument("--leak-gate-min-wells", type=int, default=20)
     ap.add_argument(
         "--leak-gate-track-m",

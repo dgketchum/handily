@@ -22,8 +22,14 @@ NEAREST so the sparse channel-strip footprint is not eroded by NaN edges. FAC
 sourcing composites the fac_rem_registry in precedence order (first finite
 wins), matching sample_fac_rem at the wells exactly.
 
-Outputs per basin -> gnn_wte_10m.tif, gnn_dtw_10m.tif (headline, unclamped),
-gnn_sigma_10m.tif. A coarse-consistency check (block-mean WTE_10 vs
+Non-negative guard (``infer_conus_gnn.clamp_dtw_nonneg``, the same helper the
+100 m renderer applies): DTW_10 = max(DEM_10 - WTE_10, 0) and WTE_10 lowered to
+DEM_10 where it sat above ground, so the written pair agrees. The pre-clamp
+negative share stays in render_run.json as ``pct_negative_dtw``; ``n_clamped`` /
+``pct_clamped`` record the guard. No other clamp.
+
+Outputs per basin -> gnn_wte_10m.tif, gnn_dtw_10m.tif (headline, clamped at
+>= 0 m), gnn_sigma_10m.tif. A coarse-consistency check (block-mean WTE_10 vs
 gnn_wte_100m, MAD split by FAC presence) runs every basin and is logged +
 persisted to render_run.json.
 
@@ -49,12 +55,15 @@ from rasterio.transform import from_origin
 from rasterio.warp import Resampling, reproject
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from build_water_mask_v3 import water_flatten_factor  # noqa: E402
 from fac_rem_registry import existing_registry  # noqa: E402
 from infer_conus_gnn import (  # noqa: E402
     HUC8_ROOT,
     RES,
     X0,
     Y0,
+    apply_water_zero,
+    clamp_dtw_nonneg,
     nm_basins,
     write_tif,
 )
@@ -189,11 +198,31 @@ def render_basin(
 
     valid = np.isfinite(wte10) & np.isfinite(dem10)
     wte10 = np.where(valid, wte10, np.nan)
-    dtw10 = dem10 - wte10
-    neg = float((dtw10[valid] < 0).mean()) if valid.any() else 0.0
+    neg = float(((dem10 - wte10)[valid] < 0).mean()) if valid.any() else 0.0
+    dtw10, wte10, n_clamped = clamp_dtw_nonneg(dem10, wte10)
+    # --water-zero-output replay: the 100 m run recorded the mask + ramp it
+    # zeroed on; apply the same 100 m factor to every nested 10 m cell.
+    wz = json.loads((gdirb / "infer_run.json").read_text()).get("water_zero_output")
+    if wz:
+        with rasterio.open(coarse_wte) as src:
+            ct, cw, ch = src.transform, src.width, src.height
+        cx, cy = np.meshgrid(
+            ct.c + (np.arange(cw) + 0.5) * ct.a, ct.f + (np.arange(ch) + 0.5) * ct.e
+        )
+        f100 = water_flatten_factor(
+            cx.ravel(), cy.ravel(), wz["mask_raster"], ramp=bool(wz["ramp"])
+        ).reshape(ch, cw)
+        f10 = np.repeat(np.repeat(f100, 10, axis=0), 10, axis=1)
+        dtw10, wte10 = apply_water_zero(dem10, dtw10, f10)
+        log.info(
+            "%s: water zero output replayed at 10 m (%d 100 m cells zeroed)",
+            basin,
+            int((f100 == 0.0).sum()),
+        )
+    pct_clamped = n_clamped / int(valid.sum()) if valid.any() else 0.0
     log.info(
         "%s: %dx%d @10m, %d valid cells, %d head-fallback, DTW median %.2f m, "
-        "%.1f%% negative",
+        "%.2f%% negative pre-clamp (%d cells clamped to 0 m)",
         basin,
         width,
         height,
@@ -201,6 +230,7 @@ def render_basin(
         n_fallback,
         float(np.nanmedian(dtw10)),
         100 * neg,
+        n_clamped,
     )
 
     # coarse-consistency: block-mean the 10 m WTE back to 100 m and MAD against
@@ -268,6 +298,12 @@ def render_basin(
                 "n_valid": int(valid.sum()),
                 "n_head_fallback": n_fallback,
                 "pct_negative_dtw": neg,
+                "pct_negative_dtw_note": "fraction (0-1) of valid 10 m cells with "
+                "DTW < 0 BEFORE the non-negative clamp",
+                "clamp_dtw_min_m": 0.0,
+                "n_clamped": n_clamped,
+                "pct_clamped": pct_clamped,
+                "water_zero_output": wz,
                 "coarse_consistency_mad_m": mad_all,
                 "coarse_consistency_mad_fac_m": mad_fac,
                 "coarse_consistency_mad_nofac_m": mad_nofac,
@@ -321,13 +357,20 @@ def main() -> None:
         "--overwrite", action="store_true", help="re-render basins with existing 10 m"
     )
     ap.add_argument(
+        "--out-name",
+        default=None,
+        help="render directory under <huc8>/<basin>/gnn/ to read the 100 m layers "
+        "from and write the 10 m layers to (default: the model dir name); match "
+        "infer_conus_gnn.py --out-name",
+    )
+    ap.add_argument(
         "--write-dem",
         action="store_true",
         help="also write gnn_dem_10m.tif (aligned 3DEP DEM) for a downstream hillshade",
     )
     args = ap.parse_args()
     model_dir = Path(args.model_dir)
-    model_name = model_dir.name
+    model_name = args.out_name or model_dir.name
     man = json.loads((model_dir / "models" / "inference_manifest.json").read_text())
     if not args.basins and not args.state:
         raise SystemExit("pass --basins or --state")

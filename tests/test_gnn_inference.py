@@ -383,3 +383,69 @@ def test_ckpt_introspection_gated_source_read_and_mae():
     assert inf.ckpt_extensions(ck) == (64, False)
     assert inf.ckpt_f_src(ck, 46) == 2
     assert inf.ckpt_f_srcedge(ck) == 4
+
+
+# ---------------------------------------------------------------------------
+# non-negative DTW guard (100 m renderer + 10 m recomposition)
+# ---------------------------------------------------------------------------
+def test_clamp_dtw_nonneg_tiny_array():
+    surface = np.array([[100.0, 100.0, 100.0], [50.0, np.nan, 50.0]])
+    wte = np.array([[98.0, 100.0, 103.5], [51.0, 40.0, np.nan]])
+    dtw, wte_c, n = inf.clamp_dtw_nonneg(surface, wte)
+    np.testing.assert_allclose(
+        dtw, [[2.0, 0.0, 0.0], [0.0, np.nan, np.nan]], equal_nan=True
+    )
+    # WTE lowered to the surface exactly where DTW was negative, untouched elsewhere
+    np.testing.assert_allclose(
+        wte_c, [[98.0, 100.0, 100.0], [50.0, 40.0, np.nan]], equal_nan=True
+    )
+    # written pair stays consistent: dtw == surface - wte
+    np.testing.assert_allclose(dtw, surface - wte_c, equal_nan=True)
+    assert n == 2  # DTW exactly 0 and NaN cells are not counted
+    assert np.nanmin(dtw) == 0.0
+
+
+def test_render_uses_the_same_clamp():
+    assert ren.clamp_dtw_nonneg is inf.clamp_dtw_nonneg
+    assert inf.CLAMP_DTW_MIN_M == 0.0
+
+
+def test_apply_water_zero_mask_ramp_and_consistency():
+    surface = np.array([100.0, 100.0, 100.0, 100.0])
+    dtw = np.array([4.0, 4.0, 4.0, np.nan])
+    factor = np.array([0.0, inf.RAMP_FACTOR, 1.0, 0.0])
+    dz, wz = inf.apply_water_zero(surface, dtw, factor)
+    np.testing.assert_allclose(dz, [0.0, 2.0, 4.0, np.nan], equal_nan=True)
+    np.testing.assert_allclose(wz, [100.0, 98.0, 96.0, np.nan], equal_nan=True)
+    assert ren.apply_water_zero is inf.apply_water_zero
+
+
+# ---------------------------------------------------------------------------
+# R ground cap (--r-ground-cap-m): lattice cap + source-residual reframe
+# ---------------------------------------------------------------------------
+def test_cap_r_ground_binds_only_above_limit_and_keeps_pins():
+    z = np.array([100.0, 100.0, 100.0, 100.0, np.nan])
+    r = np.array([105.0, 99.0, 90.0, 101.0, 120.0])
+    keep = np.array([False, False, False, True, False])
+    rc, bound = inf.cap_r_ground(r, z, 2.0, keep=keep)
+    # NaN surface: R passed through untouched, not bound
+    np.testing.assert_allclose(rc, [98.0, 98.0, 90.0, 101.0, 120.0])
+    # above-limit cells bind (99 > 98 too); pinned and NaN-surface cells do not
+    assert bound.tolist() == [True, True, False, False, False]
+    # outside the pinned cell the capped DTW is never below the cap
+    assert np.nanmin((z - rc)[~keep]) >= 2.0 - 1e-9
+
+
+def test_reframe_source_resid_preserves_observed_wte():
+    # wte_obs = R + resid is frame-invariant; after the cap the residual must
+    # reproduce the same observed WTE from the capped R
+    r = np.array([120.0, 95.0, np.nan])
+    z = np.array([100.0, 100.0, 100.0])
+    wte_obs = np.array([80.0, 92.0, 90.0])
+    resid = wte_obs - r
+    resid2 = inf.reframe_source_resid(resid, r, z, 2.0)
+    r_capped, _ = inf.cap_r_ground(r, z, 2.0)
+    np.testing.assert_allclose((r_capped + resid2)[:2], wte_obs[:2])
+    # unbound well: residual unchanged; non-finite R: residual passed through
+    assert resid2[1] == resid[1]
+    assert np.isnan(resid2[2])
