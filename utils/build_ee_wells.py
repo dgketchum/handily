@@ -22,6 +22,15 @@ the ``conus/wells_train/<unit>`` assets so the app can draw the assimilated
 population against all wells. Note the model matches assimilated wells partly
 by construction; the un-assimilated remainder is the independent check.
 
+``--bundle-dir <graph bundle> --basins-file <huc8 list>`` is the third mode:
+the training population read straight from the bundle the shipped arm was
+trained on (``query_nodes.parquet`` real-well rows inside the basin list), so
+the layer shows exactly the labels the model saw -- the monitoring networks
+plus the appended state-agency wells (NV NDWR / NM OSE admitted halves), which
+are also render-time sources. Output is tagged ``wells_train`` like the
+``--well-class`` mode; ``role`` carries the bundle ``well_class`` (monitoring /
+ndwr / ose).
+
 Upload the CSV with::
 
     earthengine upload table \
@@ -118,6 +127,59 @@ def build_state(state, wells_parquet, out_csv, well_classes=()):
     return _finalize(df, state, out_csv)
 
 
+def build_bundle(bundle_dir, basins, out_csv, label="bundle"):
+    """Training wells of a graph bundle inside a HUC8 basin list (wells_train).
+
+    Reads the real-well rows of ``query_nodes.parquet`` (water-stage pseudo-rows
+    dropped), keeps those whose ``huc8`` is in ``basins``, and maps them to the
+    app schema. ``dtw_m`` is the bundle label depth (land surface minus observed
+    water-table elevation, the same ``mean_dtw`` the trainer scores); EPSG:5070
+    coordinates are converted to lon/lat for the table upload.
+    """
+    cols = [
+        "canonical_id",
+        "source",
+        "well_class",
+        "confinement_class",
+        "huc8",
+        "x5070",
+        "y5070",
+        "mean_dtw",
+        "z_surf_well_m",
+        "wte_obs_m",
+        "is_water_pseudo",
+    ]
+    q = pd.read_parquet(Path(bundle_dir) / "query_nodes.parquet", columns=cols)
+    q = q[~q["is_water_pseudo"].astype(bool)]
+    codes = {str(b).zfill(8) for b in basins}
+    q = q[q["huc8"].astype(str).str.zfill(8).isin(codes)].copy()
+    if q.empty:
+        raise SystemExit(f"{label}: no bundle wells inside the {len(codes)} basins")
+    # the bundle label is z_surf - wte_obs; mean_dtw is that same quantity
+    d = q["z_surf_well_m"] - q["wte_obs_m"]
+    if not np.allclose(d, q["mean_dtw"], atol=1e-6, equal_nan=True):
+        raise SystemExit(f"{label}: mean_dtw != z_surf - wte_obs in the bundle")
+    lon, lat = (
+        gpd.GeoSeries(gpd.points_from_xy(q["x5070"], q["y5070"]), crs=5070)
+        .to_crs(4326)
+        .pipe(lambda g: (g.x.to_numpy(), g.y.to_numpy()))
+    )
+    df = pd.DataFrame(
+        {
+            "canonical_id": q["canonical_id"].to_numpy(),
+            "source": q["source"].to_numpy(),
+            "mean_dtw": q["mean_dtw"].to_numpy(),
+            "confinement_class": q["confinement_class"].to_numpy(),
+            "well_class": q["well_class"].to_numpy(),
+            "role": q["well_class"].to_numpy(),
+            "longitude": lon,
+            "latitude": lat,
+        }
+    )
+    print(f"{label}: bundle rows by role {df['role'].value_counts().to_dict()}")
+    return _finalize(df, label, out_csv)
+
+
 def build_footprint(
     basins,
     wells_parquet,
@@ -170,6 +232,16 @@ if __name__ == "__main__":
         "--basins-file",
         help="text file of HUC8 codes (one per line); wells clipped to their union",
     )
+    mode.add_argument(
+        "--bundle-dir",
+        help="graph bundle directory; wells_train from its query_nodes.parquet "
+        "real-well rows inside --bundle-basins (training labels of that bundle)",
+    )
+    ap.add_argument(
+        "--bundle-basins",
+        default=None,
+        help="HUC8 list (one per line) restricting --bundle-dir rows to a footprint",
+    )
     ap.add_argument(
         "--exclude-states",
         default="",
@@ -197,7 +269,22 @@ if __name__ == "__main__":
     well_classes = tuple(s.strip() for s in args.well_class.split(",") if s.strip())
     stem = "wells_train" if well_classes else "wells"
 
-    if args.state:
+    if args.bundle_dir:
+        if not args.bundle_basins:
+            raise SystemExit("--bundle-dir needs --bundle-basins")
+        basins = [
+            ln.strip()
+            for ln in Path(args.bundle_basins).read_text().splitlines()
+            if ln.strip()
+        ]
+        label = (args.label or Path(args.bundle_basins).stem).lower()
+        out = (
+            Path(args.out)
+            if args.out
+            else Path(OUT_ROOT) / label / f"handily_wells_train_{label}.csv"
+        )
+        build_bundle(args.bundle_dir, basins, out, label=label)
+    elif args.state:
         unit = args.state.upper()
         out = (
             Path(args.out)
