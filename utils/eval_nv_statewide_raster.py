@@ -72,6 +72,7 @@ import numpy as np
 import geopandas as gpd
 import pandas as pd
 import rasterio
+import rasterio.windows
 from scipy.spatial import cKDTree
 from scipy.stats import spearmanr
 
@@ -202,12 +203,35 @@ def basin_dirs(root: Path, arm_dir: str) -> dict[str, Path]:
     return found
 
 
-def read_layers(d: Path, with_ordinal: bool) -> tuple[dict, dict]:
-    """Read an arm's layers for one basin; returns (arrays, grid profile)."""
+def _read_on_grid(ds, band: int, target: dict | None) -> np.ndarray:
+    """Read one band; when `target` (primary-arm grid) differs only in extent,
+    crop/pad onto it through a boundless window (nodata fill). Same CRS and
+    cell size are required — a different projection or resolution is a defect."""
+    if target is None or (
+        tuple(ds.transform)[:6] == target["transform"]
+        and (ds.height, ds.width) == target["shape"]
+    ):
+        return ds.read(band).astype("float64")
+    t = rasterio.Affine(*target["transform"])
+    if str(ds.crs) != target["crs"] or (t.a, t.e) != (ds.transform.a, ds.transform.e):
+        raise SystemExit(f"{ds.name}: CRS/cell size differs from the primary arm grid")
+    h, w = target["shape"]
+    win = rasterio.windows.from_bounds(
+        t.c, t.f + t.e * h, t.c + t.a * w, t.f, transform=ds.transform
+    )
+    fill = ds.nodata if ds.nodata is not None else np.nan
+    return ds.read(band, window=win, boundless=True, fill_value=fill).astype("float64")
+
+
+def read_layers(
+    d: Path, with_ordinal: bool, target: dict | None = None
+) -> tuple[dict, dict]:
+    """Read an arm's layers for one basin; returns (arrays, grid profile).
+    `target` = the primary arm's grid profile: other arms are aligned onto it."""
     arrays, prof = {}, {}
     for key, name in BASE_LAYERS.items():
         with rasterio.open(d / name) as ds:
-            a = ds.read(1).astype("float64")
+            a = _read_on_grid(ds, 1, target)
             nd = ds.nodata
             if nd is not None:
                 a[a == nd] = np.nan
@@ -273,14 +297,21 @@ def scan_basins(
     multi: dict[int, list] = {}
     for basin in basins:
         arrs, profs = {}, {}
-        for a in arms:
+        for a in [primary] + [a for a in arms if a != primary]:
             d = dirs[a].get(basin)
             if d is None:
                 if a == primary:
                     raise SystemExit(f"{basin}: primary arm {a} missing")
                 log(f"  {basin}: arm {a} not rendered here (reference fields NaN)")
                 continue
-            arrs[a], profs[a] = read_layers(d, with_ordinal=(a == primary))
+            arrs[a], profs[a] = read_layers(
+                d, with_ordinal=(a == primary), target=profs.get(primary)
+            )
+            if a != primary and profs[a]["shape"] != profs[primary]["shape"]:
+                log(
+                    f"  {basin}: arm {a} grid {profs[a]['shape']} aligned onto "
+                    f"primary {profs[primary]['shape']} (extent-only crop/pad)"
+                )
         has_ref = reference in arrs
         pdir = dirs[primary][basin]
         man = json.loads((pdir / "infer_run.json").read_text())
