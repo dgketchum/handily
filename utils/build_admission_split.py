@@ -6,7 +6,13 @@ assimilated wells at inference) and the ADMISSION TARGETS (hidden; graded).
 
 Funnel (replays the Nevada draw; every filter is recorded per site):
   1. gwx product rows of ``--source`` joined to the raw POD table on the stable
-     record number for the raw use code, OSE basin and artesian code;
+     record number for the raw use code, OSE basin and artesian code
+     (``--source-kind ose``), or to the GWIC sites table on gwicid for the
+     geomethod / quarter-section detail that refines the PLSS location class
+     (``--source-kind gwic``; the use code is the gwx normalized ``well_use``),
+     or to the ADWR Wells 55 registry on REGISTRY_ID for the registry basin and
+     the raw WATER_USE that recovers ``monitoring`` where gwx left ``well_use``
+     empty (``--source-kind adwr``);
   2. 1 m coordinate round -> site; per-site median DTW, ``n_wells``, DTW std;
   3. footprint = the HUC8 render basins under ``--huc8-dir`` with the given
      prefixes; sites outside are dropped from the panel;
@@ -55,6 +61,8 @@ from sample_benchmark_rasters import MA_DIR, sample_ma_tiles  # noqa: E402
 
 GWX = "/data/ssd2/gwx/products/current/wells.geoparquet"
 RAW_POD = "/data/ssd2/gwx/nm_ose/pod.parquet"
+GWIC_SITES = "/data/ssd2/gwx/mt_gwic/sites.parquet"
+ADWR_REGISTRY = "/data/ssd2/gwx/az_adwr/registry.parquet"
 BUNDLE = "/data/ssd2/handily/conus/wte_gnn/graph_conus_monitoring_water_v2_ndwr_ufold"
 HUC8_DIR = "/data/ssd2/handily/huc8"
 #: DEM cells (100 m) on a side of the within-site relief window per gwx
@@ -71,9 +79,17 @@ RELIEF_WINDOW_CELLS = {
     "plss": 9,
     "unknown": 9,
     "plss_1": 17,
+    #: township-only location (GWIC TRS-TWN): no window can bound it; the site
+    #: is never relief-eligible.
+    "plss_twn": None,
 }
+#: GWIC quarter-section letter count (TRS-SEC) -> location class. 0 letters is
+#: the section, each letter quarters it: 1 -> 1/4, 2 -> 1/16, 3 -> 1/64,
+#: 4+ -> 1/256 or finer (window as the 1/64 class).
+GWIC_QSECTION_CLASS = {0: "plss_1", 1: "plss_4", 2: "plss_16", 3: "plss_64"}
 #: Worst-first ordering used to pick a site's class when its wells disagree.
 ACC_RANK = [
+    "plss_twn",
     "plss_1",
     "unknown",
     "plss",
@@ -143,7 +159,7 @@ def load_gwx(gwx: str, source: str, pin_dir: Path) -> gpd.GeoDataFrame:
         raise SystemExit(f"{source} rows span several build_ids: {build}")
     pin = pin_dir / f"{source}_gwx_{build[0]}.parquet"
     if pin.exists():
-        prev = gpd.read_parquet(pin, columns=["source_well_id", "mean_dtw"])
+        prev = pd.read_parquet(pin, columns=["source_well_id", "mean_dtw"])
         if len(prev) != len(g):
             raise SystemExit(f"pinned {pin} has {len(prev)} rows, product has {len(g)}")
         log(f"gwx rows match the pin {pin.name} ({len(g):,} rows)")
@@ -153,10 +169,8 @@ def load_gwx(gwx: str, source: str, pin_dir: Path) -> gpd.GeoDataFrame:
     return g
 
 
-def site_panel(args: argparse.Namespace, out_dir: Path) -> pd.DataFrame:
-    g = load_gwx(args.gwx, args.source, out_dir)
-    build_id = str(g["build_id"].iloc[0])
-    raw = pd.read_parquet(args.raw_pod, columns=RAW_COLS)
+def attach_ose_pod(g: gpd.GeoDataFrame, raw_pod: str) -> gpd.GeoDataFrame:
+    raw = pd.read_parquet(raw_pod, columns=RAW_COLS)
     raw["source_well_id"] = raw["pod_rec_nb"].astype(str)
     if not raw["source_well_id"].is_unique:
         raise SystemExit("raw pod_rec_nb is not unique")
@@ -166,6 +180,108 @@ def site_panel(args: argparse.Namespace, out_dir: Path) -> pd.DataFrame:
         raise SystemExit(
             f"{n_unjoined} gwx rows did not join the raw POD table on pod_rec_nb"
         )
+    return g
+
+
+def attach_gwic_sites(g: gpd.GeoDataFrame, sites: str) -> gpd.GeoDataFrame:
+    """GWIC: use code = gwx ``well_use``; PLSS class refined from the sites table.
+
+    gwx maps every TRS geomethod to ``plss``; the sites table says whether the
+    location is a township (TRS-TWN) or a section (TRS-SEC) and how many
+    quarter-section letters narrow the section. No OSE basin or artesian code
+    exists, so those columns are blank.
+    """
+    st = pd.read_parquet(sites, columns=["gwicid", "geomethod", "qsection"])
+    st["source_well_id"] = "gwic_" + st["gwicid"].astype(str)
+    if not st["source_well_id"].is_unique:
+        raise SystemExit("GWIC gwicid is not unique")
+    st["geomethod"] = st["geomethod"].fillna("").astype(str).str.strip()
+    st["qsection"] = (
+        st["qsection"].fillna("").astype(str).str.strip().str.replace(" ", "")
+    )
+    g = g.merge(
+        st[["source_well_id", "geomethod", "qsection"]], on="source_well_id", how="left"
+    )
+    n_unjoined = int(g["geomethod"].isna().sum())
+    if n_unjoined:
+        raise SystemExit(f"{n_unjoined} gwx rows did not join the GWIC sites table")
+    cls = g["h_accuracy_class"].astype(str).to_numpy().copy()
+    plss = cls == "plss"
+    twn = plss & (g["geomethod"] == "TRS-TWN").to_numpy()
+    sec = plss & (g["geomethod"] == "TRS-SEC").to_numpy()
+    odd = plss & ~twn & ~sec
+    if odd.any():
+        raise SystemExit(
+            f"{int(odd.sum())} plss wells with a non-TRS geomethod: "
+            f"{sorted(set(g.loc[odd, 'geomethod']))}"
+        )
+    nq = g["qsection"].str.len().to_numpy()
+    cls[twn] = "plss_twn"
+    for n, c in GWIC_QSECTION_CLASS.items():
+        cls[sec & (nq == n)] = c
+    cls[sec & (nq > max(GWIC_QSECTION_CLASS))] = GWIC_QSECTION_CLASS[
+        max(GWIC_QSECTION_CLASS)
+    ]
+    g["h_accuracy_class"] = cls
+    log(
+        "GWIC location classes: "
+        + json.dumps(g["h_accuracy_class"].value_counts().to_dict())
+    )
+    g["use_"] = g["well_use"].astype(str)
+    g["pod_basin"] = ""
+    g["grnd_wtr_s"] = ""
+    return g
+
+
+def attach_adwr_registry(g: gpd.GeoDataFrame, registry: str) -> gpd.GeoDataFrame:
+    """ADWR Wells 55: use code = gwx ``well_use`` with ``monitoring`` recovered.
+
+    gwx maps the registry WATER_USE "MONITORING" (and its "MONITORING, ..."
+    combinations) to an empty ``well_use``; those rows take ``monitoring``.
+    The registry groundwater basin (BASIN_NAME, AMA/INA or basin) fills
+    ``pod_basin`` so basin exclusions and basin eval blocks work as for OSE.
+    The gwx PLSS location class (QUARTER_*_ACRE precision) is kept as is; no
+    artesian code exists.
+    """
+    reg = pd.read_parquet(registry, columns=["REGISTRY_ID", "WATER_USE", "BASIN_NAME"])
+    reg["source_well_id"] = reg["REGISTRY_ID"].astype(str)
+    if not reg["source_well_id"].is_unique:
+        raise SystemExit("ADWR REGISTRY_ID is not unique")
+    reg["water_use_raw"] = reg["WATER_USE"].fillna("").astype(str).str.strip()
+    reg["pod_basin"] = reg["BASIN_NAME"].fillna("").astype(str).str.strip()
+    g = g.merge(
+        reg[["source_well_id", "water_use_raw", "pod_basin"]],
+        on="source_well_id",
+        how="left",
+        indicator=True,
+    )
+    n_unjoined = int((g["_merge"] != "both").sum())
+    if n_unjoined:
+        raise SystemExit(
+            f"{n_unjoined} gwx rows did not join the ADWR registry on REGISTRY_ID"
+        )
+    g = g.drop(columns=["_merge"])
+    recover = g["well_use"].isna() & g["water_use_raw"].str.startswith("MONITORING")
+    g["use_"] = g["well_use"].astype(str)
+    g.loc[recover, "use_"] = "monitoring"
+    log(
+        f"ADWR registry: {int(recover.sum()):,} empty gwx well_use rows recovered as "
+        f"monitoring from WATER_USE; use codes "
+        + json.dumps(g["use_"].value_counts().to_dict())
+    )
+    g["grnd_wtr_s"] = ""
+    return g.drop(columns=["water_use_raw"])
+
+
+def site_panel(args: argparse.Namespace, out_dir: Path) -> pd.DataFrame:
+    g = load_gwx(args.gwx, args.source, out_dir)
+    build_id = str(g["build_id"].iloc[0])
+    if args.source_kind == "ose":
+        g = attach_ose_pod(g, args.raw_pod)
+    elif args.source_kind == "adwr":
+        g = attach_adwr_registry(g, args.adwr_registry)
+    else:
+        g = attach_gwic_sites(g, args.gwic_sites)
     g = g.to_crs(5070)
     g["x5070"] = g.geometry.x
     g["y5070"] = g.geometry.y
@@ -219,7 +335,13 @@ def site_panel(args: argparse.Namespace, out_dir: Path) -> pd.DataFrame:
         .sort_values("_i")
     )
     s["huc8"] = j["huc8"].astype(object).to_numpy()
-    fp = footprint_huc8s(args.huc8_dir, args.huc8_prefixes.split(","))
+    if args.huc8_list:
+        fp = sorted(set(Path(args.huc8_list).read_text().split()))
+        missing = [h for h in fp if not (Path(args.huc8_dir) / h).is_dir()]
+        if missing:
+            raise SystemExit(f"{len(missing)} listed HUC8s have no dir: {missing[:5]}")
+    else:
+        fp = footprint_huc8s(args.huc8_dir, args.huc8_prefixes.split(","))
     in_fp = s["huc8"].isin(fp).to_numpy(bool)
     log(
         f"footprint: {len(fp)} HUC8 basins; {int((~in_fp).sum()):,} sites outside dropped"
@@ -237,8 +359,16 @@ def site_panel(args: argparse.Namespace, out_dir: Path) -> pd.DataFrame:
     for c in ("is_shore_pseudo", "is_swl_aux"):
         if c in qn.columns:
             real &= ~qn[c].to_numpy(bool)
-    if qn.loc[real, "source"].astype(str).eq(args.source).any():
-        raise SystemExit(f"bundle {args.bundle} already carries {args.source} rows")
+    n_in_bundle = int(qn.loc[real, "source"].astype(str).eq(args.source).sum())
+    if n_in_bundle and not args.allow_source_in_bundle:
+        raise SystemExit(
+            f"bundle {args.bundle} already carries {n_in_bundle} {args.source} rows"
+        )
+    if n_in_bundle:
+        log(
+            f"bundle carries {n_in_bundle} {args.source} rows (allowed); "
+            "they are excluded through the 1 m training-well rule"
+        )
     xy = s[["x5070", "y5070"]].to_numpy("float64")
     s["dist_train_km"] = (
         cKDTree(qn.loc[real, ["x5070", "y5070"]].to_numpy("float64")).query(xy)[0] / 1e3
@@ -306,10 +436,13 @@ def dem_range(s: pd.DataFrame) -> np.ndarray:
     cls = s["h_accuracy_class"].astype(str).to_numpy()
     out = np.full(len(s), np.nan)
     for c in np.unique(cls):
-        n = RELIEF_WINDOW_CELLS.get(c)
-        if n is None:
+        if c not in RELIEF_WINDOW_CELLS:
             raise SystemExit(f"no relief window for h_accuracy_class {c!r}")
+        n = RELIEF_WINDOW_CELLS[c]
         m = cls == c
+        if n is None:
+            out[m] = np.inf
+            continue
         if n == 1:
             out[m] = 0.0
             continue
@@ -317,10 +450,8 @@ def dem_range(s: pd.DataFrame) -> np.ndarray:
             arr, size=n, mode="nearest"
         )
         out[m] = rng[row[m], col[m]]
-    if not np.isfinite(out).all():
-        raise SystemExit(
-            f"{int((~np.isfinite(out)).sum())} sites have a non-finite DEM range"
-        )
+    if np.isnan(out).any():
+        raise SystemExit(f"{int(np.isnan(out).sum())} sites have a NaN DEM range")
     return out
 
 
@@ -388,6 +519,7 @@ def finalize(args: argparse.Namespace, out_dir: Path, pfx: str) -> None:
     )
     man = {
         "source": args.source,
+        "source_kind": args.source_kind,
         "gwx": args.gwx,
         "build_id": str(m["build_id"].iloc[0]),
         "raw_pod": args.raw_pod,
@@ -402,6 +534,9 @@ def finalize(args: argparse.Namespace, out_dir: Path, pfx: str) -> None:
         "relief_max_m": args.relief_max_m,
         "relief_window_cells": RELIEF_WINDOW_CELLS,
         "huc8_prefixes": args.huc8_prefixes,
+        "huc8_list": args.huc8_list,
+        "gwic_sites": args.gwic_sites if args.source_kind == "gwic" else None,
+        "adwr_registry": args.adwr_registry if args.source_kind == "adwr" else None,
         "split": {
             "seed": args.seed,
             "fraction": 0.5,
@@ -429,11 +564,31 @@ def main() -> None:
     ap.add_argument("--raw-pod", default=RAW_POD)
     ap.add_argument("--source", default="nm_ose")
     ap.add_argument(
+        "--source-kind",
+        choices=["ose", "gwic", "adwr"],
+        default="ose",
+        help="ose: join the raw POD table; gwic: join the GWIC sites table; "
+        "adwr: join the ADWR Wells 55 registry",
+    )
+    ap.add_argument("--gwic-sites", default=GWIC_SITES)
+    ap.add_argument("--adwr-registry", default=ADWR_REGISTRY)
+    ap.add_argument(
+        "--allow-source-in-bundle",
+        action="store_true",
+        help="the base bundle may carry --source rows (e.g. GWIC monitoring labels "
+        "in the CONUS set); they are excluded by the 1 m training-well rule",
+    )
+    ap.add_argument(
         "--bundle",
         default=BUNDLE,
         help="base bundle (training wells to exclude; must not carry --source)",
     )
-    ap.add_argument("--use-codes", default="MON,DOM", help="raw POD use codes admitted")
+    ap.add_argument(
+        "--use-codes",
+        default="MON,DOM",
+        help="use codes admitted: raw POD codes (ose) or gwx well_use values "
+        "(gwic, adwr; adwr adds the recovered 'monitoring')",
+    )
     ap.add_argument(
         "--classes",
         default="unconfined,unconfined_marginal",
@@ -452,6 +607,10 @@ def main() -> None:
         "--huc8-prefixes",
         default="13,1108,1408,1502",
         help="render-footprint HUC8 prefixes",
+    )
+    ap.add_argument(
+        "--huc8-list",
+        help="file of HUC8 ids for the render footprint (overrides --huc8-prefixes)",
     )
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--prefix", default="ose")
