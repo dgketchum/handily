@@ -11,7 +11,7 @@ order so earlier entries overwrite later ones wherever both are finite.
 Downsampling is block-average over the finite 10 m cells (halo included, as
 the sampler sees it). Output is Float32, nodata -9999, tiled LZW, with a JSON
 sidecar recording the manifest and counts. Used to stage the EE asset
-``projects/ssebop-montana/assets/handily/covariates/fac_rem_dtw_100m_5070``.
+``projects/ee-dgketchum/assets/handily/covariates/fac_rem_dtw_100m_5070``.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ MANIFEST = (
     "/data/ssd2/handily/conus/wte_gnn/"
     "graph_conus_monitoring_water_v2_ndwr_ufold_ose_parity/fac_rem_manifest.json"
 )
-OUT = "/data/ssd2/handily/conus/fac_rem/fac_rem_dtw_100m_5070_manifest_parity.tif"
+OUT = "/data/ssd2/handily/conus/fac_rem/fac_rem_dtw_100m_5070_handily.tif"
 
 
 def _downsample(

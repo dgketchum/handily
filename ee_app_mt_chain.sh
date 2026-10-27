@@ -5,7 +5,7 @@
 # July MT objects (handily_*_mt_30m.tif, no _parity tag) and the archived July assets are untouched. Runbook: notes/DATA_SHARE_EE_APP.md
 set -euo pipefail
 H=/data/ssd2/handily; HC=/home/dgketchum/code/handily; S=$H/share/ee_app/mt; B=gs://ucrc-wtd/handily/mt
-ROOT=projects/ssebop-montana/assets/handily; TAG=parity; st=mt
+ROOT=projects/ee-dgketchum/assets/handily; TAG=parity; st=mt
 ARM=gnn_conus_monitoring_water_src_r1e_m20_ord_gwiclbl_parity
 BAS=$H/mt/regional/wells/mt_huc8_115.txt
 BUN=$H/conus/wte_gnn/graph_conus_monitoring_water_v2_gwic_parity

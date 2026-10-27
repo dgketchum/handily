@@ -34,7 +34,7 @@ ndwr / ose).
 Upload the CSV with::
 
     earthengine upload table \
-        --asset_id=projects/ssebop-montana/assets/handily/conus/wells/<unit> \
+        --asset_id=projects/ee-dgketchum/assets/handily/conus/wells/<unit> \
         --x_column longitude --y_column latitude --crs EPSG:4326 \
         gs://ucrc-wtd/handily/<unit>/handily_wells_<unit>.csv
 

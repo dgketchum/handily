@@ -5,7 +5,7 @@
 # July assets are MOVED to handily/archive_w25_prod (reversible), never deleted. Runbook: notes/DATA_SHARE_EE_APP.md
 set -euo pipefail
 H=/data/ssd2/handily; HC=/home/dgketchum/code/handily; S=$H/share/ee_app; B=gs://ucrc-wtd/handily
-ROOT=projects/ssebop-montana/assets/handily; ARCH=$ROOT/archive_w25_prod; TAG=parity
+ROOT=projects/ee-dgketchum/assets/handily; ARCH=$ROOT/archive_w25_prod; TAG=parity
 ARM_nv=gnn_conus_monitoring_water_src_r1e_m20_ord_ndwrlbl_ufold_parity
 ARM_nm=gnn_conus_monitoring_water_src_r1e_m20_ord_ndwrlbl_ufold_oselbl_parity
 BAS_nv=$H/nv/regional/fix_round/nv_huc8_72.txt
