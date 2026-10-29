@@ -13,6 +13,9 @@ file it does not change), rewrites ``query_nodes.parquet`` and edits
    R and the deep datum for the appended rows exactly as ``infer_conus_gnn``
    does on the lattice (``idw_exclude_at_points`` with exclude 0 over the base
    pool).
+1b. **R replacement** (``--r-replace``): R := a per-row table (query_node_idx,
+   r_wte_m), e.g. the pumping-well R of utils/build_pumping_r_query_nodes.py, on
+   every row; the deep datum is kept. Applied before the cap.
 2. **Ground cap.** R := min(R, z_surf - cap) on EVERY row (water pseudo-rows
    included; this bundle has no water-v3 pins). Mirrors ``--r-ground-cap-m``.
 3. **FAC recipe.** ``fac_rem_dtw_m`` resampled from an explicit FAC-REM raster
@@ -64,6 +67,11 @@ def parse() -> argparse.Namespace:
         default=None,
         help="optional parquet with x5070/y5070/r_wte_m (render point-path payload) "
         "to parity-check the recomputed lattice R against",
+    )
+    ap.add_argument(
+        "--r-replace",
+        default=None,
+        help="parquet (query_node_idx, r_wte_m): replace R on every row before the cap",
     )
     ap.add_argument("--r-ground-cap-m", type=float, default=None)
     ap.add_argument(
@@ -210,6 +218,27 @@ def main() -> None:
             }
         r[is_app] = r_lat
         deep[is_app] = d_lat
+
+    # --- 1b. R replacement ---------------------------------------------------------
+    if args.r_replace:
+        if app:
+            raise SystemExit(
+                "--r-replace with appended-source R: pass --appended-source none"
+            )
+        rr = pd.read_parquet(args.r_replace, columns=["query_node_idx", "r_wte_m"])
+        rr = rr.set_index("query_node_idx")["r_wte_m"].reindex(np.arange(n))
+        r_new = rr.to_numpy("float64")
+        if not np.isfinite(r_new).all():
+            raise SystemExit(
+                f"--r-replace covers {int(np.isfinite(r_new).sum())}/{n} rows"
+            )
+        print(f"[1b] R replaced from {args.r_replace}: new - old {_stats(r_new - r)}")
+        rewrite["r_replace"] = {
+            "path": args.r_replace,
+            "delta_vs_bundle_R_p50_m": float(np.median(r_new - r)),
+            "delta_vs_bundle_R_p90abs_m": float(np.percentile(np.abs(r_new - r), 90)),
+        }
+        r = r_new
 
     # --- 2. ground cap -------------------------------------------------------------
     if args.r_ground_cap_m is not None:
@@ -408,6 +437,7 @@ def main() -> None:
     rewrite["dropped_features"] = list(args.drop_feature)
     rewrite["render_contract"] = {
         "r_ground_cap_m": args.r_ground_cap_m,
+        "r_replace": args.r_replace,
         "dd_dist_floor_m": args.dd_dist_floor_m,
         "fac_rem_manifest": MANIFEST_NAME,
         "exclude_source_name": app,
