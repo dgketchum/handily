@@ -34,6 +34,16 @@ What it writes to ``--out-dir`` (every intermediate is kept):
   cells each cut calls statewide.
 * ``report.md`` -- the same tables rendered as markdown for the note.
 
+Footprints. Every panel row carries ``footprint`` and ``footprint_basins``
+(basins holding at least one scored site on that footprint).
+``all_arms`` is the site set where the primary arm, the reference arm and Ma
+are all finite; ``primary_ma`` is where the primary arm and Ma are finite,
+whether or not the reference arm was rendered there. When the reference arm
+covers every scored basin the two coincide and only ``all_arms`` is written;
+when it is partial (AZ: the shipped arm exists in 19 of 84 basins) both are
+written, primary-vs-Ma deltas on each, reference-vs-primary deltas on
+``all_arms`` only. Read the footprint column before quoting a number.
+
 Definitions (repeated here because every number carries units):
 
 * residual ``r = pred - obs`` (m), positive = predicted too deep.
@@ -182,6 +192,32 @@ def band_masks(v: np.ndarray, edges, labels) -> dict[str, np.ndarray]:
     return {
         lab: (v >= lo) & (v < hi) for lab, lo, hi in zip(labels, edges[:-1], edges[1:])
     }
+
+
+def footprint_masks(
+    obs: np.ndarray,
+    primary: np.ndarray,
+    reference: np.ndarray,
+    ma: np.ndarray,
+    basin: np.ndarray,
+) -> dict[str, tuple[np.ndarray, int]]:
+    """Scoring footprints: ``all_arms`` (every predictor finite) and, only when
+    the reference arm is partial, ``primary_ma`` (primary + Ma finite). Each
+    value is ``(mask, n_basins)``."""
+    fin_pm = np.isfinite(obs) & np.isfinite(primary) & np.isfinite(ma)
+    fin_all = fin_pm & np.isfinite(reference)
+    nb = lambda m: int(len(np.unique(basin[m])))  # noqa: E731
+    fps = {"all_arms": (fin_all, nb(fin_all))}
+    if int(fin_all.sum()) != int(fin_pm.sum()):
+        fps = {"primary_ma": (fin_pm, nb(fin_pm)), **fps}
+    return fps
+
+
+def tag_rows(rows: list[dict], footprint: str, n_basins: int) -> list[dict]:
+    for r in rows:
+        r["footprint"] = footprint
+        r["footprint_basins"] = n_basins
+    return rows
 
 
 def md_table(df: pd.DataFrame) -> str:
@@ -610,6 +646,9 @@ def delta_table(
                 "n": int(m.sum()),
                 "mad_delta_m": mad(obs[m], other[m]) - mad(obs[m], primary_pred[m]),
                 "rmse_delta_m": rmse(obs[m], other[m]) - rmse(obs[m], primary_pred[m]),
+                "bias_delta_m": float(
+                    np.mean(other[m] - obs[m]) - np.mean(primary_pred[m] - obs[m])
+                ),
             }
             for bname, (boot, blocks) in boot_map.items():
                 lo, hi = boot.ci(
@@ -620,6 +659,13 @@ def delta_table(
                     lambda i: rmse(obs[i], other[i]) - rmse(obs[i], primary_pred[i]), m
                 )
                 row[f"rmse_lo_{bname}"], row[f"rmse_hi_{bname}"] = lo, hi
+                lo, hi = boot.ci(
+                    lambda i: float(
+                        np.mean(other[i] - obs[i]) - np.mean(primary_pred[i] - obs[i])
+                    ),
+                    m,
+                )
+                row[f"bias_lo_{bname}"], row[f"bias_hi_{bname}"] = lo, hi
                 row[f"n_blocks_{bname}"] = int(len(np.unique(blocks[m])))
             rows.append(row)
     return rows
@@ -959,13 +1005,27 @@ def main() -> None:
         "Ma raster (resampled here)": s["ma_resampled_m"].to_numpy("float64"),
         "Ma (stored column)": s["ma_dtw_m"].to_numpy("float64"),
     }
-    finite_core = np.isfinite(obs)
-    for name in (
-        f"{primary} raster",
-        f"{reference} raster",
-        "Ma raster (resampled here)",
-    ):
-        finite_core &= np.isfinite(preds[name])
+    basin_hit = s["basin_hit"].astype(str).to_numpy()
+    footprints = footprint_masks(
+        obs,
+        preds[f"{primary} raster"],
+        preds[f"{reference} raster"],
+        preds["Ma raster (resampled here)"],
+        basin_hit,
+    )
+    for fp, (fm, nb) in footprints.items():
+        log(f"footprint {fp}: {int(fm.sum())} sites, {nb} basins")
+    finite_core = footprints["all_arms"][0]
+    finite_pm = footprints.get("primary_ma", footprints["all_arms"])[0]
+    partial_reference = "primary_ma" in footprints
+    if partial_reference:
+        log(
+            f"reference arm {reference} is PARTIAL: finite at "
+            f"{int(finite_core.sum())} of {int(finite_pm.sum())} primary+Ma sites "
+            f"({footprints['all_arms'][1]} of {footprints['primary_ma'][1]} basins); "
+            f"primary-vs-Ma is scored on both footprints, reference-vs-primary on "
+            f"all_arms only"
+        )
 
     bc = args.block_col
     blocks_reg = s[bc].fillna("__null__").astype(str).to_numpy()
@@ -986,54 +1046,54 @@ def main() -> None:
     )
 
     core, dep, dst, nws, shal, deltas = [], [], [], [], [], []
-    for set_name, sm in sets.items():
-        m = sm & finite_core
-        log(f"panel {set_name}: n {int(m.sum())}")
-        core += core_rows(obs, preds, m, set_name, "all", "overall")
-        for lab, bm in depth.items():
-            dep += core_rows(obs, preds, m & bm, set_name, lab, "depth")
-        for lab, bm in dist_src.items():
-            dst += core_rows(obs, preds, m & bm, set_name, lab, "dist_src")
-        for lab, bm in dist_nwis.items():
-            nws += core_rows(obs, preds, m & bm, set_name, lab, "dist_nwis")
-        shal += shallow_rows(obs, preds, m, set_name)
-
-        others = {
-            "Ma": preds["Ma raster (resampled here)"],
-            reference: preds[f"{reference} raster"],
-        }
-        pp = preds[f"{primary} raster"]
-        deltas += delta_table(
-            boot_map, obs, pp, others, {"all": m}, set_name, "overall"
-        )
-        deltas += delta_table(
-            boot_map,
-            obs,
-            pp,
-            others,
-            {k: m & v for k, v in depth.items()},
-            set_name,
-            "depth",
-        )
-        deltas += delta_table(
-            boot_map,
-            obs,
-            pp,
-            others,
-            {k: m & v for k, v in dist_src.items()},
-            set_name,
-            "dist_src",
-        )
-        if set_name == "A_primary_eligible":
-            deltas += delta_table(
-                boot_map,
-                obs,
-                pp,
-                others,
-                {k: m & v for k, v in dist_nwis.items()},
-                set_name,
-                "dist_nwis",
+    pp = preds[f"{primary} raster"]
+    for fp, (fmask, nb) in footprints.items():
+        if fp == "all_arms":
+            fp_preds = preds
+            others = {
+                "Ma": preds["Ma raster (resampled here)"],
+                reference: preds[f"{reference} raster"],
+            }
+        else:
+            fp_preds = {k: v for k, v in preds.items() if reference not in k}
+            others = {"Ma": preds["Ma raster (resampled here)"]}
+        for set_name, sm in sets.items():
+            m = sm & fmask
+            log(f"panel {set_name} [{fp}]: n {int(m.sum())}")
+            core += tag_rows(
+                core_rows(obs, fp_preds, m, set_name, "all", "overall"), fp, nb
             )
+            for lab, bm in depth.items():
+                dep += tag_rows(
+                    core_rows(obs, fp_preds, m & bm, set_name, lab, "depth"), fp, nb
+                )
+            for lab, bm in dist_src.items():
+                dst += tag_rows(
+                    core_rows(obs, fp_preds, m & bm, set_name, lab, "dist_src"),
+                    fp,
+                    nb,
+                )
+            for lab, bm in dist_nwis.items():
+                nws += tag_rows(
+                    core_rows(obs, fp_preds, m & bm, set_name, lab, "dist_nwis"),
+                    fp,
+                    nb,
+                )
+            shal += tag_rows(shallow_rows(obs, fp_preds, m, set_name), fp, nb)
+
+            kinds = [
+                ("overall", {"all": m}),
+                ("depth", {k: m & v for k, v in depth.items()}),
+                ("dist_src", {k: m & v for k, v in dist_src.items()}),
+            ]
+            if set_name == "A_primary_eligible":
+                kinds.append(("dist_nwis", {k: m & v for k, v in dist_nwis.items()}))
+            for kind, strata in kinds:
+                deltas += tag_rows(
+                    delta_table(boot_map, obs, pp, others, strata, set_name, kind),
+                    fp,
+                    nb,
+                )
 
     pd.DataFrame(core).to_csv(out / "panel_core.csv", index=False)
     pd.DataFrame(dep).to_csv(out / "panel_depth.csv", index=False)
@@ -1093,8 +1153,10 @@ def main() -> None:
     # ---------------- sigma ----------------
     sig_sum, sig_dec = [], []
     for arm in (primary, reference):
+        fp = "primary_ma" if (arm == primary and partial_reference) else "all_arms"
+        fmask, nb = footprints[fp]
         for set_name in ("A_primary_eligible", "D_context_all_targets"):
-            m = sets[set_name] & finite_core
+            m = sets[set_name] & fmask
             su, de = sigma_panel(
                 obs[m],
                 s[f"{arm}__dtw"].to_numpy("float64")[m],
@@ -1102,8 +1164,8 @@ def main() -> None:
                 set_name,
                 arm,
             )
-            sig_sum.append(su)
-            sig_dec += de
+            sig_sum += tag_rows([su], fp, nb)
+            sig_dec += tag_rows(de, fp, nb)
     pd.DataFrame(sig_sum).to_csv(out / "sigma_calibration.csv", index=False)
     pd.DataFrame(sig_dec).to_csv(out / "sigma_deciles.csv", index=False)
 
@@ -1130,24 +1192,32 @@ def main() -> None:
     pd.DataFrame(neg).to_csv(out / "negatives.csv", index=False)
 
     # ---------------- per-basin MAD ----------------
-    pm = sets["A_primary_eligible"] & finite_core
+    pm_all = sets["A_primary_eligible"] & finite_pm
     pb_rows = []
-    for basin in sorted(set(s["basin_hit"][pm])):
-        bm = pm & (s["basin_hit"].to_numpy() == basin)
+    for basin in sorted(set(basin_hit[pm_all])):
+        bm = pm_all & (basin_hit == basin)
+        bref = bm & finite_core
         pb_rows.append(
             {
                 "basin": basin,
                 "n": int(bm.sum()),
+                "n_reference": int(bref.sum()),
                 f"{primary}_MAD_m": mad(obs[bm], preds[f"{primary} raster"][bm]),
-                f"{reference}_MAD_m": mad(obs[bm], preds[f"{reference} raster"][bm]),
+                f"{reference}_MAD_m": mad(obs[bref], preds[f"{reference} raster"][bref])
+                if bref.any()
+                else np.nan,
                 "ma_MAD_m": mad(obs[bm], preds["Ma raster (resampled here)"][bm]),
             }
         )
     pb = pd.DataFrame(pb_rows)
     pb.to_csv(out / "per_basin_mad.csv", index=False)
 
-    # ---------------- calling layers ----------------
+    # ---------------- calling layers (both GNN arms' sigma: all_arms footprint) ----
+    pm = sets["A_primary_eligible"] & finite_core
     curve, csum, ctot = calling_layers(s, primary, reference, pm, boot_huc8, cells)
+    for df_ in (curve, csum):
+        df_["footprint"] = "all_arms"
+        df_["footprint_basins"] = footprints["all_arms"][1]
     curve.to_csv(out / "calling_curve.csv", index=False)
     csum.to_csv(out / "calling_summary.csv", index=False)
     ctot.to_csv(out / "calling_cells.csv", index=False)
@@ -1158,6 +1228,17 @@ def main() -> None:
             f"# {args.label} statewide raster eval: {primary} vs {reference} vs Ma\n\n"
         )
         fh.write(f"sites {len(s)}; basins {len(verify)}; n_boot {args.n_boot}\n\n")
+        fh.write("## footprints\n\n")
+        for fp, (fm, nb) in footprints.items():
+            fh.write(f"- `{fp}`: {int(fm.sum())} sites, {nb} basins\n")
+        if partial_reference:
+            fh.write(
+                f"\nReference arm `{reference}` is partial: every table row carries "
+                f"`footprint`; `all_arms` rows are the reference arm's footprint only, "
+                f"`primary_ma` rows are the full primary-arm footprint (primary vs Ma). "
+                f"Quote the footprint with every number.\n"
+            )
+        fh.write("\n")
         fh.write("## verification (per basin)\n\n")
         fh.write(verify.to_csv(index=False))
         fh.write("\n## provenance\n\n")

@@ -71,6 +71,13 @@ def main() -> None:
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--n-boot", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--drop-uncovered",
+        action="store_true",
+        help="score the wells the arms share instead of exiting when an arm's OOF "
+        "does not cover the reference well set (state parity arms carry different "
+        "appended labels); the dropped counts go to run_summary.json",
+    )
     args = ap.parse_args()
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -87,20 +94,41 @@ def main() -> None:
     preds = {ref_name: ref["gnn_dtw_m"].to_numpy("float64")}
     extras = {}
     fold_info = {ref_name: run["folds"]}
+    coverage = {}
     for a in args.arm:
         name, d = a.split("=", 1)
         df = load_oof(Path(d))
+        n_arm = len(df)
         if (
             len(df) != len(ref)
             or (df["canonical_id"].to_numpy() != ref["canonical_id"].to_numpy()).any()
         ):
+            arm_only = int(
+                (~df["canonical_id"].isin(ref["canonical_id"].to_numpy())).sum()
+            )
             df = (
                 df.set_index("canonical_id")
                 .reindex(ref["canonical_id"].to_numpy())
                 .reset_index()
             )
-            if df["gnn_dtw_m"].isna().any():
-                raise SystemExit(f"{name}: OOF does not cover the reference well set")
+            ref_only = int(df["gnn_dtw_m"].isna().sum())
+            coverage[name] = {
+                "n_arm_wells": n_arm,
+                "n_ref_wells": int(len(ref)),
+                "n_arm_only_dropped": arm_only,
+                "n_ref_only_dropped": ref_only,
+            }
+            if ref_only and not args.drop_uncovered:
+                raise SystemExit(
+                    f"{name}: OOF does not cover the reference well set "
+                    f"({ref_only} reference wells missing; pass --drop-uncovered "
+                    f"to score the shared wells)"
+                )
+            log(
+                f"  {name}: {n_arm} arm wells, {len(ref)} reference wells; dropped "
+                f"{arm_only} arm-only and {ref_only} reference-only wells "
+                f"(shared footprint)"
+            )
         preds[name] = df["gnn_dtw_m"].to_numpy("float64")
         extras[name] = {
             "median_sigma_m": float(np.nanmedian(df["gnn_sigma_m"]))
@@ -167,6 +195,8 @@ def main() -> None:
                 "n_wells": int(obs.size),
                 "n_blocks": boot.n_blocks,
                 "n_boot": args.n_boot,
+                "drop_uncovered": bool(args.drop_uncovered),
+                "coverage": coverage,
                 "arm_extras": extras,
                 "folds": fold_info,
             },
