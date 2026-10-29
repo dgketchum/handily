@@ -1534,7 +1534,22 @@ def infer_basin(
     k, p = int(bman["idw_k"]), float(bman["idw_power"])
     q_co = _relief_coords(qxy, z_surf, vw)
     pool_co = _relief_coords(wells["xy"], wells["z"], vw)
-    if args.r_source == "crossfit":
+    if args.r_source == "raster":
+        # pumping-well R (utils/build_pumping_r_raster.py): a deterministic
+        # surface from donor wells screened out of every label, source and
+        # scoring set (utils/check_pumping_r_leakage.py); the arm's bundle was
+        # built from the same donor pool at cell centres, so sampling the cell is
+        # train/serve parity. The deep datum stays the crossfit interpolation.
+        r_wte = sample_coarse(args.r_raster, qx, qy)
+        if not np.isfinite(r_wte).all():
+            raise SystemExit(
+                f"{basin}: {int((~np.isfinite(r_wte)).sum())} lattice cells outside "
+                f"--r-raster {args.r_raster}"
+            )
+        deep_wte = idw_exclude_at_points(
+            pool_co, wells["deep_cross"], wells["xy"], q_co, qxy, k, p, 0.0
+        )
+    elif args.r_source == "crossfit":
         # deep uses the same k as R: this interpolates the archived per-well
         # deep-feature field (defined at every well), not a re-estimate from
         # the deep pool, so idw_k_deep does not apply.
@@ -1943,6 +1958,7 @@ def infer_basin(
                 "water_zero_output": water_zero,
                 "mixture_identity_tol_m": MIX_TOL_M,
                 "r_source": args.r_source,
+                "r_raster": args.r_raster,
                 "r_exclude_km": args.r_exclude_km,
                 "deep_exclude_km": args.deep_exclude_km,
                 "query_writeback": bool(writeback),
@@ -2056,12 +2072,18 @@ def main() -> None:
     )
     ap.add_argument(
         "--r-source",
-        choices=("crossfit", "obs-exclude"),
+        choices=("crossfit", "obs-exclude", "raster"),
         default="crossfit",
         help="lattice R/deep prior: interpolate the archived leave-fold-out "
-        "crossfit feature values (default; exact at wells, seam-free), or "
+        "crossfit feature values (default; exact at wells, seam-free), "
         "leave-radius-out IDW of raw obs (shelved lever; arc seams at the "
-        "exclusion-disk edge)",
+        "exclusion-disk edge), or sample --r-raster for R (deep stays crossfit)",
+    )
+    ap.add_argument(
+        "--r-raster",
+        default=None,
+        help="--r-source raster only: 100 m R WTE raster (m asl) on the DEM grid, "
+        "e.g. a pumping-well R r_blend_wte_100m.tif",
     )
     ap.add_argument(
         "--r-exclude-km",
@@ -2105,6 +2127,8 @@ def main() -> None:
         "pass_ratio_tripped (ensemble-variance false positive)",
     )
     args = ap.parse_args()
+    if (args.r_source == "raster") != (args.r_raster is not None):
+        raise SystemExit("--r-raster goes with --r-source raster (both or neither)")
     args.model_dir = Path(args.model_dir)
     args.model_name = args.out_name or args.model_dir.name
     args.fac_manifest_path = manifest_for_model(args.model_dir, args.fac_manifest)
