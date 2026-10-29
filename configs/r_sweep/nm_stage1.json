@@ -1,0 +1,132 @@
+[
+ {
+  "gate": "depth",
+  "select": "lifted",
+  "vw": 100.0,
+  "cap_m": 1.0,
+  "k": 32,
+  "name": "a0_idw",
+  "kernel": "idw",
+  "max_share": 0.0
+ },
+ {
+  "gate": "depth",
+  "select": "lifted",
+  "vw": 100.0,
+  "cap_m": 1.0,
+  "k": 32,
+  "name": "a1_idw_s2",
+  "kernel": "idw",
+  "max_share": 0.5
+ },
+ {
+  "gate": "depth",
+  "select": "lifted",
+  "vw": 100.0,
+  "cap_m": 1.0,
+  "k": 32,
+  "name": "a1_idw_s4",
+  "kernel": "idw",
+  "max_share": 0.25
+ },
+ {
+  "gate": "depth",
+  "select": "lifted",
+  "vw": 100.0,
+  "cap_m": 1.0,
+  "k": 32,
+  "name": "a1_idw_s8",
+  "kernel": "idw",
+  "max_share": 0.125
+ },
+ {
+  "gate": "depth",
+  "select": "lifted",
+  "vw": 100.0,
+  "cap_m": 1.0,
+  "k": 16,
+  "name": "a2_g300_k16",
+  "kernel": "gauss",
+  "h_min_m": 300.0,
+  "max_share": 0.125
+ },
+ {
+  "gate": "depth",
+  "select": "lifted",
+  "vw": 100.0,
+  "cap_m": 1.0,
+  "k": 32,
+  "name": "a2_g300_k32",
+  "kernel": "gauss",
+  "h_min_m": 300.0,
+  "max_share": 0.125
+ },
+ {
+  "gate": "depth",
+  "select": "lifted",
+  "vw": 100.0,
+  "cap_m": 1.0,
+  "k": 64,
+  "name": "a2_g300_k64",
+  "kernel": "gauss",
+  "h_min_m": 300.0,
+  "max_share": 0.125
+ },
+ {
+  "gate": "depth",
+  "select": "lifted",
+  "vw": 100.0,
+  "cap_m": 1.0,
+  "k": 16,
+  "name": "a2_g1000_k16",
+  "kernel": "gauss",
+  "h_min_m": 1000.0,
+  "max_share": 0.125
+ },
+ {
+  "gate": "depth",
+  "select": "lifted",
+  "vw": 100.0,
+  "cap_m": 1.0,
+  "k": 32,
+  "name": "a2_g1000_k32",
+  "kernel": "gauss",
+  "h_min_m": 1000.0,
+  "max_share": 0.125
+ },
+ {
+  "gate": "depth",
+  "select": "lifted",
+  "vw": 100.0,
+  "cap_m": 1.0,
+  "k": 64,
+  "name": "a2_g1000_k64",
+  "kernel": "gauss",
+  "h_min_m": 1000.0,
+  "max_share": 0.125
+ },
+ {
+  "gate": "depth",
+  "select": "lifted",
+  "vw": 100.0,
+  "cap_m": 1.0,
+  "k": 32,
+  "name": "a2_g300_k32_f0.5",
+  "kernel": "gauss",
+  "h_min_m": 300.0,
+  "h_frac": 0.5,
+  "max_share": 0.125
+ },
+ {
+  "gate": "depth",
+  "select": "lifted",
+  "vw": 100.0,
+  "cap_m": 1.0,
+  "k": 32,
+  "name": "a2_g300_k32_f0.25",
+  "kernel": "gauss",
+  "h_min_m": 300.0,
+  "h_frac": 0.25,
+  "max_share": 0.125
+ }
+]

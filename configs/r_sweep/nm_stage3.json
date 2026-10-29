@@ -1,0 +1,57 @@
+[
+ {
+  "kernel": "idw",
+  "max_share": 0.25,
+  "k": 32,
+  "cap_m": 1.0,
+  "vw": 100.0,
+  "n_min": 8,
+  "gate": "depth",
+  "ramp_lo_m": 5.0,
+  "ramp_hi_m": 15.0,
+  "select": "lifted",
+  "screen": false,
+  "name": "s4_b0_c0"
+ },
+ {
+  "kernel": "idw",
+  "max_share": 0.25,
+  "k": 32,
+  "cap_m": 1.0,
+  "vw": 100.0,
+  "n_min": 8,
+  "gate": "depth",
+  "ramp_lo_m": 3.0,
+  "ramp_hi_m": 10.0,
+  "select": "lifted",
+  "screen": false,
+  "name": "s4_b0r310_c0"
+ },
+ {
+  "kernel": "idw",
+  "max_share": 0.25,
+  "k": 32,
+  "cap_m": 1.0,
+  "vw": 100.0,
+  "n_min": 8,
+  "gate": "depth",
+  "ramp_lo_m": 3.0,
+  "ramp_hi_m": 10.0,
+  "select": "horizontal",
+  "radius_max_km": 10.0,
+  "screen": false,
+  "name": "s4_b0r310_c1"
+ },
+ {
+  "kernel": "idw",
+  "max_share": 0.25,
+  "k": 32,
+  "cap_m": 1.0,
+  "vw": 100.0,
+  "n_min": 8,
+  "gate": "median",
+  "select": "lifted",
+  "screen": false,
+  "name": "s4_b2_c0"
+ }
+]
