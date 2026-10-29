@@ -81,6 +81,7 @@ from infer_conus_gnn import (  # noqa: E402
     add_water_flatten_args,
     build_anchors,
     bundle_source_edges,
+    cap_r_ground,
     ckpt_extensions,
     ckpt_f_src,
     ckpt_f_srcedge,
@@ -306,6 +307,23 @@ def main() -> None:
         "from the deployment source pool: the trained-on-but-not-read-at-inference "
         "arms of the NDWR labels-vs-sources experiment",
     )
+    ap.add_argument(
+        "--r-ground-cap-m",
+        type=float,
+        default=None,
+        help="renderer --r-ground-cap-m: lower R to z_surf - M where it sits "
+        "higher; source-edge residuals reframed to the capped R",
+    )
+    ap.add_argument(
+        "--r-source",
+        choices=("crossfit", "raster"),
+        default="crossfit",
+        help="R at the points: crossfit interpolation (default) or sample "
+        "--r-raster (deep stays crossfit), as infer_conus_gnn.py",
+    )
+    ap.add_argument(
+        "--r-raster", default=None, help="--r-source raster only: R WTE raster (m asl)"
+    )
     add_water_flatten_args(ap)
     ap.add_argument("--dem", default=DEM)
     ap.add_argument(
@@ -318,6 +336,8 @@ def main() -> None:
     ap.add_argument("--oof-check", action="store_true")
     ap.add_argument("--oof-tol-m", type=float, default=1e-3)
     args = ap.parse_args()
+    if (args.r_source == "raster") != (args.r_raster is not None):
+        raise SystemExit("--r-source raster and --r-raster go together")
     model_dir = Path(args.model_dir)
     fac_manifest = manifest_for_model(model_dir, args.fac_manifest)
     fac_entries = load_manifest(fac_manifest)["entries"]
@@ -389,6 +409,17 @@ def main() -> None:
     deep_wte = idw_exclude_at_points(
         pool_co, deep_cross, wells_xy, q_co, qxy, k, p, 0.0
     )
+    if args.r_source == "raster":
+        # renderer --r-source raster: R read from a precomputed surface at the
+        # point's DEM cell (the cell value the bundle's --r-replace R was built
+        # at); the deep datum stays the crossfit interpolation
+        r_wte = sample_coarse(args.r_raster, qx, qy)
+        if not np.isfinite(r_wte).all():
+            raise SystemExit(
+                f"{int((~np.isfinite(r_wte)).sum())} points outside --r-raster "
+                f"{args.r_raster}"
+            )
+        log.info("R from raster %s", args.r_raster)
     fac_paths = select_paths(
         fac_entries,
         bounds=(float(qx.min()), float(qy.min()), float(qx.max()), float(qy.max())),
@@ -403,6 +434,19 @@ def main() -> None:
     # renderer-side flatten (--water-flatten-inference), shared verbatim with the
     # raster path so a point check reads the same FAC the map does
     fac_dtw, _water_flatten = water_flatten_override(args, qxy, fac_dtw)
+    if args.r_ground_cap_m is not None:
+        # renderer --r-ground-cap-m, same order: after the water V3 pin, before
+        # base/anchors; source residuals are reframed in deployment_source_ctx
+        r_wte, r_bound = cap_r_ground(
+            r_wte, z_surf, float(args.r_ground_cap_m), keep=_on_water_v3
+        )
+        log.info(
+            "R ground cap %.1f m bound %d/%d points (%.1f%%)",
+            float(args.r_ground_cap_m),
+            int(r_bound.sum()),
+            n,
+            100 * r_bound.mean(),
+        )
     base = z_surf - r_wte
     anchors = build_anchors(
         base,
@@ -521,6 +565,7 @@ def main() -> None:
             exclude_m=float(args.source_exclude_m),
             extra=extra,
             exclude_sources=tuple(args.exclude_source_name),
+            r_ground_cap_m=args.r_ground_cap_m,
         )
     agg = run_folds(
         models,
