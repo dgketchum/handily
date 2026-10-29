@@ -47,12 +47,17 @@ import pandas as pd
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from build_stacker_features import sample_coarse  # noqa: E402
+from pumping_r_core import (  # noqa: E402
+    DEM,
+    HAND,
+    STATS,
+    cap_shares,
+    load_donors,
+    weighted_stats,
+)
 
 log = logging.getLogger("pumping_r")
 
-HAND = "/data/ssd2/handily/conus/wte_gnn/conus_wells_hand.parquet"
-DEM = "/data/ssd2/handily/conus/covariates/elev48i0100a.tif"
 BUNDLE = (
     "/data/ssd2/handily/conus/wte_gnn/graph_conus_monitoring_water_v2_ndwr_ufold_parity"
 )
@@ -61,7 +66,6 @@ DEPTH_EDGES = [0, 2, 5, 10, 30, np.inf]
 DEPTH_LABELS = ["0-2", "2-5", "5-10", "10-30", "30+"]
 DIST_EDGES_KM = [0, 0.3, 1, 5, np.inf]
 DIST_LABELS = ["0-0.3km", "0.3-1km", "1-5km", "5+km"]
-STATS = ("mean", "median", "q25", "q75")
 
 
 def parse() -> argparse.Namespace:
@@ -99,6 +103,12 @@ def parse() -> argparse.Namespace:
         "--pool-classes",
         default="pumping,unknown",
         help="HAND well_class values admitted as donors",
+    )
+    ap.add_argument(
+        "--max-share",
+        type=float,
+        default=0.0,
+        help="cap any one donor's share of a cell's total weight (0 = plain IDW; 0.125 = n_eff >= 8)",
     )
     ap.add_argument("--boot", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
@@ -161,70 +171,6 @@ def uncapped_reference(base_bundle: str, mon: pd.DataFrame, cap_m: float) -> np.
     if d > 1e-3:
         raise SystemExit("parity R is not min(base R, z - cap); check the bundles")
     return r
-
-
-def load_donors(hand: str, dem: str, classes: list[str]) -> pd.DataFrame:
-    w = pd.read_parquet(
-        hand,
-        columns=[
-            "canonical_id",
-            "source",
-            "well_class",
-            "confinement_class",
-            "mean_dtw",
-            "x5070",
-            "y5070",
-            "hand_m",
-        ],
-    )
-    n0 = len(w)
-    w = w.sort_values("hand_m", na_position="last").drop_duplicates(
-        "canonical_id", keep="first"
-    )
-    log.info("HAND table: %d rows -> %d unique wells", n0, len(w))
-    w = w[w["well_class"].isin(classes) & np.isfinite(w["mean_dtw"])].reset_index(
-        drop=True
-    )
-    log.info(
-        "donor pool (%s): %d wells; class counts %s",
-        classes,
-        len(w),
-        w["well_class"].value_counts().to_dict(),
-    )
-    z = sample_coarse(
-        dem, w["x5070"].to_numpy("float64"), w["y5070"].to_numpy("float64")
-    )
-    ok = np.isfinite(z)
-    log.info("DEM surface at donors: %.4f finite", float(ok.mean()))
-    w = w[ok].reset_index(drop=True)
-    w["z_surf_m"] = z[ok]
-    w["wte_m"] = w["z_surf_m"] - w["mean_dtw"]
-    log.info(
-        "donor mean_dtw: p50 %.1f m, p90 %.1f m, %d negative",
-        float(w["mean_dtw"].median()),
-        float(w["mean_dtw"].quantile(0.9)),
-        int((w["mean_dtw"] < 0).sum()),
-    )
-    return w
-
-
-def weighted_stats(vals: np.ndarray, wts: np.ndarray) -> dict[str, np.ndarray]:
-    """Row-wise IDW-weighted mean / median / q25 / q75 over (n, k) arrays; zero
-    weights drop a neighbour. Quantiles are 'lower' type on the weighted CDF."""
-    wsum = wts.sum(1)
-    mean = (wts * vals).sum(1) / np.where(wsum > 0, wsum, np.nan)
-    order = np.argsort(vals, axis=1)
-    v = np.take_along_axis(vals, order, 1)
-    w = np.take_along_axis(wts, order, 1)
-    cdf = np.cumsum(w, 1) / np.where(wsum > 0, wsum, np.nan)[:, None]
-    out = {"mean": mean}
-    for name, q in (("median", 0.5), ("q25", 0.25), ("q75", 0.75)):
-        idx = (cdf >= q).argmax(1)
-        out[name] = np.take_along_axis(v, idx[:, None], 1)[:, 0]
-    out["mean"][wsum <= 0] = np.nan
-    for name in ("median", "q25", "q75"):
-        out[name][wsum <= 0] = np.nan
-    return out
 
 
 def panel(r: np.ndarray) -> dict[str, float]:
@@ -325,7 +271,10 @@ def main() -> None:
         if args.exclude_m > 0:
             keep &= geo >= args.exclude_m
             keep &= np.cumsum(keep, 1) <= k
-        wts = np.where(keep, 1.0 / np.maximum(dist, 1.0) ** args.power, 0.0)
+        wts = cap_shares(
+            np.where(keep, 1.0 / np.maximum(dist, 1.0) ** args.power, 0.0),
+            args.max_share,
+        )
         st = weighted_stats(vals, wts)
         log.info(
             "k=%d: rows with no surviving donor: %d", k, int((wts.sum(1) <= 0).sum())
@@ -408,7 +357,7 @@ def main() -> None:
             f"Bundle `{args.bundle}`; donors = HAND wells with well_class in {args.pool_classes} ({len(donors):,}); "
         )
         f.write(
-            f"k = {args.k}, power {args.power}, vw {args.vw}, exclude {args.exclude_m} m, cap {args.cap_m} m.\n\n"
+            f"k = {args.k}, power {args.power}, vw {args.vw}, exclude {args.exclude_m} m, cap {args.cap_m} m, max donor share {args.max_share}.\n\n"
         )
         f.write(
             "Residual r = R - observed WTE, m; positive = R above the observed table (DTW too shallow). "
