@@ -3,7 +3,9 @@
 # if an rclone Drive remote exists on this node, to the Drive folder. Same packaging as nm_parity_ship.sh
 # (zoran, 2026-10-19) and the NV delivery (notes/NV_SHIP_DRIVE_HANDOFF_2026-10-08.md). No rendering, no
 # smoothing, no training. Run only after the user's ship decision. Requires $OUT/README.txt (write it from
-# the template in notes/ZEPHYR_AZ_COMPLETION_HANDOFF.md with the eval numbers filled in) and gdal CLI on PATH.
+# the template in notes/ZEPHYR_AZ_COMPLETION_HANDOFF.md with the eval numbers filled in) and gdal CLI on PATH
+# (module load gdal, or export the user-space GDAL env first). The 100 m mosaics are rebuilt only if the difference
+# raster is missing, so a prior inspection build (handoff step 7) is reused. Never overwrites an existing zip.
 set -euo pipefail
 H=/data/ssd2/handily; HUC=$H/huc8; HC=/project/handily/code/handily-nv
 ARM0=gnn_conus_monitoring_water_gate_mirror_sigma_w25_prod
@@ -50,6 +52,7 @@ gdalbuildvrt -q -overwrite -input_file_list $OUT/dtw10_tiles_abs.txt $MOS/az_dtw
 sed "s#relativeToVRT=\"0\">$H/#relativeToVRT=\"1\">#" $MOS/az_dtw_parity_10m.vrt > $OUT/az_dtw_parity_10m.vrt
 echo "10 m VRT: $(grep -c 'relativeToVRT="1"' $OUT/az_dtw_parity_10m.vrt) relative refs"
 # 3. zips (store; every raster is already a deflate COG)
+for z in az_dtw_parity_10m_tiles.zip az_dtw_parity_statewide_100m.zip; do [ -f $OUT/$z ] && { echo "$OUT/$z exists -- refusing to overwrite"; exit 1; }; done
 cd $H && zip -0 -q $OUT/az_dtw_parity_10m_tiles.zip -@ < $OUT/az_dtw_parity_10m_tiles.lst
 cd $OUT && zip -0 -q az_dtw_parity_10m_tiles.zip az_dtw_parity_10m.vrt README.txt
 cp $OUT/README.txt $Q/README.txt && cd $Q && zip -0 -q $OUT/az_dtw_parity_statewide_100m.zip az_dtw_parity_statewide_100m.tif az_dtw_shipped_minus_parity_19basins.tif az_sigma_parity_statewide_100m.tif az_sigma_parity_statewide_100m.tif.aux.xml README.txt
